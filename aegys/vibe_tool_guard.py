@@ -1,0 +1,2026 @@
+#!/usr/bin/env python3
+"""Mistral Vibe pre_tool hook: deny what the allowlist cannot see.
+
+What Vibe's permission model cannot express, closed here:
+
+1. Bash matches command *prefixes*, and trailing arguments ride along. A few
+   read-only commands carry a flag that turns them into "run any program":
+   ``rg --pre CMD``, ``fd -x CMD``. The deny list uses the same prefix match,
+   so it only sees a flag in first position. This hook sees the whole command.
+
+2. A tool set to ``permission = "always"`` (web_fetch, Firecrawl, the web-search
+   connector) has no per-call check at all, so nothing in config.toml can deny a
+   URL. This hook scans every string argument of every tool call for URLs and
+   denies hosts on the list below: exfiltration and out-of-band endpoints, URL
+   shorteners that hide the destination, IP loggers, private and cloud-metadata
+   addresses (SSRF), and a few on-the-fence sites.
+
+3. Edits. A write whose resolved target decides what Vibe or git runs or allows
+   (any .vibe directory but its worktrees and plans, the Vibe settings in
+   ~/.agents, what ~/.vibe links to, this guard, any .git directory) needs the
+   user's Allow for that one write, except a config.toml change confined to
+   which model runs and how. A write outside every git repository, temporary
+   directory and ~/.vibe/plans needs the user's Allow once per file per
+   session. A runner's exchange directories (VIBE_WORKTREE_GUARD_EXTRA) are
+   exempt. Vibe's session logs and this hook's approval store are never
+   writable. The Allow arrives through ask_user_question; the post_tool entry
+   of this script records it.
+
+4. Bash: a recursive delete of a critical path or of a target the hook cannot
+   see, any read of a secret (also by a recursive search from above it), any
+   write to a control file, and git config writes; a read of a Vibe settings
+   file is sent to read_file. Directory changes inside the command are followed.
+
+Contract (Vibe hooks, v2.25+): JSON on stdin with ``tool_name`` (``bash``, or
+``file_system.bash`` under the unified harness) and ``tool_input``; exit 0 with a JSON object on stdout; ``{"decision": "deny",
+"reason": ...}`` turns the call into a tool error the model sees. With
+``strict = true`` in hooks.toml any crash here is also a denial: fail closed.
+Run as a ``post_tool`` hook on ask_user_question, it records the user's Allow
+and prints nothing, or ``{"hook_specific_output": {"additional_context": ...}}``.
+
+This is a pattern check, not a shell parser or a threat feed. It cannot know a
+host is malicious, only that it is on the list; it will not see a URL built
+from a variable at run time. Over-blocking is cheap (the model gets an error
+and rephrases), so patterns lean towards catching more.
+"""
+from __future__ import annotations
+
+import fnmatch
+import glob
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from .vibe_worktree_guard import (
+    FIND_WRITE_FLAGS, PRINTERS, READERS, SEARCHERS, SHELLS, WRITERS, brace_expansions,
+    git_config_writes, git_subcommand_index, inside, split_stages, unwrap,
+)
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # python < 3.11: every config edit then needs the user
+    tomllib = None  # type: ignore[assignment]
+
+# --- bash: allow-listed commands with an exec flag ----------------------------
+
+# The command must be the first word of a pipeline stage: at the start, or right
+# after ; | & ( or a backtick. Anchoring on plain whitespace would also match
+# the word as an argument, as in `echo fd -x`.
+CMD_START = r"(?:^|[;|&(`])\s*"
+STAGE = r"[^|;&]*"  # rest of the same pipeline stage
+
+BASH_RULES: list[tuple[str, re.Pattern[str], str]] = [
+    (
+        "rg --pre",
+        re.compile(rf"{CMD_START}rg\b{STAGE}\s--pre(?:=|\s|$)"),
+        "rg --pre runs an arbitrary command on every file; use rg without --pre.",
+    ),
+    (
+        "fd --exec",
+        re.compile(
+            rf"{CMD_START}(?:fd|fdfind)\b{STAGE}\s"
+            r"(?:-[A-Za-z]*[xX][A-Za-z]*|--exec(?:-batch)?)(?:=|\s|$)"
+        ),
+        "fd -x/-X/--exec runs an arbitrary command on every match; use fd alone "
+        "and act on the output separately.",
+    ),
+]
+
+# --- bash: one pass over the command, stage by stage -----------------------------
+
+SHELL_STRING_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # -c, -lc, -ec
+CWD_CHANGERS = {"cd", "pushd"}
+ASSIGNMENT_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+PRIVILEGE_WRAPPERS = {"sudo", "doas"}
+PRIVILEGE_VALUE_OPTIONS = {"-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t", "-T"}
+
+
+def strip_privilege(words: list[str]) -> list[str]:
+    """`sudo`/`doas` and their options removed: the command they run is what counts."""
+    words = list(words)
+    while words and os.path.basename(words[0]) in PRIVILEGE_WRAPPERS:
+        words.pop(0)
+        while words and words[0].startswith("-"):
+            option = words.pop(0)
+            if option in PRIVILEGE_VALUE_OPTIONS and words:
+                words.pop(0)
+    return words
+
+
+def run_words(raw: list[str]) -> tuple[list[str], bool]:
+    """The words of the command a stage runs, with wrappers, `sudo`/`doas` and
+    leading assignments removed, and whether a wrapper was refused. A refused
+    stage (GIT_DIR=..., NODE_OPTIONS=...) keeps its words, minus assignments, so
+    the path checks still see what it names."""
+    words = strip_privilege(raw)
+    unwrapped, refusal = unwrap(words)
+    if refusal is None:
+        return strip_privilege(unwrapped), False
+    return [w for w in words if not ASSIGNMENT_WORD.match(w)], True
+
+
+def expand_home(word: str, home: Path) -> str:
+    """`~`, `$HOME` and `${HOME}` at the start of a word, spelled out."""
+    for prefix in ("~", "$HOME", "${HOME}"):
+        if word == prefix or word.startswith(prefix + "/"):
+            return str(home) + word[len(prefix):]
+    return word
+
+
+def resolve_word(word: str, cwd: Path, home: Path) -> Path:
+    """The file a shell word or tool argument names, symlinks followed."""
+    return (cwd / expand_home(word, home)).resolve()
+
+
+GLOB_CHARS = frozenset("*?[")
+
+
+def expand_word(word: str, cwd: Path, home: Path) -> list[Path]:
+    """The paths a shell word may name from `cwd`, as the shell would expand it:
+    each brace alternative, its literal path, and every existing glob match."""
+    paths = []
+    for variant in brace_expansions(word):
+        spelled = expand_home(variant, home)
+        paths.append((cwd / spelled).resolve())
+        if GLOB_CHARS & set(spelled):
+            paths += [Path(match).resolve() for match in glob.glob(str(cwd / spelled))]
+    return paths
+
+
+# Output and input redirect operators, as split_stages splits them off.
+ANY_REDIRECT = re.compile(r"^(?:&?>>?|>\||>&|<>|<|<&|<<<)$")
+# What heredoc_bodies leaves in place of each heredoc operator it cut a body for:
+# one word the splitter keeps whole, which a stage counts and its words drop.
+HEREDOC_MARKER = "__heredoc_body__"
+
+
+def without_redirects(words: list[str]) -> list[str]:
+    """A stage's words without its redirects: each operator, its target, and the
+    descriptor number before it (`2>&1` arrives as 2, >&, 1). What a program
+    reads and writes is judged from these words; redirect targets separately."""
+    kept, skip = [], False
+    for word in words:
+        if skip:
+            skip = False
+        elif word == HEREDOC_MARKER:
+            continue
+        elif ANY_REDIRECT.match(word):
+            if kept and kept[-1].isdigit():
+                kept.pop()
+            skip = True
+        else:
+            kept.append(word)
+    return kept
+
+
+INTERPRETER = re.compile(r"^(?:sh|bash|zsh|dash|ksh|python[0-9.]*|node|perl|ruby)$")
+INLINE_OR_MODULE = {"-c", "-e", "-m", "-p", "--eval", "--print", "-"}
+
+
+def shell_reads_stdin(words: list[str]) -> bool:
+    """Whether a shell takes its commands from standard input: `-s`, or no script
+    operand (`-o`, `-O`, `--rcfile` and `--init-file` take a value; `--` ends the
+    options)."""
+    args, i = words[1:], 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
+            i += 2
+        elif arg == "--":
+            return i + 1 == len(args)
+        elif arg.startswith("-") and not arg.startswith("--") and "s" in arg[1:]:
+            return True
+        elif arg.startswith(("-", "+")) and arg != "--":
+            i += 1
+        else:
+            return False
+    return True
+
+
+def reads_program_from_stdin(words: list[str]) -> bool:
+    """Whether an interpreter (python, node, perl, ruby) takes its program from
+    standard input: an explicit `-`, or no script, module or inline-code operand."""
+    args = words[1:]
+    return "-" in args or not any(a in INLINE_OR_MODULE or not a.startswith("-") for a in args)
+
+
+# A heredoc operator and its delimiter (`<<EOF`, `<<-'EOF'`, `<< "EOF"`, `<<\EOF`).
+HEREDOC_OPERATOR = re.compile(r"<<(-?)[ \t]*\\?(['\"]?)([^\s'\"<>|;&()\\]+)\2")
+
+
+def heredoc_bodies(command: str) -> tuple[str, list[str]]:
+    """The command without its heredoc bodies, and the bodies in order of their
+    `<<` operators; the splitter would read each body line as a command of its own.
+    Operators are found outside quotes, comments and `((...))`, across lines, so a
+    quoted `<<`, one in a comment or one inside a multi-line string is text; each
+    one found is replaced by HEREDOC_MARKER, and comments are cut, so the caller
+    splits with comments off and a mid-word `#` (`a#b`) stays in its word."""
+    out, bodies, pending, quote, arithmetic, i, n = [], [], [], "", 0, 0, len(command)
+    while i < n:
+        c = command[i]
+        if quote:
+            if c == "\\" and quote == '"' and i + 1 < n:
+                out.append(command[i:i + 2])
+                i += 2
+                continue
+            quote = "" if c == quote else quote
+        elif c == "\\" and i + 1 < n:
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        elif c in "'\"":
+            quote = c
+        elif command.startswith(("$((", "(("), i):
+            width = 3 if c == "$" else 2
+            arithmetic += 1
+            out.append(command[i:i + width])
+            i += width
+            continue
+        elif arithmetic and command.startswith("))", i):
+            arithmetic -= 1
+            out.append("))")
+            i += 2
+            continue
+        elif not arithmetic and command.startswith("<<", i) and not command.startswith("<<<", i):
+            match = HEREDOC_OPERATOR.match(command, i)
+            if match:
+                pending.append((match.group(3), match.group(1) == "-"))
+                out.append(f" {HEREDOC_MARKER} ")
+                i = match.end()
+                continue
+        elif c == "#" and (i == 0 or command[i - 1] in " \t\n;|&()"):
+            end = command.find("\n", i)  # a comment runs to the end of its line, and goes
+            i = n if end < 0 else end
+            continue
+        elif c == "\n" and pending:
+            out.append(c)
+            i += 1
+            for delimiter, strip_tabs in pending:  # each body runs to its delimiter line
+                body = []
+                while i < n:
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line, i = command[i:end], end + 1
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        break
+                    body.append(line)
+                bodies.append("\n".join(body))
+            pending = []
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), bodies
+
+
+@dataclass
+class Stage:
+    """One command of a pipeline or list, as it will run."""
+
+    words: list[str]          # wrappers (env, xargs, sudo, ...) and assignments removed
+    cwds: tuple[Path, ...]    # every directory its relative paths may be relative to
+    cwd_known: bool           # False after a cd the hook cannot follow
+    refused: bool             # a wrapper the hook will not see through (GIT_DIR=..., ...)
+    text: str                 # the stage as written, for spelled-path checks
+    raw: list[str]            # the stage's words as split, redirects and wrappers included
+
+
+def command_stages(command: str, cwd: Path, home: Path, depth: int = 0) -> list[Stage] | None:
+    """The command's stages in order. Relative paths are checked against the
+    session's directory and, after a `cd`/`pushd` or `-C DIR`, that directory
+    too: subshells are not tracked, so both stay candidates. `sh -c` strings,
+    `eval` and a heredoc a shell runs are expanded; a heredoc another interpreter
+    runs joins its words as code; any other heredoc is data. None when the command
+    does not parse."""
+    command, bodies = heredoc_bodies(command)
+    try:
+        raw_stages = split_stages(command, comments=False)
+    except ValueError:
+        return None
+    stages: list[Stage] = []
+    current, known = cwd, True
+    for raw in raw_stages:
+        words, refused = run_words(raw)
+        words = without_redirects(words)
+        program = os.path.basename(words[0]) if words else ""
+        stage_bodies = [bodies.pop(0) for word in raw if word == HEREDOC_MARKER and bodies]
+        stage_bodies += [raw[k + 1] for k, word in enumerate(raw[:-1]) if word == "<<<"]  # here-strings
+        # A stage expanded into its inner commands still has redirects of its own.
+        redirects_only = Stage([], tuple(dict.fromkeys([cwd, current])), known, refused, " ".join(raw), raw)
+        if stage_bodies and program in SHELLS:
+            if shell_reads_stdin(words) and depth < 3:
+                stages.append(redirects_only)
+                for body in stage_bodies:  # the shell runs the body
+                    inner = command_stages(body, current, home, depth + 1)
+                    if inner is None:
+                        return None
+                    stages.extend(inner)
+                continue
+        elif stage_bodies and INTERPRETER.match(program) and reads_program_from_stdin(words):
+            words = [*words, "-", *stage_bodies]  # the program, read like a -c string
+        if depth < 3 and program in SHELLS:
+            flag = next((i for i, a in enumerate(words[1:-1], 1) if SHELL_STRING_FLAG.match(a)), None)
+            if flag is not None:
+                inner = command_stages(words[flag + 1], current, home, depth + 1)
+                if inner is None:
+                    return None
+                stages.extend([redirects_only, *inner])
+                continue
+        if depth < 3 and program == "eval":
+            inner = command_stages(" ".join(words[1:]), current, home, depth + 1)
+            if inner is None:
+                return None
+            stages.extend([redirects_only, *inner])
+            continue
+        cwds = [cwd, current]
+        for i, word in enumerate(words[:-1]):
+            if word == "-C":
+                try:
+                    cwds.append(resolve_word(words[i + 1], current, home))
+                except (ValueError, OSError, RuntimeError):
+                    known = False
+        stages.append(Stage(words, tuple(dict.fromkeys(cwds)), known, refused, " ".join(raw), raw))
+        if program in CWD_CHANGERS:
+            target = words[1] if len(words) > 1 else "~"
+            if target == "-" or "$" in target or "`" in target:
+                known = False
+            else:
+                try:
+                    current = resolve_word(target, current, home)
+                except (ValueError, OSError, RuntimeError):
+                    known = False
+    return stages
+
+
+# --- bash: deletes that never run unattended -------------------------------------
+
+GIVE_IT_BACK = "Do not run it in another form; give the user the exact command to run themselves"
+
+
+def recursive_rm_operands(args: list[str]) -> tuple[bool, list[str]]:
+    """Whether rm's arguments ask for a recursive removal, and its operands."""
+    recursive, operands, options_ended = False, [], False
+    for arg in args:
+        if options_ended or arg == "-" or not arg.startswith("-"):
+            operands.append(arg)
+        elif arg == "--":
+            options_ended = True
+        elif arg.startswith("--"):
+            recursive = recursive or arg == "--recursive"
+        else:
+            recursive = recursive or "r" in arg.lower()
+    return recursive, operands
+
+
+# find's global options, with how many arguments each takes. GNU find accepts
+# them before the start points too: `find -maxdepth 1 x` searches x.
+FIND_GLOBAL_OPTIONS = {
+    "-maxdepth": 1, "-mindepth": 1, "-regextype": 1,
+    "-depth": 0, "-d": 0, "-xdev": 0, "-mount": 0, "-noleaf": 0, "-follow": 0,
+    "-daystart": 0, "-ignore_readdir_race": 0, "-noignore_readdir_race": 0,
+    "-warn": 0, "-nowarn": 0,
+}
+
+
+def find_start_points(args: list[str]) -> list[str]:
+    """find's starting directories: past its leading options (-H, -L, -P, -D x,
+    -O3) and any global options (-maxdepth 2, -xdev), the arguments before the
+    first expression."""
+    i = 0
+    while i < len(args) and (args[i] in ("-H", "-L", "-P", "-D") or args[i].startswith("-O")):
+        i += 2 if args[i] == "-D" else 1
+    starts = []
+    while i < len(args):
+        arg = args[i]
+        if arg in FIND_GLOBAL_OPTIONS:
+            i += 1 + FIND_GLOBAL_OPTIONS[arg]
+            continue
+        if arg.startswith(("-", "(", "!", ")")):
+            break
+        starts.append(arg)
+        i += 1
+    return starts or ["."]
+
+
+# Tests that make a find select files rather than take everything below its start.
+FIND_FILTERS = {
+    "-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex",
+    "-type", "-newer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-size",
+    "-empty", "-user", "-group", "-perm", "-links", "-inum", "-samefile",
+}
+
+
+FIND_EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
+# Programs a find -exec may run that read or change files but delete none.
+FIND_EXEC_KEEPS = READERS | SEARCHERS | PRINTERS | {
+    "chmod", "chown", "chgrp", "touch", "dos2unix", "unix2dos", "sed", "tee", "cp", "ln",
+    "install", "md5sum", "sha1sum", "sha256sum", "shasum", "setfacl", "xattr",
+}
+
+
+def find_deletes(args: list[str]) -> bool:
+    """Whether a find deletes: -delete, or an -exec/-ok whose program is not known
+    to keep files (rm, mv, a shell, sudo, a script)."""
+    if "-delete" in args:
+        return True
+    return any(a in FIND_EXEC_FLAGS and os.path.basename(args[i + 1]) not in FIND_EXEC_KEEPS
+               for i, a in enumerate(args[:-1]))
+
+
+def find_writes(args: list[str]) -> bool:
+    """Whether a find's arguments delete or write: -delete, -fprint..., or an
+    -exec/-ok whose command is not a reader (`-exec grep …` only reads)."""
+    if any(a in FIND_WRITE_FLAGS - FIND_EXEC_FLAGS for a in args):
+        return True
+    return any(a in FIND_EXEC_FLAGS and os.path.basename(args[i + 1])
+               not in READERS | SEARCHERS | PRINTERS
+               for i, a in enumerate(args[:-1]))
+
+
+# Inside `find -exec sh -c STRING _ {} +`, the positional parameters are find's
+# matches, which the find itself is judged for.
+FIND_MATCH_PARAMETER = re.compile(r'"?\$\{?[0-9@*]\}?"?')
+
+
+def find_exec_shell_strings(words: list[str]) -> list[str]:
+    """The command strings a find runs through `-exec [env ...] SHELL -c STRING`,
+    with its positional parameters replaced by a relative placeholder."""
+    strings = []
+    for i, word in enumerate(words):
+        if word not in FIND_EXEC_FLAGS:
+            continue
+        inner, refusal = unwrap(strip_privilege(words[i + 1:]))
+        inner = strip_privilege(inner)
+        if (refusal is None and len(inner) >= 3 and os.path.basename(inner[0]) in SHELLS
+                and SHELL_STRING_FLAG.match(inner[1])):
+            strings.append(FIND_MATCH_PARAMETER.sub("./find-match", inner[2]))
+    return strings
+
+
+def deletes_in(words: list[str]) -> list[tuple[str, list[str], bool]]:
+    """Every recursive `rm` and deleting `find` among a stage's words, wherever it
+    sits (after an unknown wrapper such as ionice or ssh, inside `find -exec`):
+    (program, operands, whether a find is filtered). An `rm` run by `find -exec`
+    gets `{}`/`+` from the find, which is judged itself, so those are dropped.
+    `git rm` is git's own subcommand and is judged by git's rules."""
+    if words and os.path.basename(words[0]) == "git":
+        return []
+    found, in_find_exec = [], False
+    for i, word in enumerate(words):
+        name, rest = os.path.basename(word), words[i + 1:]
+        if word in FIND_EXEC_FLAGS:
+            in_find_exec = True
+        if name == "rm":
+            recursive, operands = recursive_rm_operands(rest)
+            if in_find_exec:
+                operands = [o for o in operands if o not in ("{}", "+")]
+                if not operands:
+                    continue
+            if recursive:
+                found.append(("rm", operands, False))
+        elif name == "find" and find_deletes(rest):
+            found.append(("find", find_start_points(rest), any(a in FIND_FILTERS for a in rest)))
+    return found
+
+
+def critical_removal(command: str, cwd: Path, home: Path,
+                     also_critical: frozenset[Path] = frozenset()) -> str | None:
+    """What a recursive delete in this command would wipe that no unattended call
+    may: /, a directory directly under /, $HOME or a directory above it, the
+    session's working directory or a directory above it (also as `dir/*`, through
+    a symlink when the operand ends in / or a glob, and through a glob such as
+    `~/pro*`), or a target the hook cannot see. Covers `rm -r`, a deleting `find`
+    (-delete, or -exec of a program not known to keep files) and the command
+    strings a find runs through a shell; a filtered find (`-name`, `-type`, ...)
+    may start in the working directory itself unless that is $HOME or above.
+    also_critical carries the session's critical paths into a find's shell string,
+    which runs in the directory a `cd` reached."""
+    stages = command_stages(command, cwd, home)
+    if stages is None:
+        return None
+    critical = {home, *home.parents, cwd, *cwd.parents, *also_critical}
+    project_cwd = cwd != home and cwd not in home.parents
+    for stage in stages:
+        program = os.path.basename(stage.words[0]) if stage.words else ""
+        if program in PRINTERS or program in SEARCHERS:
+            continue
+        if stage.refused and {"rm", "find"} & {os.path.basename(w) for w in stage.words}:
+            return f"a delete behind a wrapper the hook cannot see through. {GIVE_IT_BACK}"
+        for program, operands, filtered in deletes_in(stage.words):
+            why = critical_operand(program, operands, filtered, stage, critical, cwd, home, project_cwd)
+            if why:
+                return why
+        for string in find_exec_shell_strings(stage.words):
+            why = critical_removal(string, stage.cwds[-1], home, frozenset(critical))
+            if why:
+                return why
+    return None
+
+
+def critical_operand(program: str, operands: list[str], filtered: bool, stage: Stage,
+                     critical: set[Path], cwd: Path, home: Path, project_cwd: bool) -> str | None:
+    """Why one delete's operands reach a critical path, or None."""
+    if not operands:
+        return f"{program} -r whose operands come from input the hook cannot see. {GIVE_IT_BACK}"
+    for operand in (variant for word in operands for variant in brace_expansions(word)):
+        spelled = expand_home(operand, home)
+        if "$" in spelled or "`" in spelled or spelled.startswith("~") or "{}" in spelled:
+            return f"{program} of {operand!r}, whose value the hook cannot see. {GIVE_IT_BACK}"
+        if not spelled.startswith("/") and not stage.cwd_known:
+            return f"{program} of {operand!r} after a cd the hook cannot see. {GIVE_IT_BACK}"
+        stripped = re.sub(r"(?:/\.?\*|/)+$", "", spelled)
+        base = "/" if spelled.startswith("/") and not stripped else (stripped or ".")
+        if base in ("*", ".*"):
+            base = "."
+        traverses = spelled != stripped or base == "."  # dir/, dir/*: the target's contents
+        for directory in stage.cwds:
+            targets = {Path(os.path.normpath(directory / base))}
+            try:
+                if traverses:
+                    targets.add((directory / base).resolve())
+                if GLOB_CHARS & set(base):
+                    pattern = os.path.normpath(directory / base)
+                    targets |= {Path(m).resolve() for m in glob.glob(pattern)}
+                    targets |= {c for c in critical if fnmatch.fnmatch(str(c), pattern)}
+            except (ValueError, OSError, RuntimeError):
+                return f"{program} of {operand!r}, whose target the hook cannot resolve. {GIVE_IT_BACK}"
+            for target in targets:
+                if filtered and target == cwd and project_cwd:
+                    continue
+                if not (target in critical or target.parent == Path("/")):
+                    continue
+                advice = (
+                    "If you meant a directory below the working directory, name it in "
+                    "the command itself instead of cd-ing into it"
+                    if len(stage.cwds) > 1 and not spelled.startswith("/") else GIVE_IT_BACK
+                )
+                return f"{program} of {operand!r} could remove {target}. {advice}"
+    return None
+
+
+# --- paths that decide what Vibe or git runs or allows, and secrets --------------
+
+# The code that runs as the guard: this package. Editing it edits the guard.
+PACKAGE_DIR = Path(__file__).resolve().parent
+# Under $HOME: the directories whose binaries choose the guard's own python and
+# tools (the aegys launcher lives in ~/.local/bin), and git's user settings (hooks
+# path, pager, aliases).
+HOME_CONTROL = (".local/bin", ".cargo/bin", "usr/bin", ".gitconfig", ".config/git")
+# PATH directories outside $HOME, user-writable on Homebrew Macs.
+ABSOLUTE_CONTROL = (Path("/opt/homebrew/bin"), Path("/usr/local/bin"))
+# Spellings of those files in free text (inline code, quoted strings).
+CONTROL_SPELLINGS = (
+    "aegys/", "configs/vibe/", "fragments/vibe/", "hooks/vibe_", "bin/vibe-", "bin/lib.sh",
+    "scripts/install.sh", "scripts/merge-vibe-config.py", "global-rules/", ".gitconfig",
+    ".local/bin/", ".cargo/bin/", ".config/git/", "/opt/homebrew/bin/", "/usr/local/bin/",
+)
+VIBE_DIR_SPELLING = re.compile(r"\.vibe(?:/(?!(?:worktrees|plans)(?:/|$|[\s'\"]))|$|[\s'\"])")
+# Under a .vibe directory these hold ordinary work, not settings.
+VIBE_WORK_DIRS = ("worktrees", "plans")
+# Under ~/.vibe these are written only by Vibe and this hook: session transcripts
+# and the approvals this hook reads. No tool call may write them, approved or not.
+VIBE_TAMPER_PROOF_DIRS = ("logs", "tool-guard")
+# Keys and credentials no tool may read, as directories and as their contents.
+# fragments/vibe/config.toml repeats this list as the read_file denylist; a test
+# keeps the two equal.
+SECRET_PATTERNS = (
+    "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.aws", "*/.aws/*",
+    "*/.vibe/.env", "*/.netrc", "*/.docker/config.json", "*/.config/gh/hosts.yml",
+)
+
+
+def in_vibe_settings(path: Path) -> bool:
+    """True for anything under a `.vibe` directory other than its worktrees and
+    plans, at any depth: ~/.vibe, a project's .vibe/, and a .vibe/ inside a
+    Vibe-managed worktree alike."""
+    parts = path.parts
+    return any(part == ".vibe" and not (i + 1 < len(parts) and parts[i + 1] in VIBE_WORK_DIRS)
+               for i, part in enumerate(parts))
+
+
+def control_dirs(home: Path) -> tuple[Path, ...]:
+    """The guard's own package, and the control directories of the agent-config clone
+    (~/.agents): what installs and runs the harnesses."""
+    clone = (home / ".agents").resolve()
+    return (PACKAGE_DIR, *(clone / d for d in (
+        "hooks", "bin", "scripts", "configs/vibe", "fragments/vibe", "global-rules")))
+
+
+def control_areas(home: Path) -> tuple[Path, ...]:
+    """The fixed control directories and files, for the ancestor rule."""
+    return (*control_dirs(home), *(home / name for name in HOME_CONTROL), *ABSOLUTE_CONTROL,
+            (home / ".vibe").resolve())
+
+
+def harness_control(path: Path, home: Path) -> bool:
+    """True when writing path (resolved) changes what Vibe, git or this guard
+    runs or allows."""
+    if ".git" in path.parts or in_vibe_settings(path):
+        return True
+    if any(inside(path, d) for d in control_dirs(home)) or any(inside(path, d) for d in ABSOLUTE_CONTROL):
+        return True
+    return any(inside(path, home / name) for name in HOME_CONTROL)
+
+
+def holds_control(path: Path, home: Path) -> bool:
+    """True when path is a directory above a fixed control area: a write into it
+    (`cp -r x/. ~/.agents/`, `tar -C ~`, `mv ~/.agents …`) can replace control
+    files without naming them."""
+    return any(inside(area, path) for area in control_areas(home))
+
+
+def tamper_proof(path: Path, home: Path) -> bool:
+    vibe = (home / ".vibe").resolve()
+    return any(inside(path, vibe / name) for name in VIBE_TAMPER_PROOF_DIRS)
+
+
+def secret(path: Path) -> bool:
+    return any(fnmatch.fnmatch(str(path), pattern) for pattern in SECRET_PATTERNS)
+
+
+# The secret areas below $HOME, from SECRET_PATTERNS, plus Vibe's session
+# transcripts, which have held API tokens: no recursive search may start above them.
+SECRET_AREAS = (*dict.fromkeys(p.removeprefix("*/").removesuffix("/*") for p in SECRET_PATTERNS),
+                ".vibe/logs")
+RECURSIVE_SEARCHERS = {"rg", "grep", "egrep", "fgrep"}
+# Options that take a separate value, which is then neither the pattern nor a
+# start directory.
+RG_VALUE_OPTIONS = {
+    "-e", "--regexp", "-f", "--file", "-g", "--glob", "--iglob", "-t", "--type", "-T",
+    "--type-not", "--type-add", "--type-clear", "-m", "--max-count", "-A", "--after-context",
+    "-B", "--before-context", "-C", "--context", "-M", "--max-columns", "-j", "--threads",
+    "-E", "--encoding", "-d", "--max-depth", "-r", "--replace", "--max-filesize",
+    "--path-separator", "--pre", "--pre-glob", "--sort", "--sortr", "--color", "--colors",
+    "--context-separator", "--field-match-separator", "--field-context-separator",
+    "--ignore-file", "--engine", "--dfa-size-limit", "--regex-size-limit",
+}
+GREP_VALUE_OPTIONS = {
+    "-e", "--regexp", "-f", "--file", "-m", "--max-count", "-A", "--after-context", "-B",
+    "--before-context", "-C", "--context", "-d", "--directories", "-D", "--devices",
+    "--include", "--exclude", "--exclude-dir", "--exclude-from", "--label", "--binary-files",
+    "--color", "--colour", "--group-separator",
+}
+
+
+def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
+    """Where a recursive search starts (rg, or grep with -r, -R, --recursive or
+    -d recurse; default `.`), and whether it skips hidden files and directories,
+    as rg does without --hidden or -uu. None for any other stage."""
+    if not words or os.path.basename(words[0]) not in RECURSIVE_SEARCHERS:
+        return None
+    rg = os.path.basename(words[0]) == "rg"
+    if rg and "--files" in words:
+        return None  # lists file names, reads no contents
+    values = RG_VALUE_OPTIONS if rg else GREP_VALUE_OPTIONS
+    recursive, hidden, unrestricted, pattern_given = rg, False, 0, False
+    operands, args, i = [], words[1:], 0
+    while i < len(args):
+        arg, i = args[i], i + 1
+        if arg == "--":
+            operands += args[i:]
+            break
+        if arg.startswith("--"):
+            name, separator, value = arg.partition("=")
+            if name in values and not separator:
+                value, i = (args[i] if i < len(args) else ""), i + 1
+            pattern_given |= name in ("--regexp", "--file")
+            hidden |= name == "--hidden"
+            unrestricted += name == "--unrestricted"
+            recursive |= name in ("--recursive", "--dereference-recursive") or (
+                name == "--directories" and value == "recurse")
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            for j, letter in enumerate(arg[1:]):
+                if rg:
+                    hidden |= letter == "."
+                    unrestricted += letter == "u"
+                else:
+                    recursive |= letter in "rR"
+                if f"-{letter}" in values:
+                    value = arg[j + 2:]
+                    if not value:
+                        value, i = (args[i] if i < len(args) else ""), i + 1
+                    pattern_given |= letter in "ef"
+                    recursive |= not rg and letter == "d" and value == "recurse"
+                    break
+            continue
+        operands.append(arg)
+    if not recursive:
+        return None
+    if not pattern_given:
+        operands = operands[1:]
+    # A ripgrep config file can turn --hidden on for every search.
+    configured = bool(os.environ.get("RIPGREP_CONFIG_PATH")) and "--no-config" not in args
+    return operands or ["."], rg and not hidden and unrestricted < 2 and not configured
+
+
+def secret_below(start: Path, home: Path, skips_hidden: bool) -> Path | None:
+    """The first secret area a recursive search from start reads: one start is
+    inside, or one below start, reached unless the search skips hidden entries
+    and the way down passes one."""
+    for name in SECRET_AREAS:
+        area = Path(os.path.realpath(home / name))
+        if inside(start, area):
+            return area
+        if inside(area, start):
+            below = area.relative_to(start).parts
+            if not (skips_hidden and any(part.startswith(".") for part in below)):
+                return area
+    return None
+
+
+# Programs that only read the files they name. A stage whose program is not here
+# counts as a write; over-blocking costs the model one rephrase.
+READ_ONLY_PROGRAMS = READERS | {
+    "jq", "sha1sum", "sha256sum", "shasum", "md5sum", "nl", "uniq", "cut", "tr",
+    "column", "basename", "dirname", "pwd", "test", "[", "echo", "printf", "cd",
+    "pushd", "sed", "sort", "find", "tree", "git", "export", "declare", "typeset", "unset",
+    "set", "alias", "local", "readonly",
+}
+# git subcommands that leave the working tree's files as they are.
+GIT_FILE_KEEPING = {"diff", "log", "show", "status", "blame", "ls-files", "ls-tree",
+                    "cat-file", "rev-parse", "grep", "shortlog", "describe", "add", "commit",
+                    "config"}
+REDIRECT = re.compile(r"^(?:&?>>?|>\||>&|<>)$")
+HARMLESS_REDIRECT_TARGET = re.compile(r"^(?:\d+|-|/dev/null|/dev/stdout|/dev/stderr)$")
+
+
+def redirect_targets(words: list[str]) -> list[str]:
+    return [following for word, following in zip(words, [*words[1:], ""])
+            if REDIRECT.match(word) and not HARMLESS_REDIRECT_TARGET.match(following)]
+
+
+# Input redirect operators (a here-string's word is text, not a file).
+INPUT_REDIRECT = re.compile(r"^(?:<|<&)$")
+
+
+def input_targets(words: list[str]) -> list[str]:
+    return [following for word, following in zip(words, [*words[1:], ""])
+            if INPUT_REDIRECT.match(word) and not HARMLESS_REDIRECT_TARGET.match(following)]
+
+
+
+# git settings sections none of whose keys make git run a program, and harmless
+# keys of sections that also hold program settings (core.pager, init.templateDir,
+# pull.twohead, which names a merge program).
+SAFE_GIT_CONFIG_SECTIONS = {
+    "user", "color", "advice", "column", "log", "i18n", "status", "commit", "push",
+    "fetch", "rebase", "branch", "tag", "apply", "am",
+}
+SAFE_GIT_CONFIG_KEYS = {
+    "init.defaultbranch", "core.autocrlf", "core.quotepath", "core.filemode", "core.safecrlf",
+    "core.ignorecase", "merge.conflictstyle", "merge.ff", "pull.rebase", "pull.ff",
+}
+
+
+def git_config_injection(words: list[str]) -> str | None:
+    """The first key a `git -c KEY=VALUE` or `--config-env=KEY=VAR` sets that is
+    neither in SAFE_GIT_CONFIG_SECTIONS nor in SAFE_GIT_CONFIG_KEYS (core.pager,
+    core.hooksPath, alias.*, safe.directory, ...), or None."""
+    if not words or os.path.basename(words[0]) != "git":
+        return None
+    args = words[1:]
+    i = git_subcommand_index(args)
+    head = args[:i] if i is not None else args
+    for j, arg in enumerate(head):
+        if arg in ("-c", "--config-env") and j + 1 < len(head):
+            setting = head[j + 1]
+        elif arg.startswith("--config-env="):
+            setting = arg.split("=", 1)[1]
+        else:
+            continue
+        key = setting.split("=", 1)[0]
+        if key.split(".", 1)[0].lower() not in SAFE_GIT_CONFIG_SECTIONS \
+                and key.lower() not in SAFE_GIT_CONFIG_KEYS:
+            return key
+    return None
+
+
+def git_config_target(words: list[str], cwd: Path, home: Path) -> Path | None:
+    """The git settings file `git config` with a value writes (--global:
+    ~/.gitconfig). None otherwise."""
+    if not words or os.path.basename(words[0]) != "git":
+        return None
+    args = words[1:]
+    i = git_subcommand_index(args)
+    if i is None or args[i] != "config":
+        return None
+    rest = args[i + 1:]
+    if not git_config_writes([a for a in rest if a.startswith("-")],
+                             [a for a in rest if not a.startswith("-")]):
+        return None
+    if "--global" in rest:
+        return home / ".gitconfig"
+    if "--system" in rest:
+        return Path("/etc/gitconfig")
+    return cwd / ".git" / "config"
+
+
+def git_repository_created(words: list[str], cwd: Path, home: Path) -> Path | None:
+    """Where `git init [dir]` or `git clone URL DIR` creates a repository, or None."""
+    if not words or os.path.basename(words[0]) != "git":
+        return None
+    args = words[1:]
+    i = git_subcommand_index(args)
+    if i is None or args[i] not in ("init", "clone"):
+        return None
+    positional = [a for a in args[i + 1:] if not a.startswith("-")]
+    wanted = 0 if args[i] == "init" else 1
+    if len(positional) > wanted:
+        target = positional[wanted]
+    elif args[i] == "init":
+        target = "."
+    else:  # clone without DIR: the URL's last component, below cwd
+        name = positional[0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1] if positional else ""
+        target = name[:-4] if name.endswith(".git") else name
+        if not target:
+            return None
+    try:
+        return resolve_word(target, cwd, home)
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+# git subcommands that rewrite the working tree without naming the files they touch.
+def git_rewrites_tree(words: list[str]) -> bool:
+    if not words or os.path.basename(words[0]) != "git":
+        return False
+    args = words[1:]
+    i = git_subcommand_index(args)
+    if i is None:
+        return False
+    sub, rest = args[i], args[i + 1:]
+    if sub in ("am", "merge", "rebase", "pull", "cherry-pick", "revert", "read-tree"):
+        return True
+    if sub == "apply":
+        return not any(a in ("--check", "--stat", "--numstat", "--summary") for a in rest)
+    paths = git_checkout_paths(words)
+    if paths is not None:  # named files are judged as paths; `:/`, `*.py` or a file list name none
+        return (any(path.startswith(":") or GLOB_CHARS & set(path) for path in paths)
+                or any(a.startswith("--pathspec-from-file") for a in rest))
+    positional = [a for a in rest if not a.startswith("-")]
+    if sub == "checkout":  # `-b NEW` keeps the files; `-b NEW START` checks START out
+        return not any(a in ("-b", "-B") for a in rest) or len(positional) >= 2
+    if sub == "switch":
+        creates = any(a in ("-c", "-C", "--create", "--force-create") for a in rest)
+        return not creates or len(positional) >= 2
+    if sub == "restore":
+        return False  # --staged alone writes only the index
+    if sub == "reset":
+        return any(a in ("--hard", "--merge", "--keep") for a in rest)
+    if sub == "stash":
+        return not (rest and rest[0] in ("list", "show"))
+    return False
+
+
+def git_checkout_paths(words: list[str]) -> list[str] | None:
+    """The paths `git checkout [REF] -- PATHS` or `git restore PATHS` rewrites in
+    the working tree; None for any other git command and for `restore --staged`,
+    which writes only the index."""
+    if not words or os.path.basename(words[0]) != "git":
+        return None
+    args = words[1:]
+    i = git_subcommand_index(args)
+    if i is None:
+        return None
+    sub, rest = args[i], args[i + 1:]
+    if sub == "checkout" and "--" in rest:
+        return rest[rest.index("--") + 1:]
+    if sub == "restore" and not ({"--staged", "-S"} & set(rest) and not {"--worktree", "-W"} & set(rest)):
+        paths, skip = [], False
+        for arg in rest:
+            if skip:
+                skip = False
+            elif arg in ("-s", "--source"):
+                skip = True
+            elif not arg.startswith("-"):
+                paths.append(arg)
+        return paths
+    return None
+
+
+
+
+def script_index(words: list[str]) -> int | None:
+    """Index of the file an interpreter stage runs, or None (inline code, a module,
+    standard input, or not an interpreter)."""
+    if not words or not INTERPRETER.match(os.path.basename(words[0])):
+        return None
+    for i, arg in enumerate(words[1:], 1):
+        if arg in INLINE_OR_MODULE or SHELL_STRING_FLAG.match(arg):
+            return None
+        if not arg.startswith("-"):
+            return i
+    return None
+
+
+def executed_file(stage: Stage, home: Path) -> Path | None:
+    """The file a stage runs: its program when given as a path, or an interpreter's
+    script operand. None for a bare command name or inline code."""
+    words = stage.words
+    if not words:
+        return None
+    index = 0 if "/" in words[0] else script_index(words)
+    if index is None:
+        return None
+    try:
+        return resolve_word(words[index], stage.cwds[-1], home)
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+def operand_words(words: list[str]) -> list[str]:
+    """A stage's words without the program and an interpreter's script operand:
+    running a file does not write it."""
+    index = script_index(words)
+    rest = words[1:]
+    return rest if index is None else rest[:index - 1] + rest[index:]
+
+
+# A sed command's optional address range and `!`, its `s/re/text/` body, and the
+# characters that end a command.
+SED_ADDRESS = r"(?:\d+(?:~\d+)?|\$|/(?:\\.|[^/\\])*/[IM]*)"
+SED_COMMAND_START = re.compile(
+    rf"[\s;]*(?:{SED_ADDRESS}(?:\s*,\s*(?:[+~]?\d+|{SED_ADDRESS}))?)?\s*!*\s*")
+SED_SUBSTITUTE = re.compile(r"s(.)((?:\\.|(?!\1).)*)\1((?:\\.|(?!\1).)*)\1")
+SED_SEPARATOR = re.compile(r"[;\n{}]")
+
+
+def sed_script_targets(script: str) -> list[str]:
+    """The files a sed script writes: the rest of the line after a `w`/`W` command
+    or an `s///` command's `w` flag. Commands are read left to right, so a `w` in
+    a regex, a replacement or a file name is not taken for one."""
+    targets, i = [], 0
+    while i < len(script):
+        i = SED_COMMAND_START.match(script, i).end()
+        if i >= len(script):
+            break
+        command = script[i]
+        if command in "{}":
+            i += 1
+            continue
+        if command == "s":
+            match = SED_SUBSTITUTE.match(script, i)
+            if match:
+                i = match.end() + len(re.match(r"[0-9gpiImMe]*", script[match.end():]).group(0))
+                if i >= len(script) or script[i] not in "wW":
+                    continue
+                command = script[i]
+        if command in "wW":
+            end = script.find("\n", i)
+            end = len(script) if end < 0 else end
+            if script[i + 1:end].strip():
+                targets.append(script[i + 1:end].strip())
+            i = end
+            continue
+        separator = SED_SEPARATOR.search(script, i + 1)
+        i = separator.start() if separator else len(script)
+    return targets
+
+
+def sed_targets(args: list[str]) -> list[str] | None:
+    """The files sed writes besides standard output: the `w` targets of its
+    expressions (-e X, -eX, --expression=X, or the first operand when no -e is
+    given). None when it rewrites its input files (-i) or runs a script file the
+    hook cannot see (-f), so that every operand may be written. Short options are
+    read letter by letter: -ni and -nf count."""
+    expressions, operands, take_next = [], [], False
+    for arg in args:
+        if take_next:
+            expressions.append(arg)
+            take_next = False
+        elif arg.startswith(("--in-place", "--file")):
+            return None
+        elif arg.startswith("--expression"):
+            if "=" in arg:
+                expressions.append(arg.split("=", 1)[1])
+            else:
+                take_next = True
+        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            for j, letter in enumerate(arg[1:]):
+                if letter in "if":
+                    return None  # -i, -ni, -i.bak, -f, -nf
+                if letter == "e":
+                    attached = arg[j + 2:]
+                    if attached:
+                        expressions.append(attached)
+                    else:
+                        take_next = True
+                    break
+        elif not arg.startswith("-"):
+            operands.append(arg)
+    return [target for script in (expressions or operands[:1])
+            for target in sed_script_targets(script)]
+
+
+def sed_files(args: list[str]) -> list[str]:
+    """sed's input files: its operands after the script, which is the first
+    operand unless -e, --expression, -f or --file gives it."""
+    positional, script_given, take_next = [], False, False
+    for arg in args:
+        if take_next:
+            take_next = False
+        elif arg.startswith(("--expression", "--file")):
+            script_given, take_next = True, "=" not in arg
+        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            for j, letter in enumerate(arg[1:]):
+                if letter == "i":
+                    break  # the rest is a backup suffix
+                if letter in "ef":
+                    script_given, take_next = True, not arg[j + 2:]
+                    break
+        elif not arg.startswith("-"):
+            positional.append(arg)
+    return positional if script_given else positional[1:]
+
+
+def sed_writes(args: list[str]) -> bool:
+    return sed_targets(args) != []
+
+
+def program_writes(words: list[str]) -> bool:
+    """True unless the stage's program only reads the files it names; redirects
+    are judged separately, by their targets."""
+    if not words:
+        return False
+    program, args = os.path.basename(words[0]), words[1:]
+    if program not in READ_ONLY_PROGRAMS:
+        return True
+    if program == "sed":
+        return sed_writes(args)
+    if program == "sort":
+        return any(a == "--output" or a.startswith(("-o", "--output=")) for a in args)
+    if program == "find":
+        return find_writes(args)
+    if program == "tree":
+        return any(a.startswith("-o") for a in args)
+    if program == "git":
+        i = git_subcommand_index(args)
+        subcommand = args[i] if i is not None else ""
+        return subcommand not in GIT_FILE_KEEPING or any(a.startswith("--output") for a in args)
+    return False
+
+
+def stage_paths(stage: Stage, home: Path, words: list[str] | None = None) -> list[Path]:
+    """Every path the given words (default: the whole stage) may name: plain words,
+    `--opt=value` values and attached short-option values (`-o/path`), against
+    each candidate directory, with globs expanded as the shell would."""
+    paths = []
+    for word in stage.words if words is None else words:
+        if URL_WORD.match(word) and "/.." not in word:
+            continue  # a URL, not a path
+        if word.startswith("--"):
+            values = [word.split("=", 1)[1]] if "=" in word else []
+        elif word.startswith("-") and len(word) > 2:
+            values = [word[2:]]
+        elif word.startswith("-"):
+            values = []  # -i, -n, -: an option or standard input
+        elif KEY_VALUE_WORD.match(word):
+            values = [word.split("=", 1)[1]]  # dd of=PATH, make VAR=PATH
+        else:
+            values = [word]
+        for value in values:
+            for directory in stage.cwds:
+                try:
+                    paths.extend(expand_word(value, directory, home))
+                except (ValueError, OSError, RuntimeError):
+                    continue
+    return paths
+
+
+URL_WORD = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+URL_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"]*")
+KEY_VALUE_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Inside the agent-config clone, its control directories by relative name at
+# the start of a word (so skills/x/scripts/y.py is not one).
+AGENT_REPO_SPELLING = re.compile(r"(?:^|[\s'\"(=,])((?:\./)?(?:hooks|bin|scripts)/[^\s'\"),]*)")
+
+
+COPIERS = {"cp", "ln", "install", "rsync", "ditto"}
+
+
+def copy_destination(program: str, args: list[str]) -> list[str]:
+    """What cp, ln, install, rsync or ditto writes: the -t directory, every operand
+    of `install -d`, or the last operand."""
+    operands = [a for a in args if not a.startswith("-")]
+    if program == "install" and ("-d" in args or "--directory" in args):
+        return operands
+    for i, arg in enumerate(args):
+        if arg in ("-t", "--target-directory") and i + 1 < len(args):
+            return [args[i + 1]]
+        if arg.startswith("--target-directory="):
+            return [arg.split("=", 1)[1]]
+    return operands[-1:]
+
+
+def option_values(args: list[str], short: str, long: str) -> list[str]:
+    """The values of an option given as `-o X`, `-oX`, `--output X` or `--output=X`."""
+    values = []
+    for i, arg in enumerate(args):
+        if arg in (short, long) and i + 1 < len(args):
+            values.append(args[i + 1])
+        elif arg.startswith(long + "="):
+            values.append(arg.split("=", 1)[1])
+        elif arg.startswith(short) and not arg.startswith("--") and len(arg) > len(short):
+            values.append(arg[len(short):])
+    return values
+
+
+TAR_MODES = set("cxtrudA")
+
+
+def tar_cluster(args: list[str]) -> tuple[int, str]:
+    """Where tar's mode letters are and what they are: the first word when it has
+    no dash (old style, `tar czf ARCHIVE`), else the first single-dash word holding
+    a mode letter, wherever options such as `-C DIR` or `--exclude=X` put it.
+    (-1, "") when there is none."""
+    if args and not args[0].startswith("-"):
+        return 0, args[0]
+    for i, arg in enumerate(args):
+        if arg.startswith("-") and not arg.startswith("--") and TAR_MODES & set(arg[1:]):
+            return i, arg[1:]
+    return -1, ""
+
+
+def tar_directory(args: list[str]) -> list[str]:
+    """Where tar extracts: -C DIR, -CDIR, --directory[=]DIR, --one-top-level=DIR,
+    or a C in the mode cluster (`-xzC DIR`, `-xCDIR`); [] for the working
+    directory."""
+    at, cluster = tar_cluster(args)
+    for i, arg in enumerate(args):
+        if arg in ("-C", "--directory") and i + 1 < len(args):
+            return [args[i + 1]]
+        if arg.startswith(("--directory=", "--one-top-level=")):
+            return [arg.split("=", 1)[1]]
+        if arg.startswith("-C") and len(arg) > 2:
+            return [arg[2:]]
+    if "C" in cluster:
+        attached = cluster[cluster.index("C") + 1:]
+        after = at + 1 + cluster[:cluster.index("C")].count("f")  # f takes its word first
+        return [attached] if attached else args[after:after + 1]
+    return []
+
+
+def tar_created_archive(args: list[str]) -> list[str] | None:
+    """The archive a creating tar writes (-f FILE, --file=FILE, or the word after
+    a cluster such as czf); None when tar does not create."""
+    at, cluster = tar_cluster(args)
+    if "--create" not in args and "c" not in cluster:
+        return None
+    archives = [a.split("=", 1)[1] for a in args if a.startswith("--file=")]
+    archives += [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-f", "--file")]
+    if "f" in cluster:
+        old_style = at == 0 and not args[0].startswith("-")
+        attached = "" if old_style else cluster[cluster.index("f") + 1:]
+        archives.append(attached or (args[at + 1] if at + 1 < len(args) else ""))
+    return archives
+
+
+def written_operands(words: list[str]) -> list[str]:
+    """The operands a writing stage writes, where the hook can tell them from what
+    it reads: a copy's destination, the -o file of sort and tree, sed's `w` files
+    (or its input files with -i or -f),
+    a creating archiver's archive. Every operand otherwise; redirects never."""
+    program, args = os.path.basename(words[0]), words[1:]
+    if program in COPIERS:
+        return copy_destination(program, args)
+    if program in ("sort", "tree"):
+        return option_values(args, "-o", "--output")
+    if program == "sed":
+        targets = sed_targets(args)
+        return sed_files(args) if targets is None else targets
+    if program in ("tar", "bsdtar"):
+        archives = tar_created_archive(args)
+        if archives is not None:
+            return archives
+    if program == "zip":
+        return [a for a in args if not a.startswith("-")][:1]
+    if program in ("7z", "7za", "7zz"):
+        operands = [a for a in args if not a.startswith("-")]
+        if operands[:1] in (["a"], ["u"], ["d"]):
+            return operands[1:2]
+    return operand_words(words)
+
+
+def ancestor_operands(words: list[str]) -> list[str]:
+    """The operands a stage writes into as directories, for the ancestor rule: the
+    destination of a copy, every operand of mv, -C or the working directory of an
+    extracting tar, unzip's -d, 7z's -o, the start points of a writing find, the
+    paths of `git checkout -- PATHS` and `git restore`, dd's of=, and every operand
+    of the other writers (rm, chmod, ...). Empty for programs that do not write
+    into directories they name, so `cmake ..`, `pytest .` and
+    `./configure --prefix=~/.local` are not caught."""
+    if not words:
+        return []
+    program, args = os.path.basename(words[0]), words[1:]
+    operands = [a for a in args if not a.startswith("-")]
+    if program == "mv":
+        return operands  # the sources disappear, the destination is written
+    if program in COPIERS:
+        return copy_destination(program, args)
+    if program == "unzip":
+        if any(a in ("-l", "-t", "-v", "-Z", "-p", "-c") for a in args):
+            return []  # lists, tests or prints
+        return option_values(args, "-d", "--exdir") or ["."]
+    if program in ("7z", "7za", "7zz"):
+        if not operands or operands[0] not in ("x", "e"):
+            return []
+        return [a[2:] for a in args if a.startswith("-o")] or ["."]
+    if program == "find":
+        return find_start_points(args) if find_writes(args) else []
+    if program == "git":
+        return git_checkout_paths(words) or []
+    if program == "zip":
+        return []  # writes only its archive
+    if program in ("tar", "bsdtar"):
+        extracting = "--extract" in args or "--get" in args or "x" in tar_cluster(args)[1]
+        return (tar_directory(args) or ["."]) if extracting else []
+    if program == "dd":
+        return [a.split("=", 1)[1] for a in args if a.startswith("of=")]
+    return operands if program in WRITERS else []
+
+
+def spelled_control(text: str, in_agent_repo: bool = False) -> str | None:
+    """A control-file spelling in free text, where no path can be resolved, as
+    the whole word that holds it. URLs are not paths and are skipped, unless they
+    climb with `/..`."""
+    text = URL_TEXT.sub(lambda m: m.group(0) if "/.." in m.group(0) else " ", text)
+    for spelling in CONTROL_SPELLINGS:
+        if spelling in text:
+            return re.search(r"[^\s'\"(=,]*" + re.escape(spelling) + r"[^\s'\"),]*", text).group(0)
+    if in_agent_repo:
+        match = AGENT_REPO_SPELLING.search(text)
+        if match:
+            return match.group(1)
+    match = VIBE_DIR_SPELLING.search(text)
+    return match.group(0).strip() if match else None
+
+
+CONTROL_WRITE = (
+    "this command can write {control}, which decides what Vibe, git or the tool guard "
+    "runs or allows. Change it with the edit tool, where the change is checked, or "
+    "leave it to the user"
+)
+
+# A program the hook does not know to be read-only, naming a control file: the
+# hook cannot tell whether it writes it.
+UNKNOWN_PROGRAM_ON_CONTROL = (
+    "{program} is not known to only read files, and it names {control}, which decides "
+    "what Vibe, git or the tool guard runs or allows. If it only reads, ask the user to "
+    "run it, or run it on a copy in a worktree"
+)
+TAMPER_PROOF_WRITE = "{path} is written only by Vibe and this hook; no tool call may change it"
+
+
+def inline_code(words: list[str]) -> list[str]:
+    """The program text a python, node, perl or ruby stage runs from its own words:
+    the word after -c, -e, -p, --eval or --print (or a cluster such as -pe), and
+    everything after a lone `-` (a program on standard input, a heredoc's body).
+    Shells are not here: their -c strings are walked as commands."""
+    program = os.path.basename(words[0]) if words else ""
+    if not INTERPRETER.match(program) or program in SHELLS:
+        return []
+    code = []
+    for i, arg in enumerate(words[1:], 1):
+        if arg == "-":
+            return [*code, *words[i + 1:]]
+        if arg.startswith(("--eval=", "--print=")):
+            code.append(arg.split("=", 1)[1])
+        elif (arg in ("--eval", "--print") or re.fullmatch(r"-[A-Za-z]*[cep]", arg)) and i + 1 < len(words):
+            code.append(words[i + 1])
+    return code
+
+
+CONTROL_ANCESTOR_WRITE = (
+    "this command writes into {directory}, which holds files that decide what Vibe, git "
+    "or the tool guard runs or allows. Write into a directory below it, or leave it to "
+    "the user"
+)
+# Added when a relative target after a `cd` is what reached that directory.
+AFTER_CD = (
+    ". After a cd, the hook checks a relative target from every directory the command "
+    "may be in, because it cannot track subshells; name the target directory instead"
+)
+
+# An assignment that points git at another repository or working tree, and one
+# that hands git settings through the environment (GIT_CONFIG_PARAMETERS,
+# GIT_CONFIG_KEY_0, GIT_CONFIG_GLOBAL, ...).
+GIT_LOCATION_WORD = re.compile(r"(?:^|\s)GIT_(?:DIR|WORK_TREE|COMMON_DIR)=")
+GIT_CONFIG_WORD = re.compile(r"(?:^|\s)GIT_CONFIG\w*=")
+
+
+# fragments/vibe/config.toml's read_file allowlist (a test keeps them equal): the
+# files read_file reads with no prompt.
+READ_FILE_ALLOWLIST = (
+    "*/.vibe/config.toml", "*/.agents/configs/vibe/*", "*/.agents/fragments/vibe/*",
+    "*/.agents/global-rules/*",
+)
+# Programs that print what they read, so their read can go to read_file instead.
+FILE_READERS = {"cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "sed",
+                "wc", "nl", "cut", "sort", "jq", "diff"}
+
+
+def read_file_instead(stages: list[Stage], command: str, home: Path) -> Path | None:
+    """A Vibe settings file a bash command reads for the model, naming a `.vibe`
+    path (which makes Vibe ask the user), where read_file would read it with no
+    prompt: every stage naming a `.vibe` path is a reader of such files only, and
+    no output goes to a file. None otherwise (listings, copies, other files)."""
+    if not VIBE_DIR_SPELLING.search(command) or any(redirect_targets(s.raw) for s in stages):
+        return None
+    files = []
+    for stage in stages:
+        if not stage.words or os.path.basename(stage.words[0]) in CWD_CHANGERS:
+            continue
+        named = [path for path in stage_paths(stage, home, stage.words[1:]) if in_vibe_settings(path)]
+        if not named:
+            continue
+        if os.path.basename(stage.words[0]) not in FILE_READERS or program_writes(stage.words):
+            return None
+        if not all(path.is_file() and any(fnmatch.fnmatch(str(path), pattern)
+                                          for pattern in READ_FILE_ALLOWLIST) for path in named):
+            return None
+        files += named
+    return files[0] if files else None
+
+
+def git_environment(earlier: list[Stage], stage: Stage) -> str:
+    """The assignments that reach a git stage, as text: its own leading ones and
+    those of earlier `export`/`declare`/`typeset` stages. A commit message is not
+    among them."""
+    exported = [w for s in earlier
+                if (os.path.basename(s.words[0]) in ("export", "declare", "typeset") if s.words
+                    else all(ASSIGNMENT_WORD.match(w) for w in s.raw))  # `X=1;`, not `X=1 bash -c …`
+                for w in s.raw if ASSIGNMENT_WORD.match(w)]
+    own = []
+    for word in stage.raw:
+        if os.path.basename(word) == "git":
+            break
+        if ASSIGNMENT_WORD.match(word):
+            own.append(word)
+    return " ".join([*exported, *own])
+
+
+def git_c_directories(stage: Stage, home: Path) -> list[Path]:
+    """Where a git stage given `-C DIR` runs, from each directory it may start in;
+    each -C applies to the one before. Empty without -C."""
+    if not stage.words or os.path.basename(stage.words[0]) != "git":
+        return []
+    args = stage.words[1:]
+    i = git_subcommand_index(args)
+    head = args[:i] if i is not None else args
+    values = [head[j + 1] for j, arg in enumerate(head[:-1]) if arg == "-C"]
+    if not values:
+        return []
+    directories = []
+    for base in stage.cwds:
+        try:
+            for value in values:
+                base = resolve_word(value, base, home)
+        except (ValueError, OSError, RuntimeError):
+            continue
+        directories.append(base)
+    return directories
+
+
+def git_top(path: Path) -> Path | None:
+    """The working tree path lies in: the nearest directory at or above it with a
+    `.git` entry (a directory in a main clone, a file in a linked worktree)."""
+    return next((d for d in (path, *path.parents) if (d / ".git").exists()), None)
+
+
+def bash_path_denial(command: str, cwd: Path, home: Path,
+                     temp_roots: tuple[Path, ...] = ()) -> str | None:
+    """Why a bash command must not run: a stage names a secret, or searches
+    recursively from above one; a stage's redirect targets a control file; git
+    settings are written, or injected with a key that can run a program; git
+    creates a repository outside the working directory and the temporary
+    directories; a stage whose program writes writes a control file or into a
+    directory above one; git settings come from the environment; git or patch
+    rewrites files of the agent-config clone without naming them; or a read
+    of a Vibe settings file belongs to read_file. A stage that runs a file in
+    the repository's control directories runs the user's own guarded code, so its
+    operands are not held against it."""
+    stages = command_stages(command, cwd, home)
+    if stages is None:
+        return None
+    for index, stage in enumerate(stages):
+        for path in stage_paths(stage, home):
+            if secret(path):
+                return f"{path} holds keys or credentials, which no tool may read or write"
+        searched = search_starts(stage.words)
+        if searched is not None:
+            starts, skips_hidden = searched
+            for start in stage_paths(stage, home, starts):
+                reached = secret_below(start, home, skips_hidden)
+                if reached is not None:
+                    return (f"a recursive search from {start} would read {reached}, which holds "
+                            "keys, credentials or session transcripts. Search a directory that "
+                            "does not contain it")
+        outputs = redirect_targets(stage.raw)
+        for target in [*outputs, *input_targets(stage.raw)]:
+            for directory in stage.cwds:
+                try:
+                    resolved = expand_word(target, directory, home)
+                except (ValueError, OSError, RuntimeError):
+                    continue
+                for path in resolved:
+                    if secret(path):
+                        return f"{path} holds keys or credentials, which no tool may read or write"
+                    if target in outputs and tamper_proof(path, home):
+                        return TAMPER_PROOF_WRITE.format(path=path)
+                    if target in outputs and harness_control(path, home):
+                        return CONTROL_WRITE.format(control=path)
+        injected = git_config_injection(stage.words)
+        if injected is not None:
+            return (f"`git -c {injected}=…` sets a git setting the hook does not know to be "
+                    "harmless; settings such as core.pager, core.hooksPath and alias.* run "
+                    "programs. Leave it out (for paging, use `git --no-pager`) or ask the user")
+        git_settings = git_config_target(stage.words, stage.cwds[-1], home)
+        if git_settings is not None:
+            return CONTROL_WRITE.format(control=git_settings)
+        created = git_repository_created(stage.words, stage.cwds[-1], home)
+        in_project = inside(created, cwd) and cwd != home and cwd not in home.parents \
+            if created is not None else False
+        if created is not None and not (in_project
+                                        or any(inside(created, r) for r in temp_roots)):
+            return (
+                f"git would create a repository at {created}, outside the working directory, "
+                "and writes there would then pass as undoable. Ask the user to create it"
+            )
+        executed = executed_file(stage, home)
+        if executed is not None and any(inside(executed, d) for d in control_dirs(home)):
+            continue  # the user's own guarded code, run as installed
+        # The main clone only: a worktree elsewhere or inside it is ordinary work.
+        # `git -C DIR` runs in DIR alone; no subshell can leave it elsewhere.
+        repo_dirs = git_c_directories(stage, home) or list(stage.cwds)
+        clone = (home / ".agents").resolve()
+        in_agent_repo = any(git_top(directory) == clone for directory in repo_dirs)
+        program = os.path.basename(stage.words[0]) if stage.words else ""
+        writes = stage.refused or program_writes(stage.words)
+        operands = stage.words if stage.refused else written_operands(stage.words) if writes else []
+        if writes:
+            known_writer = stage.refused or program in WRITERS or program in READ_ONLY_PROGRAMS
+            for path in stage_paths(stage, home, operands):
+                if tamper_proof(path, home):
+                    return TAMPER_PROOF_WRITE.format(path=path)
+                if harness_control(path, home):
+                    if known_writer:
+                        return CONTROL_WRITE.format(control=path)
+                    return UNKNOWN_PROGRAM_ON_CONTROL.format(program=program, control=path)
+            for word in ancestor_operands(stage.words):
+                for path in stage_paths(stage, home, [word]):
+                    if holds_control(path, home):
+                        after_cd = len(stage.cwds) > 1 and not expand_home(word, home).startswith("/")
+                        return CONTROL_ANCESTOR_WRITE.format(directory=path) + (AFTER_CD if after_cd else "")
+            # Words are judged by where they resolve; only text no path can be read
+            # from (inline code, a refused wrapper) is searched for spellings.
+            spelled = spelled_control(stage.text if stage.refused else " ".join(inline_code(stage.words)),
+                                      in_agent_repo)
+            if spelled is not None:
+                return CONTROL_WRITE.format(control=spelled)
+        git_at = next((i for i, w in enumerate(stage.words) if os.path.basename(w) == "git"), None)
+        environment = git_environment(stages[:index], stage) if git_at is not None else ""
+        relocated = git_at is not None and (GIT_LOCATION_WORD.search(environment) or any(
+            w.startswith(("--git-dir", "--work-tree")) for w in stage.words[git_at + 1:]))
+        if git_at is not None and GIT_CONFIG_WORD.search(environment):
+            return ("git settings given through GIT_CONFIG_* variables, which the hook does not "
+                    "read, can make git run a program. Leave them out or ask the user")
+        if relocated and (git_rewrites_tree(stage.words[git_at:])
+                          or git_checkout_paths(stage.words[git_at:]) is not None):
+            return (
+                "git pointed at another repository or working tree (GIT_DIR, GIT_WORK_TREE, "
+                "--git-dir, --work-tree) would rewrite a tree the hook cannot locate. Leave it "
+                "to the user"
+            )
+        if in_agent_repo and (git_rewrites_tree(stage.words) or program == "patch"):
+            return (
+                "this command may rewrite files of the agent-config clone (~/.agents) "
+                "without naming them, which could change what the harnesses run. To restore named "
+                "files, use `git restore FILE` or `git checkout -- FILE`, which are judged by "
+                "their paths; for a worktree, name it with `git -C WORKTREE`; otherwise leave "
+                "it to the user"
+            )
+    settings = read_file_instead(stages, command, home)
+    if settings is not None:
+        return (f"{settings} is one of Vibe's settings files: read it with the read_file tool, "
+                "which needs no prompt, instead of bash, which asks the user whenever a command "
+                "names a .vibe path")
+    return None
+
+
+# --- approvals: the user's "Allow" from ask_user_question ------------------------
+
+APPROVAL_QUESTION = "Allow Vibe to write {path}?"
+# The question exactly as the hook asked for it: a path without glob characters,
+# then `?`, then nothing or the hook's change summary.
+APPROVAL_PATTERN = re.compile(r"Allow Vibe to write ([~/][^?*\[\]]*)\?(?: Changes: .*)?$")
+# The question tool's exact qualified name; a provided tool with the same leaf
+# name (mcp_<server>.ask_user_question) must not be able to record consent.
+APPROVAL_TOOL_NAMES = frozenset({"ui.ask_user_question"})
+
+
+def session_key(payload: dict[str, Any]) -> str | None:
+    """A subagent shares its parent's approvals: the user answered the parent."""
+    return payload.get("parent_session_id") or payload.get("session_id")
+
+
+class ApprovalStore:
+    """What the user allowed in one session, in
+    ~/.vibe/tool-guard/approvals/<session>.json. Only this hook writes there.
+
+    files    paths outside git the user allowed for the rest of the session
+    pending  control-file writes the hook denied: path -> the call's hash and the
+             change summary the question had to show the user
+    calls    [path, call hash] pairs the user allowed, each good for that one call
+    """
+
+    def __init__(self, home: Path, session: str | None) -> None:
+        valid = bool(session) and re.fullmatch(r"[A-Za-z0-9_-]+", str(session))
+        self.file = (
+            home / ".vibe" / "tool-guard" / "approvals" / f"{session}.json" if valid else None
+        )
+
+    def _load(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"files": [], "pending": {}, "calls": []}
+        if self.file is None:
+            return data
+        try:
+            stored = json.loads(self.file.read_text())
+        except (OSError, ValueError):
+            return data
+        if isinstance(stored, dict):
+            data["files"] = [p for p in stored.get("files", []) if isinstance(p, str)]
+            data["pending"] = {k: v for k, v in (stored.get("pending") or {}).items()
+                               if isinstance(v, dict)}
+            data["calls"] = [c for c in stored.get("calls", []) if isinstance(c, list) and len(c) == 2]
+        return data
+
+    def _save(self, data: dict[str, Any]) -> None:
+        if self.file is None:
+            return
+        self.file.parent.mkdir(parents=True, exist_ok=True)
+        partial = self.file.with_suffix(".partial")
+        partial.write_text(json.dumps(data, sort_keys=True))
+        os.replace(partial, self.file)
+
+    def add(self, path: Path) -> None:
+        data = self._load()
+        if str(path) not in data["files"]:
+            data["files"].append(str(path))
+        self._save(data)
+
+    def has(self, path: Path) -> bool:
+        return str(path) in self._load()["files"]
+
+    def pend(self, path: Path, call: str, summary: str) -> None:
+        data = self._load()
+        data["pending"][str(path)] = {"call": call, "summary": summary}
+        self._save(data)
+
+    def approve(self, path: Path, question: str) -> None:
+        """The user answered Allow to `question` about `path`. A pending control
+        write whose summary the question showed becomes an allowed call; anything
+        else becomes a session approval of the file, which control files ignore."""
+        data = self._load()
+        pending = data["pending"].pop(str(path), None)
+        expected = APPROVAL_QUESTION.format(path=path)
+        if pending is not None and pending.get("summary"):
+            expected += f" {pending['summary']}"
+        if pending is not None and question == expected:
+            data["calls"].append([str(path), pending.get("call")])
+        elif str(path) not in data["files"]:
+            data["files"].append(str(path))
+        self._save(data)
+
+    def take(self, path: Path, call: str) -> bool:
+        data = self._load()
+        if [str(path), call] not in data["calls"]:
+            return False
+        data["calls"].remove([str(path), call])
+        self._save(data)
+        return True
+
+
+def canonical_path(spelled: str, home: Path) -> Path | None:
+    """The path the user saw, if it is absolute after `~` expansion and already
+    its own resolved form; None for any other spelling."""
+    expanded = expand_home(spelled.strip(), home)
+    if not expanded.startswith("/") or os.path.normpath(expanded) != expanded:
+        return None
+    path = Path(expanded)
+    try:
+        return path if path.resolve() == path else None
+    except (ValueError, OSError, RuntimeError):
+        return None
+
+
+def record_approvals(payload: dict[str, Any], home: Path) -> list[str]:
+    """Store every path the user allowed in an ask_user_question answer; return them."""
+    if str(payload.get("tool_name", "")) not in APPROVAL_TOOL_NAMES:
+        return []
+    if payload.get("tool_status") != "success":
+        return []
+    output = payload.get("tool_output")
+    if not isinstance(output, dict):
+        try:
+            output = json.loads(payload.get("tool_output_text") or "")
+        except ValueError:
+            return []
+    answers = output.get("answers") if isinstance(output, dict) else None
+    store = ApprovalStore(home, session_key(payload))
+    if store.file is None or not isinstance(answers, list):
+        return []
+    recorded = []
+    for answer in answers:
+        if not isinstance(answer, dict) or answer.get("isOther"):
+            continue
+        if str(answer.get("answer", "")).strip() != "Allow":
+            continue
+        question = str(answer.get("question", "")).strip()
+        match = APPROVAL_PATTERN.match(question)
+        path = canonical_path(match.group(1), home) if match else None
+        if path is not None:
+            store.approve(path, question)
+            recorded.append(str(path))
+    return recorded
+
+
+# --- URLs: hosts no tool may contact --------------------------------------------
+# A host matches if it equals an entry or ends with "." + entry.
+
+# Paste bins, drop boxes, request catchers, tunnels: the standard places a
+# prompt-injected model would send data to. No legitimate coding task needs them.
+EXFILTRATION_HOSTS = [
+    "0x0.st", "anonfiles.com", "beeceptor.com", "burpcollaborator.net",
+    "catbox.moe", "ceye.io", "dnslog.cn", "dpaste.com", "dpaste.org",
+    "file.io", "ghostbin.com", "gofile.io", "hastebin.com", "hookbin.com",
+    "interact.sh", "ix.io", "loca.lt", "localhost.run", "ngrok-free.app",
+    "ngrok.app", "ngrok.dev", "ngrok.io", "oast.fun", "oast.live", "oast.me",
+    "oast.online", "oast.pro", "oast.site", "oastify.com", "paste.ee",
+    "pastebin.com", "pipedream.net", "privatebin.net", "rentry.co",
+    "requestbin.com", "requestbin.net", "requestcatcher.com", "serveo.net",
+    "sprunge.us", "termbin.com", "transfer.sh", "trycloudflare.com",
+    "webhook.site",
+]
+
+# Shorteners hide the real destination from the user reading the transcript.
+URL_SHORTENER_HOSTS = [
+    "adf.ly", "bc.vc", "bit.ly", "buff.ly", "cutt.ly", "goo.gl", "is.gd",
+    "ow.ly", "rb.gy", "rebrand.ly", "shorte.st", "shorturl.at", "t.co",
+    "tiny.cc", "tinyurl.com",
+]
+
+# Services whose whole purpose is to log the IP of whoever opens the link.
+IP_LOGGER_HOSTS = ["2no.co", "grabify.link", "iplogger.com", "iplogger.org", "yip.su"]
+
+# Legally grey or piracy sites. Not dangerous to the machine; listed because the
+# user asked for on-the-fence hosts too. Delete an entry to allow it.
+ON_THE_FENCE_HOSTS = [
+    "1337x.to", "annas-archive.org", "libgen.is", "libgen.li", "libgen.rs",
+    "sci-hub.ru", "sci-hub.se", "sci-hub.st", "thepiratebay.org", "z-lib.org",
+]
+
+# Names that resolve inside this machine's own network or to cloud metadata.
+# web_fetch runs locally, so a URL here reaches services the model should not.
+INTERNAL_HOST_SUFFIXES = [
+    "localhost", "local", "internal", "lan", "home.arpa", "metadata.google.internal",
+]
+
+DENIED_HOSTS: dict[str, str] = {}
+for _hosts, _why in (
+    (EXFILTRATION_HOSTS, "data exfiltration / out-of-band endpoint"),
+    (URL_SHORTENER_HOSTS, "URL shortener hides the destination"),
+    (IP_LOGGER_HOSTS, "IP logger"),
+    (ON_THE_FENCE_HOSTS, "on-the-fence site"),
+    (INTERNAL_HOST_SUFFIXES, "internal / private network name"),
+):
+    for _h in _hosts:
+        DENIED_HOSTS[_h] = _why
+
+# "]" stays inside a URL so bracketed IPv6 hosts like http://[::1]/ survive.
+URL_PATTERN = re.compile(r"https?://[^\s'\"<>`)}]+", re.IGNORECASE)
+
+
+def host_denial_reason(host: str) -> str | None:
+    host = host.lower().rstrip(".")
+    if not host:
+        return None
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+    if ip is not None:
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return "private, loopback, link-local or metadata address"
+        return None
+    for denied, why in DENIED_HOSTS.items():
+        if host == denied or host.endswith("." + denied):
+            return why
+    return None
+
+
+def iter_strings(value: Any, key: str | None = None):
+    if isinstance(value, str):
+        yield key, value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from iter_strings(v, str(k))
+    elif isinstance(value, list):
+        for v in value:
+            yield from iter_strings(v, key)
+
+
+def urls_in(tool_input: dict[str, Any]):
+    for key, text in iter_strings(tool_input):
+        for match in URL_PATTERN.findall(text):
+            yield match
+        # web_fetch and open_url accept a bare host; Vibe prepends https://.
+        if key == "url" and "://" not in text and text.strip():
+            yield "https://" + text.strip()
+
+
+# --- edits: only where git can undo them, or with the user's Allow ---------------
+
+# `search_replace` is the unified harness's name for the edit tool.
+EDITING_TOOLS = {"edit", "write_file", "search_replace"}
+# config.toml keys a session may change on its own: which model runs and how.
+SAFE_CONFIG_KEYS = frozenset({"active_model", "theme", "models"})
+
+
+def config_files(home: Path) -> set[Path]:
+    """The live Vibe config, and the fragment the installer merges into it (in ~/.agents)."""
+    return {(home / ".vibe" / "config.toml").resolve(),
+            (home / ".agents" / "fragments" / "vibe" / "config.toml").resolve()}
+
+
+def edited_text(old: str, tool_name: str, tool_input: dict[str, Any]) -> str | None:
+    """The file's text after this call, or None when the hook cannot reproduce it."""
+    if tool_name == "write_file":
+        content = tool_input.get("content")
+        return content if isinstance(content, str) else None
+    blocks = tool_input.get("content")
+    if not isinstance(blocks, list):
+        blocks = [{"old_str": tool_input.get("old_string"),
+                   "new_str": tool_input.get("new_string"),
+                   "replace_all": tool_input.get("replace_all", False)}]
+    text = old
+    for block in blocks:
+        if not isinstance(block, dict):
+            return None
+        find, put = block.get("old_str"), block.get("new_str")
+        if not isinstance(find, str) or not isinstance(put, str) or not find or find not in text:
+            return None
+        text = text.replace(find, put, -1 if block.get("replace_all") else 1)
+    return text
+
+
+def model_key(entry: dict[str, Any]) -> object:
+    return entry.get("alias") or entry.get("name")
+
+
+def models_change_is_safe(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """A models change is safe when the classifier's model entry is untouched, every
+    model uses a provider the file already had, and no model gains a connector
+    the file did not already enable."""
+    classifier = str((old.get("utility_models") or {}).get("smart_approve") or "").strip()
+    if classifier:
+        before = [m for m in old.get("models", []) if model_key(m) == classifier]
+        after = [m for m in new.get("models", []) if model_key(m) == classifier]
+        if before != after:
+            return False
+    providers = {p.get("name") for p in old.get("providers", [])}
+    providers |= {m.get("provider") for m in old.get("models", [])}
+    enabled = {c.get("name") for c in old.get("connectors", []) if not c.get("disabled")}
+    for model in new.get("models", []):
+        if model.get("provider") not in providers:
+            return False
+        for connector in model.get("connectors", []):
+            if not connector.get("disabled") and connector.get("name") not in enabled:
+                return False
+    return True
+
+
+def config_edit_is_safe(path: Path, tool_name: str, tool_input: dict[str, Any]) -> bool:
+    """True when the call changes only which model runs and how; False when it
+    changes anything else, or the hook cannot tell."""
+    if tomllib is None:
+        return False
+    try:
+        old_text = path.read_text()
+        new_text = edited_text(old_text, tool_name, tool_input)
+        if new_text is None:
+            return False
+        old, new = tomllib.loads(old_text), tomllib.loads(new_text)
+        changed = {key for key in old.keys() | new.keys() if old.get(key) != new.get(key)}
+        if not changed <= SAFE_CONFIG_KEYS:
+            return False
+        return "models" not in changed or models_change_is_safe(old, new)
+    except (OSError, UnicodeDecodeError, AttributeError, TypeError, tomllib.TOMLDecodeError):
+        return False
+
+
+def git_undoable(path: Path, home: Path) -> bool:
+    """True when path lies in a git work tree that is not rooted at $HOME or above
+    (a dotfiles repository at $HOME does not make every file under it undoable)."""
+    for parent in path.parents:
+        if parent == home or parent in home.parents:
+            return False
+        if (parent / ".git").exists():
+            return True
+    return False
+
+
+def call_hash(tool_name: str, tool_input: dict[str, Any]) -> str:
+    """Identifies one exact call, so an Allow covers that call and no other."""
+    text = json.dumps({"tool": tool_name, "input": tool_input}, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def change_summary(path: Path, tool_name: str, tool_input: dict[str, Any], home: Path) -> str:
+    """What the user is asked to allow: the config keys and tool tables a config
+    edit changes, or the file's name."""
+    if path in config_files(home) and tomllib is not None:
+        try:
+            old_text = path.read_text()
+            new_text = edited_text(old_text, tool_name, tool_input)
+            old = tomllib.loads(old_text)
+            new = tomllib.loads(new_text) if new_text is not None else None
+        except (OSError, UnicodeDecodeError, TypeError, tomllib.TOMLDecodeError):
+            new = None
+        if new is not None:
+            return "Changes: " + ("; ".join(describe_change("", old, new)) or "nothing")
+    return f"Changes: {path.name}"
+
+
+def describe_change(path: str, was: object, now: object) -> list[str]:
+    """Each changed leaf, as `key.sub = value`, `list +added -removed`, or
+    `models[alias].field = value` for entries matched by alias or name."""
+    if was == now:
+        return []
+    if isinstance(was, dict) and isinstance(now, dict):
+        return [line for key in sorted(was.keys() | now.keys())
+                for line in describe_change(f"{path}.{key}" if path else key, was.get(key), now.get(key))]
+    if all(isinstance(v, list) and all(isinstance(e, dict) for e in v) for v in (was, now)):
+        def keyed(entries: list) -> dict:
+            return {str(e.get("alias") or e.get("name")): e for e in entries}
+        before, after = keyed(was), keyed(now)
+        return [line for key in sorted(before.keys() | after.keys())
+                for line in describe_change(f"{path}[{key}]", before.get(key), after.get(key))]
+    if isinstance(was, list) or isinstance(now, list):
+        was, now = was if isinstance(was, list) else [], now if isinstance(now, list) else []
+        delta = [f"+{x}" for x in now if x not in was] + [f"-{x}" for x in was if x not in now]
+        return [f"{path} " + " ".join(map(str, delta))]
+    return [f"{path} = {now!r}"]
+
+
+def approval_reason(path: Path, why: str, summary: str = "") -> str:
+    question = APPROVAL_QUESTION.format(path=path) + (f" {summary}" if summary else "")
+    return (
+        f"{why}. Ask the user with ask_user_question, the question exactly "
+        f"\"{question}\" and the options \"Allow\" and \"Don't allow\". If they choose "
+        "Allow, repeat this call unchanged. Otherwise stop and report what is left "
+        "undone; do not change this file another way"
+    )
+
+
+def edit_denial(
+    tool_name: str, tool_input: dict[str, Any], cwd: Path, home: Path,
+    session: str | None, temp_roots: tuple[Path, ...], extra_dirs: tuple[Path, ...],
+) -> str | None:
+    raw = tool_input.get("file_path") or tool_input.get("path")
+    if not raw:
+        return None  # Vibe rejects a call without a path itself
+    try:
+        target = resolve_word(str(raw), cwd, home)
+    except (ValueError, OSError, RuntimeError):
+        return f"cannot resolve the path {raw!r}"
+    if tamper_proof(target, home):
+        return TAMPER_PROOF_WRITE.format(path=target)
+    if any(inside(target, directory) for directory in extra_dirs):
+        return None  # a runner's exchange directory: the headless worker's own output
+    store = ApprovalStore(home, session)
+    if harness_control(target, home):
+        if target in config_files(home) and config_edit_is_safe(target, tool_name, tool_input):
+            return None
+        call = call_hash(tool_name, tool_input)
+        if store.take(target, call):
+            return None
+        summary = change_summary(target, tool_name, tool_input, home)
+        store.pend(target, call, summary)
+        return approval_reason(
+            target, f"{target} decides what Vibe, git or the tool guard runs or allows", summary)
+    vibe_plans = (home / ".vibe" / "plans").resolve()
+    if git_undoable(target, home) or inside(target, vibe_plans):
+        return None
+    if any(inside(target, root) for root in temp_roots) or store.has(target):
+        return None
+    return approval_reason(
+        target, f"{target} is outside every git repository, so this write could not be undone"
+    )
+
+
+SYSTEM_TEMP_ROOTS = tuple({Path(p).resolve() for p in ("/tmp", "/var/tmp", tempfile.gettempdir())})
+
+
+def guard_extra_dirs() -> tuple[Path, ...]:
+    """Directories a runner names as a headless worker's own output."""
+    raw = os.environ.get("VIBE_WORKTREE_GUARD_EXTRA", "")
+    return tuple(Path(p).expanduser().resolve() for p in raw.split(os.pathsep) if p.strip())
+
+
+def decide(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    cwd: str | None = None,
+    home: str | None = None,
+    session: str | None = None,
+    temp_roots: Any = None,
+    extra_dirs: Any = None,
+) -> tuple[str, str | None]:
+    home_path = Path(home or os.environ.get("HOME", "~")).expanduser().resolve()
+    cwd_path = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    roots = SYSTEM_TEMP_ROOTS if temp_roots is None else tuple(temp_roots)
+    extras = guard_extra_dirs() if extra_dirs is None else tuple(extra_dirs)
+
+    if tool_name in EDITING_TOOLS:
+        why = edit_denial(tool_name, tool_input, cwd_path, home_path, session, roots, extras)
+        if why:
+            return "deny", f"Blocked by the tool-guard hook: {why}."
+
+    if tool_name == "bash":
+        command = str(tool_input.get("command", ""))
+        for name, pattern, reason in BASH_RULES:
+            if pattern.search(command):
+                return "deny", f"Blocked by the tool-guard hook ({name}): {reason}"
+        if command_stages(command, cwd_path, home_path) is None:
+            return (
+                "deny",
+                "Blocked by the tool-guard hook: it cannot split this command into words "
+                "(an unbalanced quote, often inside a here-document), so it cannot check "
+                "it. Write multi-line content with the edit tool, or run simpler commands.",
+            )
+        why = critical_removal(command, cwd_path, home_path)
+        if why:
+            return "deny", f"Blocked by the tool-guard hook (critical path): {why}."
+        why = bash_path_denial(command, cwd_path, home_path, roots)
+        if why:
+            return "deny", f"Blocked by the tool-guard hook: {why}."
+
+    for url in urls_in(tool_input):
+        try:
+            host = urlsplit(url).hostname or ""
+        except ValueError:
+            # A URL the parser rejects cannot be checked, so it is not allowed.
+            return "deny", f"Blocked by the tool-guard hook: cannot parse URL {url!r}."
+        why = host_denial_reason(host)
+        if why:
+            return (
+                "deny",
+                f"Blocked by the tool-guard hook: {host} is denied ({why}). "
+                "Do not try another route to the same host.",
+            )
+    return "allow", None
+
+
+def bare_tool_name(name: str) -> str:
+    """The unified harness names built-in tools `file_system.bash` and
+    `file_system.search_replace`, the legacy harness `bash` and `edit`: compare on
+    the last dotted component, or every tool-specific rule above is skipped."""
+    return name.rsplit(".", 1)[-1]
+
+
+def main() -> int:
+    payload = json.load(sys.stdin)
+    home = Path(os.environ.get("HOME", "~")).expanduser().resolve()
+    if payload.get("hook_event_name") == "post_tool":
+        recorded = record_approvals(payload, home)
+        if recorded:
+            note = ("The user allowed writing " + ", ".join(recorded)
+                    + ". Repeat the blocked call unchanged.")
+            print(json.dumps({"hook_specific_output": {"additional_context": note}}))
+        return 0
+    tool_input = payload.get("tool_input")
+    decision, reason = decide(
+        bare_tool_name(str(payload.get("tool_name", ""))),
+        tool_input if isinstance(tool_input, dict) else {},
+        cwd=payload.get("cwd"),
+        home=str(home),
+        session=session_key(payload),
+    )
+    out: dict[str, str] = {"decision": decision}
+    if reason:
+        out["reason"] = reason
+    print(json.dumps(out))
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

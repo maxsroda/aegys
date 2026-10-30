@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aegys"
+version = "0.1.0"
+description = "Guard and classifier for Antigravity CLI (agy) tool calls."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+aegys = "aegys.guard:main"
+
+[tool.setuptools.packages.find]
+include = ["aegys*"]
+
+[tool.setuptools.package-data]
+aegys = ["data/*.json"]
