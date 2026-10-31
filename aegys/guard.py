@@ -16,19 +16,19 @@ the message before the model runs, applies it, and stops the turn with an
 has no way to switch the guard itself.
 
 For ``run_command``, in order:
-1. **Deterministic hard-deny (all states):** a command matching a bash deny rule
-   from ``aegys/data/pi-automode-config.json`` or ``aegys/command_checks.py``
+1. **Deterministic hard-deny (all states):** a command matching a
+   ``shellCommandRules.deny`` pattern, or a check in ``aegys/command_checks.py``
    (``rg --pre``, ``fd -x``, recursive deletes of critical paths, secret reads,
    writes or redirects to harness and control files, dangerous git config,
-   exfiltration or private URLs) returns ``{"decision": "deny", ...}``.
+   denied or private URLs) returns ``{"decision": "deny", ...}``.
 2. **Privilege escalation (all states):** ``sudo`` and ``doas`` return
    ``{"decision": "force_ask", ...}`` so agy prompts the user.
-3. **Guard off:** a single plain command on the static ``command(...)``
-   allowlist in ``aegys/data/agy-settings.json`` returns ``{"decision": "allow"}``;
-   every other command returns ``{"decision": "force_ask", ...}``.
+3. **Guard off:** a single plain command matching ``allowWhileGuardOff`` returns
+   ``{"decision": "allow"}``; every other command returns
+   ``{"decision": "force_ask", ...}``.
 4. **Deterministic stage-by-stage fast allow (0 ms):** every pipeline or chain
-   stage matches a ``bash(...)`` allow rule in ``aegys/data/pi-automode-config.json``
-   (or is a read-only ``sed``/``awk`` stage) and writes no protected path. Returns
+   stage matches a ``shellCommandRules.allow`` pattern (or is a read-only
+   ``sed``/``awk`` stage) and writes no protected path. Returns
    ``{"decision": "allow"}``, plus ``"overwrite": {"BypassSandbox": True}`` while
    the status line last reported the terminal sandbox on.
 5. **Two-stage Claude Haiku 5.5 classifier (``low`` effort):** the pi-automode
@@ -42,8 +42,8 @@ For ``run_command``, in order:
    ``{"decision": "force_ask", ...}`` so agy pauses and warns the user.
 
 For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
-1. **Hard-deny (all states):** a credential path (pi-automode ``deniedPaths``
-   plus agy's credential files); a write into agy's control directories or into
+1. **Hard-deny (all states):** a path matching ``secretPaths`` (credential files
+   of agy and of the other harnesses included); a write into agy's control directories or into
    the launcher directories of the harness config repository (see
    ``aegys/config.py``).
 2. **Workspace fast allow:** a path under a workspace root or the working
@@ -58,10 +58,18 @@ For ``list_directory``, ``grep_search`` and ``find``: deny when a path argument
 is a credential path or, for the two recursive searches, lies above one;
 otherwise allow.
 
+The lists in items 1, 3 and 4 and the secret paths come from the shipped
+``aegys/data/default-config.json``, merged with the user's
+``~/.gemini/aegys/config.json`` (see ``aegys/config.py``). If the shipped file
+cannot be read, the guard fails closed: every ``run_command``, and every file or
+search tool call that is not a plain read inside the workspace, returns
+``{"decision": "force_ask", ...}``, except for the denies that need no list.
+
 All classifier calls of one hook run share a 25 s budget, below agy's 30 s hook
 timeout; when it runs out the hook returns ``force_ask``. ``--statusline`` shows
 a red ``aegys ✗`` when ``~/.gemini/config/hooks.json`` does not wire the hook
-for every guarded tool.
+for every guarded tool, or when the user's config does not parse or names an
+unknown ``harnessConfigRepository`` key.
 """
 from __future__ import annotations
 
@@ -79,7 +87,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlsplit
 
-from .config import harness_config_repository, load_aegys_config
+from .config import (
+    DEFAULT_CONFIG_PATH,
+    Policy,
+    config_problem,
+    harness_config_repository,
+    load_aegys_config,
+    load_policy,
+)
 from .command_checks import (
     BASH_RULES,
     PACKAGE_DIR,
@@ -97,6 +112,8 @@ from .command_checks import (
     inline_code,
     input_targets,
     inside,
+    matches_bash_deny_pattern,
+    matches_wildcard_pattern,
     program_writes,
     redirect_targets,
     resolve_word,
@@ -109,11 +126,6 @@ from .command_checks import (
 )
 from .shell_words import WRITERS
 
-# Policy data shipped with aegys: pi-automode's deny and allow rules, and the static
-# allowlist agy uses while the guard is off.
-DATA_DIR = PACKAGE_DIR / "data"
-PI_AUTOMODE_CONFIG = DATA_DIR / "pi-automode-config.json"
-AGY_FRAGMENT_CONFIG = DATA_DIR / "agy-settings.json"
 
 DEFAULT_CLASSIFIER_MODEL = "anthropic/claude-haiku-5-5"
 DEFAULT_CLASSIFIER_EFFORT = "low"
@@ -412,88 +424,6 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
     return None
 
 
-# --- Wildcard and permission pattern matching ------------------------------------
-
-
-def canonicalize_case(value: str) -> str:
-    out = []
-    for ch in value:
-        up = ch.upper()
-        if len(up) != 1 or (ord(ch) >= 128 and ord(up) < 128):
-            out.append(ch)
-        else:
-            out.append(up)
-    return "".join(out)
-
-
-def matches_wildcard_pattern(
-    pattern: str, value: str, overflow_match: bool = True
-) -> bool:
-    if len(pattern) > 4096 or len(value) > 1024 * 1024:
-        return overflow_match
-    norm_pat = canonicalize_case(pattern)
-    norm_val = canonicalize_case(value)
-    if "*" not in norm_pat:
-        return norm_pat == norm_val
-    starts_wild = norm_pat.startswith("*")
-    ends_wild = norm_pat.endswith("*")
-    literals = [lit for lit in norm_pat.split("*") if lit]
-    if not literals:
-        return True
-    lit_idx = 0
-    val_idx = 0
-    last_lit_idx = len(literals)
-    if not starts_wild:
-        prefix = literals[0]
-        if not norm_val.startswith(prefix):
-            return False
-        val_idx = len(prefix)
-        lit_idx = 1
-    search_end = len(norm_val)
-    if not ends_wild:
-        suffix = literals[-1]
-        search_end -= len(suffix)
-        if search_end < val_idx or not norm_val.endswith(suffix):
-            return False
-        last_lit_idx -= 1
-    while lit_idx < last_lit_idx:
-        literal = literals[lit_idx]
-        found = norm_val.find(literal, val_idx, search_end)
-        if found < 0:
-            return False
-        val_idx = found + len(literal)
-        lit_idx += 1
-    return True
-
-
-def matches_bash_deny_pattern(arg_pattern: str, candidate: str) -> bool:
-    if matches_wildcard_pattern(arg_pattern, candidate, overflow_match=True):
-        return True
-    if arg_pattern.endswith(" *"):
-        return matches_wildcard_pattern(
-            arg_pattern[:-2], candidate, overflow_match=True
-        )
-    return False
-
-
-def extract_bash_patterns(entries: list[Any]) -> list[str]:
-    patterns: list[str] = []
-    for item in entries:
-        if not isinstance(item, str):
-            continue
-        match = re.match(r"^@?bash\((.*)\)$", item.strip(), re.IGNORECASE | re.DOTALL)
-        if match and match.group(1).strip():
-            patterns.append(match.group(1).strip())
-    return patterns
-
-
-def load_pi_automode_config() -> dict[str, Any]:
-    try:
-        return json.loads(PI_AUTOMODE_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
 # --- Shell structure checks for deterministic fast-allow -------------------------
 
 
@@ -718,39 +648,30 @@ def command_fast_allowed(
     )
 
 
-# --- Static allowlist matching, used while the guard is off (aegys/data/agy-settings.json)
+# --- Static allowlist matching, used while the guard is off (allowWhileGuardOff)
 
 
-def load_agy_static_command_rules() -> tuple[list[str], list[re.Pattern[str]]]:
+def static_command_rules(entries: tuple[str, ...]) -> tuple[list[str], list[re.Pattern[str]]]:
+    """Split allowWhileGuardOff entries into command prefixes and compiled regexes.
+    A `regex:` entry that does not compile is skipped."""
     prefixes: list[str] = []
     regexes: list[re.Pattern[str]] = []
-    try:
-        data = json.loads(AGY_FRAGMENT_CONFIG.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return prefixes, regexes
-    allow = (data.get("permissions") or {}).get("allow") or []
-    for entry in allow:
-        if not isinstance(entry, str) or not (
-            entry.startswith("command(") and entry.endswith(")")
-        ):
-            continue
-        inner = entry[len("command(") : -1].strip()
-        if inner == "regex:(?s).*":
-            continue
-        if inner.startswith("regex:"):
-            expr = inner[len("regex:") :].strip()
+    for entry in entries:
+        if entry.startswith("regex:"):
+            expr = entry[len("regex:"):].strip()
             try:
                 regexes.append(re.compile(rf"^(?:{expr})(?:\s|$)"))
             except re.error:
                 continue
-        elif inner:
-            prefixes.append(inner)
+        else:
+            prefixes.append(entry)
     return prefixes, regexes
 
 
-def matches_agy_static_allow(command: str, stages: list[Stage]) -> bool:
-    """Whether a single plain command matches the static rules in
-    aegys/data/agy-settings.json (used while the guard is off)."""
+def matches_agy_static_allow(command: str, stages: list[Stage],
+                             allow_while_guard_off: tuple[str, ...]) -> bool:
+    """Whether a single plain command matches allowWhileGuardOff (used while the
+    guard is off)."""
     if len(stages) != 1:
         return False
     stage = stages[0]
@@ -763,7 +684,7 @@ def matches_agy_static_allow(command: str, stages: list[Stage]) -> bool:
     text = " ".join(stage.raw)
     if text != " ".join(stage.words):
         return False
-    prefixes, regexes = load_agy_static_command_rules()
+    prefixes, regexes = static_command_rules(allow_while_guard_off)
     for prefix in prefixes:
         if text == prefix or text.startswith(prefix + " "):
             return True
@@ -1062,7 +983,7 @@ def format_status_line(
     sandbox is on. `ca:`/`cd:` appear once the classifier has decided a command."""
     data = payload if isinstance(payload, dict) else {}
     home_path = (home or Path(os.environ.get("HOME", "~")).expanduser()).resolve()
-    problem = hook_install_problem(home_path)
+    problem = hook_install_problem(home_path) or config_problem(home_path)
     if problem is None and always_proceed_enabled(home_path):
         problem = "toolPermission always-proceed: prompts become denies"
     conv_id = extract_conversation_id(data)
@@ -1657,14 +1578,6 @@ WRITE_TOOL_NAMES = ("write_file", "edit_file")
 SEARCH_TOOL_NAMES = ("list_directory", "grep_search", "find")
 RECURSIVE_SEARCH_TOOL_NAMES = ("grep_search", "find")
 GUARDED_TOOL_NAMES = ("run_command", *FILE_TOOL_NAMES, *SEARCH_TOOL_NAMES)
-# Credential files that agy and Claude Code keep under $HOME, beyond the pi-automode
-# patterns that command_checks.secret() already covers.
-AGY_CREDENTIAL_PATTERNS = (
-    "*/.gemini/gemini-credentials.json",
-    "*/.gemini/antigravity-cli/antigravity-oauth-token*",
-    "*/.claude/.credentials.json",
-    "*/.codex/auth.json",
-)
 
 
 def guard_code_dirs(home: Path) -> tuple[Path, ...]:
@@ -1684,10 +1597,10 @@ def classified_write_roots(home: Path) -> tuple[Path, ...]:
 SLASH_COMMAND_RE = re.compile(r"/aegys(?:\s+(on|off))?", re.IGNORECASE)
 
 
-def credential_path(path: Path) -> bool:
-    return secret(path) or any(
-        matches_wildcard_pattern(pattern, str(path)) for pattern in AGY_CREDENTIAL_PATTERNS
-    )
+def policy_unavailable_reason() -> str:
+    """The reason a call is held for the user when the shipped policy cannot be read."""
+    return (f"{GUARD_NAME} cannot read its shipped policy in {DEFAULT_CONFIG_PATH}, "
+            "so it cannot check this; confirm it manually.")
 
 
 def file_tool_path(args: dict[str, Any], cwd: Path) -> Path | None:
@@ -1707,6 +1620,7 @@ def evaluate_file_access(
     cwd: Path,
     home: Path,
     classifier_caller: ClassifierCaller | None,
+    policy: Policy | None,
 ) -> dict[str, Any]:
     conversation_id = extract_conversation_id(payload)
 
@@ -1719,7 +1633,7 @@ def evaluate_file_access(
     path = file_tool_path(args, cwd)
     if path is None:
         return deny(f"{tool_name} has no Path argument.")
-    if credential_path(path):
+    if policy is not None and secret(path, policy.secret_paths):
         return deny(f"{path} holds credentials, so {tool_name} is refused.")
     if tool_name in WRITE_TOOL_NAMES and (
         agy_control_path(path, home) or any(inside(path, d) for d in guard_code_dirs(home))
@@ -1743,11 +1657,15 @@ def evaluate_file_access(
         inside(path, r) for r in classified_write_roots(home)
     ):
         root = None
-    if root is not None and not any(
+    # Without a policy, only a plain read inside the workspace passes.
+    may_pass = policy is not None or tool_name not in WRITE_TOOL_NAMES
+    if root is not None and may_pass and not any(
         part in DEFAULT_PROTECTED_PATHS for part in path.relative_to(root).parts
     ):
         record_guard_decision(home, conversation_id, allowed=True)
         return {"decision": "allow"}
+    if policy is None:
+        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
 
     if not guard_enabled(home, conversation_id):
         return {
@@ -1780,13 +1698,16 @@ def path_arguments(args: dict[str, Any], cwd: Path) -> list[Path]:
 
 
 def evaluate_search_access(
-    tool_name: str, args: dict[str, Any], payload: dict[str, Any], cwd: Path, home: Path
+    tool_name: str, args: dict[str, Any], payload: dict[str, Any], cwd: Path, home: Path,
+    policy: Policy | None,
 ) -> dict[str, Any]:
+    if policy is None:
+        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
     conversation_id = extract_conversation_id(payload)
     for path in path_arguments(args, cwd):
-        area = path if credential_path(path) else None
+        area = path if secret(path, policy.secret_paths) else None
         if area is None and tool_name in RECURSIVE_SEARCH_TOOL_NAMES:
-            area = secret_below(path, home, skips_hidden=False)
+            area = secret_below(path, home, skips_hidden=False, secret_paths=policy.secret_paths)
         if area is not None:
             return escalated_deny(
                 home, conversation_id, f"{tool_name} {path}",
@@ -1890,12 +1811,13 @@ def decide_pre_tool_use(
     if not isinstance(tool_args, dict):
         tool_args = {}
 
+    policy = load_policy(home_path)
     if tool_name in FILE_TOOL_NAMES:
         return evaluate_file_access(
-            tool_name, tool_args, payload, cwd_path, home_path, classifier_caller
+            tool_name, tool_args, payload, cwd_path, home_path, classifier_caller, policy
         )
     if tool_name in SEARCH_TOOL_NAMES:
-        return evaluate_search_access(tool_name, tool_args, payload, cwd_path, home_path)
+        return evaluate_search_access(tool_name, tool_args, payload, cwd_path, home_path, policy)
     if tool_name != "run_command":
         return {"decision": "allow"}
 
@@ -1923,7 +1845,7 @@ def decide_pre_tool_use(
     if crit:
         return deny(f"Blocked by {GUARD_NAME} (critical path): {crit}.")
 
-    path_deny = bash_path_denial(command, cwd_path, home_path, roots)
+    path_deny = bash_path_denial(command, cwd_path, home_path, roots, policy)
     if path_deny:
         return deny(f"Blocked by {GUARD_NAME}: {path_deny}.")
 
@@ -1936,18 +1858,15 @@ def decide_pre_tool_use(
             host = urlsplit(url).hostname or ""
         except ValueError:
             return deny(f"Blocked by {GUARD_NAME}: cannot parse URL {url!r}.")
-        host_why = host_denial_reason(host)
+        host_why = host_denial_reason(host, policy.denied_hosts if policy else None)
         if host_why:
             return deny(
                 f"Blocked by {GUARD_NAME}: {host} is denied ({host_why}). "
                 "Do not try another route to the same host."
             )
 
-    pi_cfg = load_pi_automode_config()
-    perms = (pi_cfg.get("permissions") or {}) if isinstance(pi_cfg, dict) else {}
-    deny_patterns = extract_bash_patterns(perms.get("deny") or [])
-    ask_patterns = extract_bash_patterns(perms.get("ask") or [])
-    allow_patterns = extract_bash_patterns(perms.get("allow") or [])
+    if policy is None:
+        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
 
     stage_candidates = [command.strip()]
     for st in stages:
@@ -1956,19 +1875,16 @@ def decide_pre_tool_use(
         if st.words:
             stage_candidates.append(" ".join(st.words))
 
-    for pat in deny_patterns:
+    for pat in policy.shell_deny:
         if any(matches_bash_deny_pattern(pat, cand) for cand in stage_candidates):
-            return deny(
-                f"Blocked by {GUARD_NAME}: command matches deny rule "
-                f"bash({pat})."
-            )
+            return deny(f"Blocked by {GUARD_NAME}: command matches deny rule {pat!r}.")
 
-    # 2. Privilege escalation (`sudo`, `doas`, `permissions.ask`) always forces a user prompt.
+    # 2. Privilege escalation (`sudo`, `doas`, `ask` rules) always forces a user prompt.
     if any(
         st.raw and os.path.basename(st.raw[0]) in PRIVILEGE_WRAPPERS for st in stages
     ) or any(
         matches_bash_deny_pattern(pat, cand)
-        for pat in ask_patterns
+        for pat in policy.shell_ask
         for cand in stage_candidates
     ):
         return {
@@ -1978,7 +1894,7 @@ def decide_pre_tool_use(
 
     # 3. Guard off: only the static allowlist passes; everything else asks the user.
     if not guard_enabled(home_path, conv_id):
-        if matches_agy_static_allow(command, stages):
+        if matches_agy_static_allow(command, stages, policy.allow_while_guard_off):
             return {"decision": "allow"}
         return {
             "decision": "force_ask",
@@ -1990,7 +1906,7 @@ def decide_pre_tool_use(
     # added only while the status line last reported this conversation's sandbox on.
     sandbox_on = read_state_file(home_path, conv_id).get("sandbox_on") is True
     overwrite = {"overwrite": {"BypassSandbox": True}} if sandbox_on and not bypass_sandbox else {}
-    if command_fast_allowed(command, stages, allow_patterns, home_path):
+    if command_fast_allowed(command, stages, list(policy.shell_allow), home_path):
         record_guard_decision(home_path, conv_id, allowed=True)
         return {"decision": "allow", **overwrite}
 

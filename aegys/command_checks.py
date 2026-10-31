@@ -1,18 +1,18 @@
 """Deterministic checks on shell commands, file paths and URLs, for the aegys guard.
 
-guard.py runs these checks before it decides a command. Each check denies on its
-own, whatever the policy lists in the config say:
+guard.py runs these checks before it decides a command. Checks 1 and 3, and the
+address test of check 4, are fixed in code. Check 2 and the host names of check 4
+come from the policy lists (see ``aegys/config.py``):
 
 1. ``rg --pre CMD`` and ``fd -x CMD``: flags that run a command on every file.
    The check sees the flag anywhere in its stage of the command.
-2. Secret paths (``SECRET_PATTERNS``): no command may read or write them, and a
-   recursive search that starts above one is denied.
+2. Secret paths (the policy's ``secretPaths``): no command may read or write them,
+   and a recursive search that starts above one is denied.
 3. Control files: a write, redirect or inline code that names one changes what
    the harnesses, git or this guard run or allow, so it is denied. So are a
    recursive delete of a critical path and git settings that can run a program.
-4. URLs: each URL in a command is checked against the hosts of
-   ``DENIED_HOSTS`` and against private, loopback, link-local and metadata
-   addresses (SSRF).
+4. URLs: each URL in a command is checked against the policy's ``deniedHosts``
+   and against private, loopback, link-local and metadata addresses (SSRF).
 
 Commands are split into stages by ``aegys/shell_words.py``. Directory changes
 inside the command are followed.
@@ -34,11 +34,73 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import harness_config_repository
+from .config import Policy, harness_config_repository
 from .shell_words import (
     FIND_WRITE_FLAGS, PRINTERS, READERS, SEARCHERS, SHELLS, WRITERS, brace_expansions,
     git_config_writes, git_subcommand_index, inside, split_stages, unwrap,
 )
+
+
+def canonicalize_case(value: str) -> str:
+    out = []
+    for ch in value:
+        up = ch.upper()
+        if len(up) != 1 or (ord(ch) >= 128 and ord(up) < 128):
+            out.append(ch)
+        else:
+            out.append(up)
+    return "".join(out)
+
+
+def matches_wildcard_pattern(
+    pattern: str, value: str, overflow_match: bool = True
+) -> bool:
+    if len(pattern) > 4096 or len(value) > 1024 * 1024:
+        return overflow_match
+    norm_pat = canonicalize_case(pattern)
+    norm_val = canonicalize_case(value)
+    if "*" not in norm_pat:
+        return norm_pat == norm_val
+    starts_wild = norm_pat.startswith("*")
+    ends_wild = norm_pat.endswith("*")
+    literals = [lit for lit in norm_pat.split("*") if lit]
+    if not literals:
+        return True
+    lit_idx = 0
+    val_idx = 0
+    last_lit_idx = len(literals)
+    if not starts_wild:
+        prefix = literals[0]
+        if not norm_val.startswith(prefix):
+            return False
+        val_idx = len(prefix)
+        lit_idx = 1
+    search_end = len(norm_val)
+    if not ends_wild:
+        suffix = literals[-1]
+        search_end -= len(suffix)
+        if search_end < val_idx or not norm_val.endswith(suffix):
+            return False
+        last_lit_idx -= 1
+    while lit_idx < last_lit_idx:
+        literal = literals[lit_idx]
+        found = norm_val.find(literal, val_idx, search_end)
+        if found < 0:
+            return False
+        val_idx = found + len(literal)
+        lit_idx += 1
+    return True
+
+
+def matches_bash_deny_pattern(arg_pattern: str, candidate: str) -> bool:
+    if matches_wildcard_pattern(arg_pattern, candidate, overflow_match=True):
+        return True
+    if arg_pattern.endswith(" *"):
+        return matches_wildcard_pattern(
+            arg_pattern[:-2], candidate, overflow_match=True
+        )
+    return False
+
 
 # --- bash: allow-listed commands with an exec flag ----------------------------
 
@@ -552,11 +614,6 @@ CONTROL_SPELLINGS = (
     "aegys/", ".gitconfig",
     ".local/bin/", ".cargo/bin/", ".config/git/", "/opt/homebrew/bin/", "/usr/local/bin/",
 )
-# Keys and credentials no tool may read, as directories and as their contents.
-SECRET_PATTERNS = (
-    "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.aws", "*/.aws/*",
-    "*/.vibe/.env", "*/.netrc", "*/.docker/config.json", "*/.config/gh/hosts.yml",
-)
 
 
 def control_dirs(home: Path) -> tuple[Path, ...]:
@@ -594,13 +651,21 @@ def holds_control(path: Path, home: Path) -> bool:
     return any(inside(area, path) for area in control_areas(home))
 
 
-def secret(path: Path) -> bool:
-    return any(fnmatch.fnmatch(str(path), pattern) for pattern in SECRET_PATTERNS)
+def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
+    """True when path matches one of the secret path globs (fnmatch syntax), in any
+    letter case."""
+    value = str(path).lower()
+    return any(fnmatch.fnmatchcase(value, pattern.lower()) for pattern in secret_paths)
 
 
-# The secret areas below $HOME, from SECRET_PATTERNS: no recursive search may start
-# above them.
-SECRET_AREAS = tuple(dict.fromkeys(p.removeprefix("*/").removesuffix("/*") for p in SECRET_PATTERNS))
+def secret_areas(secret_paths: tuple[str, ...]) -> tuple[str, ...]:
+    """The directories and files of the secret paths, relative to $HOME, as
+    `.ssh` for `*/.ssh/*`. A pattern with a wildcard left over is no area: it names
+    no fixed place. No recursive search may start above an area."""
+    areas = (pattern.removeprefix("*/").removesuffix("/*") for pattern in secret_paths)
+    return tuple(dict.fromkeys(area for area in areas if not set(area) & set("*?[")))
+
+
 RECURSIVE_SEARCHERS = {"rg", "grep", "egrep", "fgrep"}
 # Options that take a separate value, which is then neither the pattern nor a
 # start directory.
@@ -673,11 +738,12 @@ def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
     return operands or ["."], rg and not hidden and unrestricted < 2 and not configured
 
 
-def secret_below(start: Path, home: Path, skips_hidden: bool) -> Path | None:
+def secret_below(start: Path, home: Path, skips_hidden: bool,
+                 secret_paths: tuple[str, ...]) -> Path | None:
     """The first secret area a recursive search from start reads: one start is
     inside, or one below start, reached unless the search skips hidden entries
     and the way down passes one."""
-    for name in SECRET_AREAS:
+    for name in secret_areas(secret_paths):
         area = Path(os.path.realpath(home / name))
         if inside(start, area):
             return area
@@ -1317,10 +1383,12 @@ def git_top(path: Path) -> Path | None:
 
 
 def bash_path_denial(command: str, cwd: Path, home: Path,
-                     temp_roots: tuple[Path, ...] = ()) -> str | None:
+                     temp_roots: tuple[Path, ...] = (),
+                     policy: Policy | None = None) -> str | None:
     """Why a bash command must not run: a stage names a secret, or searches
-    recursively from above one; a stage's redirect targets a control file; git
-    settings are written, or injected with a key that can run a program; git
+    recursively from above one (the secret checks need a policy); a stage's
+    redirect targets a control file; git settings are written, or injected with a
+    key that can run a program; git
     creates a repository outside the working directory and the temporary
     directories; a stage whose program writes writes a control file or into a
     directory above one; git settings come from the environment; git or patch
@@ -1330,15 +1398,18 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
     stages = command_stages(command, cwd, home)
     if stages is None:
         return None
+    # Without a policy the secret checks have no paths to check; the guard then asks
+    # before the command, so nothing here is allowed on that account.
+    secret_paths = policy.secret_paths if policy is not None else None
     for index, stage in enumerate(stages):
         for path in stage_paths(stage, home):
-            if secret(path):
+            if secret_paths is not None and secret(path, secret_paths):
                 return f"{path} holds keys or credentials, which no tool may read or write"
         searched = search_starts(stage.words)
-        if searched is not None:
+        if searched is not None and secret_paths is not None:
             starts, skips_hidden = searched
             for start in stage_paths(stage, home, starts):
-                reached = secret_below(start, home, skips_hidden)
+                reached = secret_below(start, home, skips_hidden, secret_paths)
                 if reached is not None:
                     return (f"a recursive search from {start} would read {reached}, which holds "
                             "keys, credentials or session transcripts. Search a directory that "
@@ -1351,7 +1422,7 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
                 except (ValueError, OSError, RuntimeError):
                     continue
                 for path in resolved:
-                    if secret(path):
+                    if secret_paths is not None and secret(path, secret_paths):
                         return f"{path} holds keys or credentials, which no tool may read or write"
                     if target in outputs and harness_control(path, home):
                         return CONTROL_WRITE.format(control=path)
@@ -1428,62 +1499,25 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
 
 
 # --- URLs: hosts no tool may contact --------------------------------------------
-# A host matches if it equals an entry or ends with "." + entry.
-
-# Paste bins, drop boxes, request catchers, tunnels: the standard places a
-# prompt-injected model would send data to. No legitimate coding task needs them.
-EXFILTRATION_HOSTS = [
-    "0x0.st", "anonfiles.com", "beeceptor.com", "burpcollaborator.net",
-    "catbox.moe", "ceye.io", "dnslog.cn", "dpaste.com", "dpaste.org",
-    "file.io", "ghostbin.com", "gofile.io", "hastebin.com", "hookbin.com",
-    "interact.sh", "ix.io", "loca.lt", "localhost.run", "ngrok-free.app",
-    "ngrok.app", "ngrok.dev", "ngrok.io", "oast.fun", "oast.live", "oast.me",
-    "oast.online", "oast.pro", "oast.site", "oastify.com", "paste.ee",
-    "pastebin.com", "pipedream.net", "privatebin.net", "rentry.co",
-    "requestbin.com", "requestbin.net", "requestcatcher.com", "serveo.net",
-    "sprunge.us", "termbin.com", "transfer.sh", "trycloudflare.com",
-    "webhook.site",
-]
-
-# Shorteners hide the real destination from the user reading the transcript.
-URL_SHORTENER_HOSTS = [
-    "adf.ly", "bc.vc", "bit.ly", "buff.ly", "cutt.ly", "goo.gl", "is.gd",
-    "ow.ly", "rb.gy", "rebrand.ly", "shorte.st", "shorturl.at", "t.co",
-    "tiny.cc", "tinyurl.com",
-]
-
-# Services whose whole purpose is to log the IP of whoever opens the link.
-IP_LOGGER_HOSTS = ["2no.co", "grabify.link", "iplogger.com", "iplogger.org", "yip.su"]
-
-# Legally grey or piracy sites. Not dangerous to the machine; listed because the
-# user asked for on-the-fence hosts too. Delete an entry to allow it.
-ON_THE_FENCE_HOSTS = [
-    "1337x.to", "annas-archive.org", "libgen.is", "libgen.li", "libgen.rs",
-    "sci-hub.ru", "sci-hub.se", "sci-hub.st", "thepiratebay.org", "z-lib.org",
-]
+# A host matches if it equals an entry or ends with "." + entry. The listed hosts
+# are the policy's deniedHosts (see aegys/config.py).
 
 # Names that resolve inside this machine's own network or to cloud metadata.
 # web_fetch runs locally, so a URL here reaches services the model should not.
 INTERNAL_HOST_SUFFIXES = [
     "localhost", "local", "internal", "lan", "home.arpa", "metadata.google.internal",
 ]
-
-DENIED_HOSTS: dict[str, str] = {}
-for _hosts, _why in (
-    (EXFILTRATION_HOSTS, "data exfiltration / out-of-band endpoint"),
-    (URL_SHORTENER_HOSTS, "URL shortener hides the destination"),
-    (IP_LOGGER_HOSTS, "IP logger"),
-    (ON_THE_FENCE_HOSTS, "on-the-fence site"),
-    (INTERNAL_HOST_SUFFIXES, "internal / private network name"),
-):
-    for _h in _hosts:
-        DENIED_HOSTS[_h] = _why
+INTERNAL_REASON = "internal / private network name"
 
 # "]" stays inside a URL so bracketed IPv6 hosts like http://[::1]/ survive.
 URL_PATTERN = re.compile(r"https?://[^\s'\"<>`)}]+", re.IGNORECASE)
 
 
-def host_denial_reason(host: str) -> str | None:
+def host_denial_reason(host: str, denied_hosts: dict[str, str] | None) -> str | None:
+    """Why a host must not be contacted, or None. Private, loopback, link-local and
+    reserved addresses are always denied. Then the names: those of denied_hosts (host
+    to reason, from the policy) and the internal suffixes. Without a policy,
+    denied_hosts is None and only the address check and the internal suffixes apply."""
     host = host.lower().rstrip(".")
     if not host:
         return None
@@ -1497,7 +1531,9 @@ def host_denial_reason(host: str) -> str | None:
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
             return "private, loopback, link-local or metadata address"
         return None
-    for denied, why in DENIED_HOSTS.items():
+    names = (*(denied_hosts or {}).items(),
+             *((name, INTERNAL_REASON) for name in INTERNAL_HOST_SUFFIXES))
+    for denied, why in names:
         if host == denied or host.endswith("." + denied):
             return why
     return None
