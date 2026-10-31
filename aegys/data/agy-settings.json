@@ -1,14 +1,8 @@
 {
-  "_comment": "Keys merged into ~/.gemini/antigravity-cli/settings.json by scripts/install.sh --apply-agy-config. See AGENTS.md.",
+  "_comment": "agy settings for use with aegys. aegys reads only the command(...) rules of permissions.allow, as its allowlist while the guard is off.",
   "agentMode": "accept-edits",
   "altScreenMode": "always",
   "queuedMessages": "send-immediately",
-  "statusLine": {
-    "type": "command",
-    "command": "\"$HOME/.agents/bin/agy-statusline\"",
-    "enabled": true,
-    "stack_with_default": true
-  },
   "permissions": {
     "allow": [
       "read_file($HOME)",

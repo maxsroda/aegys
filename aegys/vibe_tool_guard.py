@@ -16,8 +16,8 @@ What Vibe's permission model cannot express, closed here:
    addresses (SSRF), and a few on-the-fence sites.
 
 3. Edits. A write whose resolved target decides what Vibe or git runs or allows
-   (any .vibe directory but its worktrees and plans, the Vibe settings in
-   ~/.agents, what ~/.vibe links to, this guard, any .git directory) needs the
+   (any .vibe directory but its worktrees and plans, the Vibe settings in the
+   harness config repository, what ~/.vibe links to, this guard, any .git directory) needs the
    user's Allow for that one write, except a config.toml change confined to
    which model runs and how. A write outside every git repository, temporary
    directory and ~/.vibe/plans needs the user's Allow once per file per
@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .config import harness_config_repository
 from .vibe_worktree_guard import (
     FIND_WRITE_FLAGS, PRINTERS, READERS, SEARCHERS, SHELLS, WRITERS, brace_expansions,
     git_config_writes, git_subcommand_index, inside, split_stages, unwrap,
@@ -575,10 +576,10 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 HOME_CONTROL = (".local/bin", ".cargo/bin", "usr/bin", ".gitconfig", ".config/git")
 # PATH directories outside $HOME, user-writable on Homebrew Macs.
 ABSOLUTE_CONTROL = (Path("/opt/homebrew/bin"), Path("/usr/local/bin"))
-# Spellings of those files in free text (inline code, quoted strings).
+# Spellings of those files in free text (inline code, quoted strings). The harness
+# config repository adds its own (see control_spellings).
 CONTROL_SPELLINGS = (
-    "aegys/", "configs/vibe/", "fragments/vibe/", "hooks/vibe_", "bin/vibe-", "bin/lib.sh",
-    "scripts/install.sh", "scripts/merge-vibe-config.py", "global-rules/", ".gitconfig",
+    "aegys/", ".gitconfig",
     ".local/bin/", ".cargo/bin/", ".config/git/", "/opt/homebrew/bin/", "/usr/local/bin/",
 )
 VIBE_DIR_SPELLING = re.compile(r"\.vibe(?:/(?!(?:worktrees|plans)(?:/|$|[\s'\"]))|$|[\s'\"])")
@@ -588,8 +589,6 @@ VIBE_WORK_DIRS = ("worktrees", "plans")
 # and the approvals this hook reads. No tool call may write them, approved or not.
 VIBE_TAMPER_PROOF_DIRS = ("logs", "tool-guard")
 # Keys and credentials no tool may read, as directories and as their contents.
-# fragments/vibe/config.toml repeats this list as the read_file denylist; a test
-# keeps the two equal.
 SECRET_PATTERNS = (
     "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.aws", "*/.aws/*",
     "*/.vibe/.env", "*/.netrc", "*/.docker/config.json", "*/.config/gh/hosts.yml",
@@ -606,11 +605,16 @@ def in_vibe_settings(path: Path) -> bool:
 
 
 def control_dirs(home: Path) -> tuple[Path, ...]:
-    """The guard's own package, and the control directories of the agent-config clone
-    (~/.agents): what installs and runs the harnesses."""
-    clone = (home / ".agents").resolve()
-    return (PACKAGE_DIR, *(clone / d for d in (
-        "hooks", "bin", "scripts", "configs/vibe", "fragments/vibe", "global-rules")))
+    """The guard's own package, and the control directories of the harness config
+    repository (see aegys.config): what installs and runs the harnesses."""
+    repository = harness_config_repository(home)
+    return (PACKAGE_DIR, *(repository.control_dirs if repository else ()))
+
+
+def control_spellings(home: Path) -> tuple[str, ...]:
+    """CONTROL_SPELLINGS, and those of the harness config repository."""
+    repository = harness_config_repository(home)
+    return (*CONTROL_SPELLINGS, *(repository.vibe_control_spellings if repository else ()))
 
 
 def control_areas(home: Path) -> tuple[Path, ...]:
@@ -631,7 +635,7 @@ def harness_control(path: Path, home: Path) -> bool:
 
 def holds_control(path: Path, home: Path) -> bool:
     """True when path is a directory above a fixed control area: a write into it
-    (`cp -r x/. ~/.agents/`, `tar -C ~`, `mv ~/.agents …`) can replace control
+    (`cp -r x/. ~/repo/`, `tar -C ~`, `mv ~/repo …`) can replace control
     files without naming them."""
     return any(inside(area, path) for area in control_areas(home))
 
@@ -1098,9 +1102,15 @@ def stage_paths(stage: Stage, home: Path, words: list[str] | None = None) -> lis
 URL_WORD = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
 URL_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"]*")
 KEY_VALUE_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# Inside the agent-config clone, its control directories by relative name at
-# the start of a word (so skills/x/scripts/y.py is not one).
-AGENT_REPO_SPELLING = re.compile(r"(?:^|[\s'\"(=,])((?:\./)?(?:hooks|bin|scripts)/[^\s'\"),]*)")
+
+
+def repository_code_spelling(names: tuple[str, ...]) -> re.Pattern[str] | None:
+    """Inside the harness config repository, its launcher and script directories by
+    relative name at the start of a word (so skills/x/scripts/y.py is not one)."""
+    if not names:
+        return None
+    alternatives = "|".join(re.escape(name) for name in names)
+    return re.compile(r"(?:^|[\s'\"(=,])((?:\./)?(?:" + alternatives + r")/[^\s'\"),]*)")
 
 
 COPIERS = {"cp", "ln", "install", "rsync", "ditto"}
@@ -1247,16 +1257,18 @@ def ancestor_operands(words: list[str]) -> list[str]:
     return operands if program in WRITERS else []
 
 
-def spelled_control(text: str, in_agent_repo: bool = False) -> str | None:
+def spelled_control(text: str, home: Path, in_config_repository: bool = False) -> str | None:
     """A control-file spelling in free text, where no path can be resolved, as
     the whole word that holds it. URLs are not paths and are skipped, unless they
     climb with `/..`."""
     text = URL_TEXT.sub(lambda m: m.group(0) if "/.." in m.group(0) else " ", text)
-    for spelling in CONTROL_SPELLINGS:
+    for spelling in control_spellings(home):
         if spelling in text:
             return re.search(r"[^\s'\"(=,]*" + re.escape(spelling) + r"[^\s'\"),]*", text).group(0)
-    if in_agent_repo:
-        match = AGENT_REPO_SPELLING.search(text)
+    repository = harness_config_repository(home)
+    code_spelling = repository_code_spelling(repository.code_dir_names) if repository else None
+    if in_config_repository and code_spelling is not None:
+        match = code_spelling.search(text)
         if match:
             return match.group(1)
     match = VIBE_DIR_SPELLING.search(text)
@@ -1316,15 +1328,19 @@ GIT_LOCATION_WORD = re.compile(r"(?:^|\s)GIT_(?:DIR|WORK_TREE|COMMON_DIR)=")
 GIT_CONFIG_WORD = re.compile(r"(?:^|\s)GIT_CONFIG\w*=")
 
 
-# fragments/vibe/config.toml's read_file allowlist (a test keeps them equal): the
-# files read_file reads with no prompt.
-READ_FILE_ALLOWLIST = (
-    "*/.vibe/config.toml", "*/.agents/configs/vibe/*", "*/.agents/fragments/vibe/*",
-    "*/.agents/global-rules/*",
-)
+# The files read_file reads with no prompt, besides the Vibe settings directories of
+# the harness config repository (see read_file_allowlist).
+READ_FILE_ALLOWLIST = ("*/.vibe/config.toml",)
 # Programs that print what they read, so their read can go to read_file instead.
 FILE_READERS = {"cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "sed",
                 "wc", "nl", "cut", "sort", "jq", "diff"}
+
+
+def read_file_allowlist(home: Path) -> tuple[str, ...]:
+    repository = harness_config_repository(home)
+    return (*READ_FILE_ALLOWLIST,
+            *(f"*/{d.relative_to(home.resolve())}/*" if inside(d, home.resolve()) else f"{d}/*"
+              for d in (repository.vibe_settings_dirs if repository else ())))
 
 
 def read_file_instead(stages: list[Stage], command: str, home: Path) -> Path | None:
@@ -1344,7 +1360,7 @@ def read_file_instead(stages: list[Stage], command: str, home: Path) -> Path | N
         if os.path.basename(stage.words[0]) not in FILE_READERS or program_writes(stage.words):
             return None
         if not all(path.is_file() and any(fnmatch.fnmatch(str(path), pattern)
-                                          for pattern in READ_FILE_ALLOWLIST) for path in named):
+                                          for pattern in read_file_allowlist(home)) for path in named):
             return None
         files += named
     return files[0] if files else None
@@ -1403,7 +1419,7 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
     creates a repository outside the working directory and the temporary
     directories; a stage whose program writes writes a control file or into a
     directory above one; git settings come from the environment; git or patch
-    rewrites files of the agent-config clone without naming them; or a read
+    rewrites files of the harness config repository without naming them; or a read
     of a Vibe settings file belongs to read_file. A stage that runs a file in
     the repository's control directories runs the user's own guarded code, so its
     operands are not held against it."""
@@ -1460,8 +1476,9 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
         # The main clone only: a worktree elsewhere or inside it is ordinary work.
         # `git -C DIR` runs in DIR alone; no subshell can leave it elsewhere.
         repo_dirs = git_c_directories(stage, home) or list(stage.cwds)
-        clone = (home / ".agents").resolve()
-        in_agent_repo = any(git_top(directory) == clone for directory in repo_dirs)
+        repository = harness_config_repository(home)
+        in_config_repository = repository is not None and any(
+            git_top(directory) == repository.path for directory in repo_dirs)
         program = os.path.basename(stage.words[0]) if stage.words else ""
         writes = stage.refused or program_writes(stage.words)
         operands = stage.words if stage.refused else written_operands(stage.words) if writes else []
@@ -1482,7 +1499,7 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
             # Words are judged by where they resolve; only text no path can be read
             # from (inline code, a refused wrapper) is searched for spellings.
             spelled = spelled_control(stage.text if stage.refused else " ".join(inline_code(stage.words)),
-                                      in_agent_repo)
+                                      home, in_config_repository)
             if spelled is not None:
                 return CONTROL_WRITE.format(control=spelled)
         git_at = next((i for i, w in enumerate(stage.words) if os.path.basename(w) == "git"), None)
@@ -1499,9 +1516,9 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
                 "--git-dir, --work-tree) would rewrite a tree the hook cannot locate. Leave it "
                 "to the user"
             )
-        if in_agent_repo and (git_rewrites_tree(stage.words) or program == "patch"):
+        if in_config_repository and (git_rewrites_tree(stage.words) or program == "patch"):
             return (
-                "this command may rewrite files of the agent-config clone (~/.agents) "
+                f"this command may rewrite files of the harness config repository ({repository.path}) "
                 "without naming them, which could change what the harnesses run. To restore named "
                 "files, use `git restore FILE` or `git checkout -- FILE`, which are judged by "
                 "their paths; for a worktree, name it with `git -C WORKTREE`; otherwise leave "
@@ -1757,9 +1774,8 @@ SAFE_CONFIG_KEYS = frozenset({"active_model", "theme", "models"})
 
 
 def config_files(home: Path) -> set[Path]:
-    """The live Vibe config, and the fragment the installer merges into it (in ~/.agents)."""
-    return {(home / ".vibe" / "config.toml").resolve(),
-            (home / ".agents" / "fragments" / "vibe" / "config.toml").resolve()}
+    """The live Vibe config."""
+    return {(home / ".vibe" / "config.toml").resolve()}
 
 
 def edited_text(old: str, tool_name: str, tool_input: dict[str, Any]) -> str | None:

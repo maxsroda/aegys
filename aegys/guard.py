@@ -2,7 +2,7 @@
 """Antigravity CLI (agy) hooks: the aegys guard and classifier.
 
 Paired with ``"command(regex:(?s).*)"`` in ``permissions.allow`` of
-``fragments/agy/settings.json``, this hook replaces agy's built-in ``autorun``
+``~/.gemini/antigravity-cli/settings.json``, this hook replaces agy's built-in ``autorun``
 classifier. It gates ``run_command``, the file tools (``read_file``,
 ``view_file``, ``write_file``, ``edit_file``) and the listing and search tools
 (``list_directory``, ``grep_search``, ``find``) in every session and does not read agy's mode (Auto,
@@ -44,10 +44,12 @@ For ``run_command``, in order:
 For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
 1. **Hard-deny (all states):** a credential path (pi-automode ``deniedPaths``
    plus agy's credential files); a write into agy's control directories or into
-   ``~/.agents/hooks/`` and ``~/.agents/bin/``.
+   the launcher directories of the harness config repository (see
+   ``aegys/config.py``).
 2. **Workspace fast allow:** a path under a workspace root or the working
    directory, unless a protected name such as ``.git`` or ``.gemini`` occurs in
-   it, or the call writes into ``~/.agents``, ``~/.gemini`` or the aegys package.
+   it, or the call writes into the harness config repository, ``~/.gemini`` or
+   the aegys package.
    Returns ``{"decision": "allow"}``.
 3. **Guard off:** ``{"decision": "force_ask", ...}``.
 4. **Classifier:** the verdict rules of 5, with the file action as input.
@@ -77,6 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlsplit
 
+from .config import harness_config_repository, load_aegys_config
 from .vibe_tool_guard import (
     BASH_RULES,
     PACKAGE_DIR,
@@ -296,12 +299,10 @@ CLASSIFIER_DECISION_TOOL = {
     },
 }
 
-# The guard's own code, and the agent-config files that configure agy and pi-automode.
+# The guard's own code, and the files that configure agy and pi-automode. The harness
+# config repository adds its agy settings directories (see agy_control_dirs).
 AGY_EXTRA_CONTROL_DIRS = (PACKAGE_DIR,)
 AGY_HOME_CONTROL_DIRS = (
-    ".agents/configs/pi",
-    ".agents/fragments/agy",
-    ".agents/configs/claude",
     ".gemini/config",
     ".gemini/antigravity-cli",
     ".gemini/aegys",
@@ -310,8 +311,6 @@ AGY_HOME_CONTROL_DIRS = (
     ".pi/agent",
 )
 AGY_CONTROL_SPELLINGS = (
-    "configs/pi/",
-    "fragments/agy/",
     "aegys/guard",
     "aegys/vibe_",
     "aegys/data/",
@@ -341,18 +340,21 @@ def build_classifier_system_prompt() -> str:
 # --- Control path checks for agy and pi-automode ---------------------------------
 
 
+def agy_control_dirs(home: Path) -> tuple[Path, ...]:
+    repository = harness_config_repository(home)
+    return (
+        *AGY_EXTRA_CONTROL_DIRS,
+        *(repository.agy_settings_dirs if repository else ()),
+        *((home / rel).resolve() for rel in AGY_HOME_CONTROL_DIRS),
+    )
+
+
 def agy_control_path(path: Path, home: Path) -> bool:
-    if any(inside(path, d) for d in AGY_EXTRA_CONTROL_DIRS):
-        return True
-    return any(inside(path, (home / rel).resolve()) for rel in AGY_HOME_CONTROL_DIRS)
+    return any(inside(path, d) for d in agy_control_dirs(home))
 
 
 def agy_holds_control(path: Path, home: Path) -> bool:
-    areas = (
-        *AGY_EXTRA_CONTROL_DIRS,
-        *((home / rel).resolve() for rel in AGY_HOME_CONTROL_DIRS),
-    )
-    return any(inside(area, path) for area in areas)
+    return any(inside(area, path) for area in agy_control_dirs(home))
 
 
 def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
@@ -360,9 +362,12 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
     stages = command_stages(command, cwd, home)
     if stages is None:
         return None
+    repository = harness_config_repository(home)
+    script_dirs = repository.script_dirs if repository else ()
+    spellings = (*AGY_CONTROL_SPELLINGS, *(repository.agy_control_spellings if repository else ()))
     for stage in stages:
         executed = executed_file(stage, home)
-        if executed is not None and inside(executed, (home / ".agents" / "scripts").resolve()):
+        if executed is not None and any(inside(executed, d) for d in script_dirs):
             continue
         outputs = redirect_targets(stage.raw)
         for target in outputs:
@@ -399,7 +404,7 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
                         "auto-mode control files"
                     )
         code_text = stage.text if stage.refused else " ".join(inline_code(stage.words))
-        for spelling in AGY_CONTROL_SPELLINGS:
+        for spelling in spellings:
             if spelling in code_text:
                 return (
                     f"inline code references control path {spelling!r}, which controls "
@@ -1301,19 +1306,9 @@ def load_project_instructions(workspace_paths: list[str], home: Path) -> str:
 # --- Two-stage Claude Haiku 5.5 classifier ---------------------------------------
 
 
-def load_aegys_config() -> dict[str, Any]:
-    """The per-user classifier settings, written by agent-config's installer to
-    ~/.gemini/aegys/config.json. Missing or unreadable means the defaults."""
-    try:
-        data = json.loads((Path.home() / ".gemini" / "aegys" / "config.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def resolve_anthropic_endpoint() -> tuple[str, str, str | None]:
     """Return `(base_url, model_id, api_key)` from the aegys config and environment."""
-    cfg = load_aegys_config()
+    cfg = load_aegys_config(Path.home())
     model_spec = str(cfg.get("classifierModel") or DEFAULT_CLASSIFIER_MODEL)
     _, _, model_id = model_spec.partition("/")
     if not model_id:
@@ -1674,15 +1669,18 @@ AGY_CREDENTIAL_PATTERNS = (
 
 
 def guard_code_dirs(home: Path) -> tuple[Path, ...]:
-    """The guard's package, and the agent-config hooks and launchers that harnesses run."""
-    return (PACKAGE_DIR, (home / ".agents" / "hooks").resolve(), (home / ".agents" / "bin").resolve())
+    """The guard's package, and the launcher directories of the harness config
+    repository: hooks and launchers that harnesses run."""
+    repository = harness_config_repository(home)
+    return (PACKAGE_DIR, *(repository.launcher_dirs if repository else ()))
 
 
 def classified_write_roots(home: Path) -> tuple[Path, ...]:
     """Trees whose writes always go to the classifier, even inside the workspace:
-    the agent-config clone (it installs what agy and the other harnesses run),
+    the harness config repository (it installs what agy and the other harnesses run),
     agy's own directory, and the aegys package."""
-    return (PACKAGE_DIR, (home / ".agents").resolve(), (home / ".gemini").resolve())
+    repository = harness_config_repository(home)
+    return (PACKAGE_DIR, *((repository.path,) if repository else ()), (home / ".gemini").resolve())
 # The whole user message `/aegys`, `/aegys on` or `/aegys off`, any case.
 SLASH_COMMAND_RE = re.compile(r"/aegys(?:\s+(on|off))?", re.IGNORECASE)
 

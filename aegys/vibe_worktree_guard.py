@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Mistral Vibe pre_tool hook: hold an unattended worker to its worktree, best effort.
 
-Active only when ``VIBE_WORKTREE_GUARD`` names a directory (the orchestrate
-skill's Vibe runner sets it to the worker's worktree); otherwise it passes every
+Active only when ``VIBE_WORKTREE_GUARD`` names a directory (a runner that drives
+Vibe headless sets it to the worker's worktree); otherwise it passes every
 call through, so interactive sessions are unaffected.
 
 What it denies, while active:

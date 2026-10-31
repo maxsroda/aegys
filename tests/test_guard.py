@@ -25,6 +25,15 @@ from aegys.guard import (
 # The checkout root: the tests run from here, so `python -m aegys.guard` imports this package.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_DIR = REPO_ROOT / "aegys"
+# The harness config repository every test home declares in ~/.gemini/aegys/config.json.
+HARNESS_CONFIG_REPOSITORY = {
+    "path": "~/harness-config",
+    "launcherDirs": ["hooks", "bin"],
+    "scriptDirs": ["scripts"],
+    "vibeSettingsDirs": ["vibe-settings"],
+    "agySettingsDirs": ["agy-settings"],
+    "controlSpellings": ["bin/launcher.sh"],
+}
 
 
 def make_payload(
@@ -119,6 +128,12 @@ class AegysTest(unittest.TestCase):
             json.dumps({"agentMode": "auto"}), encoding="utf-8"
         )
         self.write_hooks(HOOK_MATCHER)
+        self.write_aegys_config({"harnessConfigRepository": HARNESS_CONFIG_REPOSITORY})
+
+    def write_aegys_config(self, config: dict[str, Any]) -> None:
+        directory = self.home / ".gemini" / "aegys"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
     def write_hooks(self, matcher: str, slash_command: bool = True) -> None:
         config = self.home / ".gemini" / "config"
@@ -291,7 +306,8 @@ class AegysTest(unittest.TestCase):
         for tool_name, path in (
             ("write_file", PACKAGE_DIR / "guard.py"),
             ("edit_file", PACKAGE_DIR / "data" / "agy-settings.json"),
-            ("write_file", self.home / ".agents" / "bin" / "lib.sh"),
+            ("write_file", self.home / "harness-config" / "bin" / "lib.sh"),
+            ("edit_file", self.home / "harness-config" / "agy-settings" / "rules.json"),
             ("write_file", self.home / ".gemini" / "config" / "hooks.json"),
             (
                 "write_file",
@@ -766,12 +782,13 @@ class AegysTest(unittest.TestCase):
             )
             self.assertEqual(res, {"decision": "allow"}, (tool_name, args))
 
-    def test_writes_inside_agents_and_gemini_go_to_classifier(self) -> None:
-        agents = self.home / ".agents"
+    def test_writes_inside_the_harness_config_repository_and_gemini_go_to_classifier(self) -> None:
+        agents = self.home / "harness-config"
         for tool_name, path in (
-            ("write_file", agents / "scripts" / "merge-agy-hooks.mjs"),
-            ("edit_file", agents / "AGENTS.md"),
-            ("write_file", agents / "skills" / "x" / "SKILL.md"),
+            ("write_file", agents / "scripts" / "setup.sh"),
+            ("edit_file", agents / "vibe-settings" / "config.toml"),
+            ("edit_file", agents / "README.md"),
+            ("write_file", agents / "notes" / "x.md"),
             ("write_file", self.home / ".gemini" / "projects.json"),
         ):
             # Even when that tree is the workspace, a write is not fast-allowed.
@@ -783,35 +800,78 @@ class AegysTest(unittest.TestCase):
         # Reads in the workspace stay fast.
         self.assertEqual(
             self.evaluate_file(
-                "read_file", str(agents / "scripts" / "install.sh"),
+                "read_file", str(agents / "scripts" / "setup.sh"),
                 workspace=agents, classifier_caller=unexpected_caller,
             ),
             {"decision": "allow"},
         )
 
     def test_shell_writes_into_agent_trees_never_skip_the_classifier(self) -> None:
-        # Into the agent-config clone: denied outright, even with the clone as workspace.
-        agents = self.home / ".agents"
+        # Into the harness config repository's control directories: denied outright,
+        # even with the repository as workspace.
+        agents = self.home / "harness-config"
+        (agents / ".git").mkdir(parents=True)
         for cmd in (
-            "sed -i s/a/b/ scripts/install.sh",
-            "echo x > scripts/install.sh",
+            "sed -i s/a/b/ scripts/setup.sh",
+            "echo x > scripts/setup.sh",
             "cp README.md scripts/x.sh",
-            "git checkout -- scripts/install.sh",
+            "echo x > hooks/x.py",
+            "echo x > vibe-settings/config.toml",
+            "echo x > agy-settings/rules.json",
+            "git checkout -- scripts/setup.sh",
+            "git checkout -- .",
+            "python3 -c \"open('hooks/x.py', 'w')\"",
         ):
             res = evaluate_pre_tool_use(
                 make_payload(cmd, workspace_paths=[str(agents)]),
                 home=self.home, cwd=agents, temp_roots=(), classifier_caller=unexpected_caller,
             )
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
-        # Into ~/.gemini or another ~/.agents tree: the classifier decides.
+        # Into ~/.gemini or another tree of the repository: the classifier decides.
         for cmd in (
             "sed -i s/a/b/ ~/.gemini/projects.json",
-            "echo x > ~/.agents/skills/x/SKILL.md",
-            "touch ~/.agents/skills/new",
+            "echo x > ~/harness-config/notes/x.md",
+            "touch ~/harness-config/notes/new",
         ):
             res = self.evaluate(cmd, classifier_caller=soft_deny_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
             self.assertIn("classifier", res.get("reason", ""), (cmd, res))
+
+    def test_inline_code_naming_a_control_spelling_is_denied(self) -> None:
+        for cmd in (
+            "python3 -c \"open('bin/launcher.sh', 'w')\"",
+            "python3 -c \"open('agy-settings/rules.json', 'w')\"",
+            "python3 -c \"open('vibe-settings/config.toml', 'w')\"",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_without_a_harness_config_repository_no_repository_is_guarded(self) -> None:
+        self.write_aegys_config({})
+        repository = self.home / "harness-config"
+        for tool_name, path in (
+            ("write_file", repository / "hooks" / "x.py"),
+            ("edit_file", repository / "agy-settings" / "rules.json"),
+        ):
+            res = self.evaluate_file(
+                tool_name, str(path), workspace=repository, classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res, {"decision": "allow"}, (tool_name, path))
+
+    def test_the_guarded_repository_follows_the_configured_path(self) -> None:
+        self.write_aegys_config(
+            {"harnessConfigRepository": {**HARNESS_CONFIG_REPOSITORY, "path": "~/elsewhere"}}
+        )
+        res = self.evaluate_file(
+            "write_file", str(self.home / "elsewhere" / "hooks" / "x.py"),
+            classifier_caller=unexpected_caller,
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+        res = self.evaluate_file(
+            "write_file", str(self.home / "harness-config" / "hooks" / "x.py"),
+            workspace=self.home / "harness-config", classifier_caller=unexpected_caller,
+        )
+        self.assertEqual(res, {"decision": "allow"})
 
     def test_classifier_retries_stop_at_the_time_budget(self) -> None:
         import time
