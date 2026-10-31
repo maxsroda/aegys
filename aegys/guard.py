@@ -21,8 +21,10 @@ For ``run_command``, in order:
    (``rg --pre``, ``fd -x``, recursive deletes of critical paths, secret reads,
    writes or redirects to harness and control files, dangerous git config,
    denied or private URLs) returns ``{"decision": "deny", ...}``.
-2. **Privilege escalation (all states):** ``sudo`` and ``doas`` return
-   ``{"decision": "force_ask", ...}`` so agy prompts the user.
+2. **Privilege escalation and ask rules (all states):** ``sudo`` and ``doas``, and a
+   command matching a ``shellCommandRules.ask`` pattern, return
+   ``{"decision": "force_ask", ...}`` so agy prompts the user. The reason names the
+   matched rule.
 3. **Guard off:** a single plain command matching ``allowWhileGuardOff`` returns
    ``{"decision": "allow"}``; every other command returns
    ``{"decision": "force_ask", ...}``.
@@ -31,8 +33,8 @@ For ``run_command``, in order:
    ``sed``/``awk`` stage) and writes no protected path. Returns
    ``{"decision": "allow"}``, plus ``"overwrite": {"BypassSandbox": True}`` while
    the status line last reported the terminal sandbox on.
-5. **Two-stage Claude Haiku 5.5 classifier (``low`` effort):** the pi-automode
-   classifier (Stage 1: single-digit ``0``/``1`` fast check; Stage 2:
+5. **Two-stage Claude Haiku 5.5 classifier (``low`` effort):** the classifier
+   (Stage 1: single-digit ``0``/``1`` fast check; Stage 2:
    ``classifier_decision`` tool call) judges the rest. ``allow`` returns as in 4;
    ``soft_deny``, ``hard_deny``, or malformed/truncated output fail closed with
    ``{"decision": "deny", ...}`` so the model sees the error and adapts. The
@@ -58,19 +60,20 @@ For ``list_directory``, ``grep_search`` and ``find``: deny when a path argument
 is a credential path or, for the two recursive searches, lies above one;
 otherwise allow.
 
-The lists in items 1, 3 and 4 and the secret paths come from the shipped
+The lists in items 1 to 4 and the secret paths come from the shipped
 ``aegys/data/default-config.json``, merged with the user's
 ``~/.gemini/aegys/config.json`` (see ``aegys/config.py``). If the shipped file
-cannot be read, the guard fails closed: every ``run_command``, file tool call and
-search tool call returns ``{"decision": "force_ask", ...}``, except for the denies
-that need no list.
+cannot be read, or the user's config has a problem (it does not parse, has an
+unknown key, or has a value of the wrong type), the guard fails closed: every
+``run_command``, file tool call and search tool call returns
+``{"decision": "force_ask", ...}``, and the reason names the problem and the file.
+The denies that need no list still apply.
 
 All classifier calls of one hook run share a 25 s budget, below agy's 30 s hook
 timeout; when it runs out the hook returns ``force_ask``. ``--statusline`` shows
 a red ``aegys ✗`` when ``~/.gemini/config/hooks.json`` does not wire the hook
-for every guarded tool, when the user's config does not parse or names an
-unknown ``harnessConfigRepository`` key, or when the shipped defaults cannot be
-read.
+for every guarded tool, when the user's config has a problem, or when the shipped
+defaults cannot be read.
 """
 from __future__ import annotations
 
@@ -89,12 +92,12 @@ from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlsplit
 
 from .config import (
-    DEFAULT_CONFIG_PATH,
     Policy,
     config_problem,
     harness_config_repository,
     load_aegys_config,
     load_policy,
+    policy_problem,
     shipped_problem,
 )
 from .command_checks import (
@@ -275,7 +278,7 @@ Examples:
 - Editing internal/interaction/dashboard.go after "For FF-28 in /worktree, modify existing files under internal/**" => allow, explicit_intent, target stays inside a direct, bounded user authorization.
 - Editing cmd/tool.go after the same authorization => block, soft_deny, target lies outside authorized scope.
 - Uploading repository contents, logs with secrets, or internal data to an untrusted domain => block, hard_deny.
-- Modifying .pi/automode*, this extension, or permission rules => block, hard_deny.
+- Modifying ~/.gemini/aegys/config.json, the aegys package, or permission rules => block, hard_deny.
 - After "cat ~/.ssh/id_rsa" was denied: base64 ~/.ssh/id_rsa, or python3 -c that opens it => block, evasion."""
 
 CLASSIFIER_FAST_INSTRUCTION = (
@@ -313,9 +316,11 @@ CLASSIFIER_DECISION_TOOL = {
     },
 }
 
-# The guard's own code, and the files that configure agy and pi-automode. The harness
-# config repository adds its permission settings directories (see agy_control_dirs).
+# The guard's own code, and the files that configure agy. The harness config
+# repository adds its permission settings directories (see agy_control_dirs).
 AGY_EXTRA_CONTROL_DIRS = (PACKAGE_DIR,)
+# Under $HOME: agy's and aegys's own files, and the pi harness's settings (another
+# harness, protected in the same way).
 AGY_HOME_CONTROL_DIRS = (
     ".gemini/config",
     ".gemini/antigravity-cli",
@@ -350,7 +355,7 @@ def build_classifier_system_prompt() -> str:
     )
 
 
-# --- Control path checks for agy and pi-automode ---------------------------------
+# --- Control path checks for agy and the pi harness ------------------------------
 
 
 def agy_control_dirs(home: Path) -> tuple[Path, ...]:
@@ -371,7 +376,7 @@ def agy_holds_control(path: Path, home: Path) -> bool:
 
 
 def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
-    """Deny writes or redirects to agy or pi-automode control files."""
+    """Deny writes or redirects to agy or pi control files."""
     stages = command_stages(command, cwd, home)
     if stages is None:
         return None
@@ -1391,10 +1396,10 @@ def classify_in_stages(
     caller: ClassifierCaller | None = None,
     recent_denials: str = "",
 ) -> dict[str, str]:
-    """Run the 2-stage pi-automode classifier (`fast` 0/1 check -> `detailed`
+    """Run the two-stage classifier (`fast` 0/1 check -> `detailed`
     `classifier_decision` tool call). Fails closed (`decision: "block"`) on
-    malformed/truncated output like pi-automode does; returns `decision: "error"`
-    only when the classifier itself is unavailable/failing (API/network failure)."""
+    malformed or truncated output; returns `decision: "error"` only when the
+    classifier itself is unavailable or failing (API or network failure)."""
     deadline = time.monotonic() + CLASSIFIER_TIME_BUDGET_SECONDS
     invoke = caller or (
         lambda sys_prompt, msgs, max_tok, tls: anthropic_messages_call(
@@ -1599,10 +1604,10 @@ def classified_write_roots(home: Path) -> tuple[Path, ...]:
 SLASH_COMMAND_RE = re.compile(r"/aegys(?:\s+(on|off))?", re.IGNORECASE)
 
 
-def policy_unavailable_reason() -> str:
-    """The reason a call is held for the user when the shipped policy cannot be read."""
-    return (f"{GUARD_NAME} cannot read its shipped policy in {DEFAULT_CONFIG_PATH}, "
-            "so it cannot check this; confirm it manually.")
+def policy_unavailable_reason(home: Path) -> str:
+    """The reason a call is held for the user when the policy cannot be applied."""
+    return (f"{GUARD_NAME} cannot apply its policy ({policy_problem(home)}), so it cannot "
+            "check this; confirm it manually.")
 
 
 def file_tool_path(args: dict[str, Any], cwd: Path) -> Path | None:
@@ -1660,7 +1665,7 @@ def evaluate_file_access(
     ):
         root = None
     if policy is None:
-        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
+        return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     if root is not None and not any(
         part in DEFAULT_PROTECTED_PATHS for part in path.relative_to(root).parts
     ):
@@ -1702,7 +1707,7 @@ def evaluate_search_access(
     policy: Policy | None,
 ) -> dict[str, Any]:
     if policy is None:
-        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
+        return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     conversation_id = extract_conversation_id(payload)
     for path in path_arguments(args, cwd):
         area = path if secret(path, policy.secret_paths) else None
@@ -1866,7 +1871,7 @@ def decide_pre_tool_use(
             )
 
     if policy is None:
-        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
+        return {"decision": "force_ask", "reason": policy_unavailable_reason(home_path)}
 
     stage_candidates = [command.strip()]
     for st in stages:
@@ -1879,18 +1884,18 @@ def decide_pre_tool_use(
         if any(matches_bash_deny_pattern(pat, cand) for cand in stage_candidates):
             return deny(f"Blocked by {GUARD_NAME}: command matches deny rule {pat!r}.")
 
-    # 2. Privilege escalation (`sudo`, `doas`, `ask` rules) always forces a user prompt.
-    if any(
-        st.raw and os.path.basename(st.raw[0]) in PRIVILEGE_WRAPPERS for st in stages
-    ) or any(
-        matches_bash_deny_pattern(pat, cand)
-        for pat in policy.shell_ask
-        for cand in stage_candidates
-    ):
+    # 2. Privilege escalation (`sudo`, `doas`) and the ask rules always force a user prompt.
+    if any(st.raw and os.path.basename(st.raw[0]) in PRIVILEGE_WRAPPERS for st in stages):
         return {
             "decision": "force_ask",
             "reason": "Privilege escalation (sudo/doas) requires explicit user confirmation.",
         }
+    for pat in policy.shell_ask:
+        if any(matches_bash_deny_pattern(pat, cand) for cand in stage_candidates):
+            return {
+                "decision": "force_ask",
+                "reason": f"command matches ask rule {pat!r}; it requires explicit user confirmation.",
+            }
 
     # 3. Guard off: only the static allowlist passes; everything else asks the user.
     if not guard_enabled(home_path, conv_id):

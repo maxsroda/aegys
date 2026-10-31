@@ -9,17 +9,29 @@ merged with the user's entries. Both files have the same keys:
 - ``allowWhileGuardOff``: command prefixes, or ``regex:`` patterns, that agy may
   run while the guard is off (``/aegys off``).
 - ``deniedHosts``: an object from a reason to a list of hosts. A host is denied
-  when it equals an entry or ends with ``.`` and the entry.
-- ``secretPaths``: glob patterns for paths that no tool may read or write, in
-  any letter case.
+  when it equals an entry or ends with ``.`` and the entry. Host names ignore case.
+- ``secretPaths``: fnmatch glob patterns for paths that no tool may read or write.
+  An entry that starts with ``~/`` is read from the home directory. An entry also
+  covers everything below what it matches: ``*/.mysecret`` covers ``*/.mysecret/x``.
 
-The user's config adds entries to these lists. ``removeDefaults`` removes shipped
-entries: it has the same keys, except that for ``deniedHosts`` it is one flat list
-of hosts, removed from every reason. The effective list is the shipped entries
-plus the user's, minus the removed ones, each entry once. Entries that are not
-strings are ignored, and so is a value of the wrong type, key by key. A missing
-user config gives the shipped lists alone. If the shipped file cannot be read or
-does not hold every list, ``load_policy`` returns None and the guard fails closed.
+Shell rules and secret paths are matched without regard to letter case.
+
+The user's config adds entries to these lists. Shipped and user entries alike lose
+their surrounding whitespace, and empty entries are dropped. ``removeDefaults``
+removes entries from the effective list, shipped entries and the user's own alike.
+It has the same keys, except that for ``deniedHosts`` it is one flat list of hosts,
+removed from every reason. A removed entry matches only when spelled as written,
+except host names, which match in any letter case. The effective list keeps each
+entry once, shipped entries first.
+
+The user's config also takes ``classifierModel`` and ``anthropicBaseUrl``, strings
+that name the classifier's model and API base URL.
+
+A missing user config gives the shipped lists alone. If the shipped file cannot be
+read, or the user's config does not parse, has an unknown key, or has a value of
+the wrong type, ``load_policy`` returns None, and the guard holds every call it
+would have to check (see ``aegys/guard.py``). ``policy_problem`` says why and
+names the file.
 
 ``harnessConfigRepository`` names the harness config repository: a git clone that
 installs and configures the coding-agent harnesses (their hooks, launchers and
@@ -38,8 +50,9 @@ protects it. Its keys, each a list of directories relative to ``path``:
 - ``controlSpellings``: file names that, written anywhere in inline code, count
   as a write to the repository's control files.
 
-Any other write inside ``path`` goes to the classifier. Without
-``harnessConfigRepository`` no repository is protected.
+Its ``path`` is a string, and ``~/`` in it is read as home. Any other write inside
+``path`` goes to the classifier. Without ``harnessConfigRepository`` no repository
+is protected.
 """
 from __future__ import annotations
 
@@ -49,11 +62,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+def user_config_path(home: Path) -> Path:
+    """The user's config file under home."""
+    return home / ".gemini" / "aegys" / "config.json"
+
+
 def load_aegys_config(home: Path) -> dict[str, Any]:
-    """The settings in home/.gemini/aegys/config.json. Missing or unreadable means
-    the defaults."""
+    """The settings in the user's config file. Missing or unreadable means none."""
     try:
-        data = json.loads((home / ".gemini" / "aegys" / "config.json").read_text(encoding="utf-8"))
+        data = json.loads(user_config_path(home).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -61,7 +78,14 @@ def load_aegys_config(home: Path) -> dict[str, Any]:
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_CONFIG_PATH = DATA_DIR / "default-config.json"
-# The keys of harnessConfigRepository that the loader reads.
+# The keys the loader reads from the user's config.
+TOP_LEVEL_KEYS = frozenset({
+    "classifierModel", "anthropicBaseUrl", "harnessConfigRepository", "removeDefaults",
+    "shellCommandRules", "allowWhileGuardOff", "deniedHosts", "secretPaths",
+})
+RULE_KINDS = ("allow", "ask", "deny")
+# The keys removeDefaults may name.
+REMOVABLE_KEYS = frozenset({"shellCommandRules", "allowWhileGuardOff", "deniedHosts", "secretPaths"})
 HARNESS_REPOSITORY_KEYS = frozenset({
     "path", "launcherDirs", "scriptDirs", "harnessSettingsDirs", "permissionSettingsDirs",
     "controlSpellings",
@@ -96,7 +120,7 @@ def shipped_lists() -> Optional[dict[str, Any]]:
     hosts = data.get("deniedHosts")
     if not (
         isinstance(rules, dict)
-        and all(is_string_list(rules.get(kind)) for kind in ("allow", "ask", "deny"))
+        and all(is_string_list(rules.get(kind)) for kind in RULE_KINDS)
         and is_string_list(data.get("allowWhileGuardOff"))
         and is_string_list(data.get("secretPaths"))
         and isinstance(hosts, dict)
@@ -111,10 +135,15 @@ def _mapping(value: Any) -> dict[str, Any]:
 
 
 def _strings(value: Any) -> list[str]:
-    """The non-empty string entries of a list; anything else is ignored."""
+    """The entries of a list, stripped of surrounding whitespace, with empty ones dropped."""
     if not isinstance(value, list):
         return []
     return [entry.strip() for entry in value if isinstance(entry, str) and entry.strip()]
+
+
+def _expand_home(entry: str, home: Path) -> str:
+    """A secret path that starts with ~/ names a path under home."""
+    return f"{home.resolve()}{entry[1:]}" if entry.startswith("~/") else entry
 
 
 def _merged(shipped: list[str], user: list[str], removed: list[str]) -> tuple[str, ...]:
@@ -124,25 +153,26 @@ def _merged(shipped: list[str], user: list[str], removed: list[str]) -> tuple[st
 
 
 def _denied_hosts(shipped: dict[str, Any], user: dict[str, Any], removed: list[str]) -> dict[str, str]:
-    """Each denied host with its reason. A reason whose value is not a list is ignored;
-    where a host is listed twice, the first reason wins."""
+    """Each denied host with its reason. Where a host is listed twice, the first reason wins."""
     gone = {host.lower() for host in removed}
     reasons: dict[str, str] = {}
     for by_reason in (shipped, user):
         for reason, hosts in by_reason.items():
-            if not isinstance(reason, str) or not reason.strip() or not isinstance(hosts, list):
+            reason = reason.strip()
+            if not reason:
                 continue
             for host in _strings(hosts):
                 host = host.lower()
                 if host not in gone:
-                    reasons.setdefault(host, reason.strip())
+                    reasons.setdefault(host, reason)
     return reasons
 
 
 def load_policy(home: Path) -> Optional[Policy]:
-    """The effective policy for home, or None when the shipped lists cannot be read."""
+    """The effective policy for home, or None when it cannot be applied: the shipped
+    lists are unreadable, or the user's config has a problem (see policy_problem)."""
     shipped = shipped_lists()
-    if shipped is None:
+    if shipped is None or config_problem(home) is not None:
         return None
     user = load_aegys_config(home)
     removed = _mapping(user.get("removeDefaults"))
@@ -151,46 +181,144 @@ def load_policy(home: Path) -> Optional[Policy]:
     shipped_rules = shipped["shellCommandRules"]
 
     def rule_list(kind: str) -> tuple[str, ...]:
-        return _merged(shipped_rules[kind], _strings(user_rules.get(kind)),
+        return _merged(_strings(shipped_rules[kind]), _strings(user_rules.get(kind)),
                        _strings(removed_rules.get(kind)))
+
+    def secret_list(entries: Any) -> list[str]:
+        return [_expand_home(entry, home) for entry in _strings(entries)]
 
     return Policy(
         shell_allow=rule_list("allow"),
         shell_ask=rule_list("ask"),
         shell_deny=rule_list("deny"),
         allow_while_guard_off=_merged(
-            shipped["allowWhileGuardOff"], _strings(user.get("allowWhileGuardOff")),
+            _strings(shipped["allowWhileGuardOff"]), _strings(user.get("allowWhileGuardOff")),
             _strings(removed.get("allowWhileGuardOff"))),
         denied_hosts=_denied_hosts(
             shipped["deniedHosts"], _mapping(user.get("deniedHosts")),
             _strings(removed.get("deniedHosts"))),
         secret_paths=_merged(
-            shipped["secretPaths"], _strings(user.get("secretPaths")),
-            _strings(removed.get("secretPaths"))),
+            secret_list(shipped["secretPaths"]), secret_list(user.get("secretPaths")),
+            secret_list(removed.get("secretPaths"))),
     )
 
 
 def shipped_problem() -> Optional[str]:
-    """Why the shipped policy cannot be used, or None. The guard then fails closed."""
+    """Why the shipped policy cannot be used, or None. Used by the status line."""
     return None if shipped_lists() is not None else "default-config.json unreadable"
 
 
+def _list_problem(value: Any, where: str) -> Optional[str]:
+    return None if is_string_list(value) else f"{where} is not a list of strings"
+
+
+def _object_problem(value: Any, where: str) -> Optional[str]:
+    return None if isinstance(value, dict) else f"{where} is not an object"
+
+
+def _string_problem(value: Any, where: str) -> Optional[str]:
+    return None if isinstance(value, str) else f"{where} is not a string"
+
+
+def _rules_problem(value: Any, where: str) -> Optional[str]:
+    problem = _object_problem(value, where)
+    if problem is not None:
+        return problem
+    for kind, entries in value.items():
+        if kind not in RULE_KINDS:
+            return f"unknown key {kind} in {where}"
+        problem = _list_problem(entries, f"{where}.{kind}")
+        if problem is not None:
+            return problem
+    return None
+
+
+def _hosts_problem(value: Any, where: str) -> Optional[str]:
+    problem = _object_problem(value, where)
+    if problem is not None:
+        return problem
+    for reason, hosts in value.items():
+        if not reason.strip():
+            return f"{where} has an empty reason"
+        problem = _list_problem(hosts, f"{where}.{reason}")
+        if problem is not None:
+            return problem
+    return None
+
+
+def _removed_problem(value: Any) -> Optional[str]:
+    problem = _object_problem(value, "removeDefaults")
+    if problem is not None:
+        return problem
+    for key, entries in value.items():
+        if key not in REMOVABLE_KEYS:
+            return f"unknown key {key} in removeDefaults"
+        if key == "shellCommandRules":
+            problem = _rules_problem(entries, "removeDefaults.shellCommandRules")
+        else:
+            problem = _list_problem(entries, f"removeDefaults.{key}")
+        if problem is not None:
+            return problem
+    return None
+
+
+def _repository_problem(value: Any) -> Optional[str]:
+    problem = _object_problem(value, "harnessConfigRepository")
+    if problem is not None:
+        return problem
+    for key, item in value.items():
+        if key not in HARNESS_REPOSITORY_KEYS:
+            return f"unknown config key {key}"
+        if key == "path":
+            problem = _string_problem(item, "harnessConfigRepository.path")
+        else:
+            problem = _list_problem(item, f"harnessConfigRepository.{key}")
+        if problem is not None:
+            return problem
+    return None
+
+
 def config_problem(home: Path) -> Optional[str]:
-    """Why the user's config.json cannot be used as written, or None. A missing file is
-    fine. An unreadable or unparsable one, or an unknown key under
-    harnessConfigRepository, is not: the guard would silently ignore what it says."""
+    """Why the user's config cannot be applied as written, or None. A missing file is
+    fine. Otherwise the first problem is reported: the file does not parse or is not
+    a JSON object, a key is unknown, or a value has the wrong type."""
     try:
-        data = json.loads((home / ".gemini" / "aegys" / "config.json").read_text(encoding="utf-8"))
+        data = json.loads(user_config_path(home).read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
         return "config.json does not parse"
     if not isinstance(data, dict):
-        return "config.json does not parse"
-    repository = data.get("harnessConfigRepository")
-    for key in _mapping(repository):
-        if key not in HARNESS_REPOSITORY_KEYS:
+        return "config.json is not a JSON object"
+    for key in data:
+        if key not in TOP_LEVEL_KEYS:
             return f"unknown config key {key}"
+    checks = (
+        ("shellCommandRules", lambda v: _rules_problem(v, "shellCommandRules")),
+        ("allowWhileGuardOff", lambda v: _list_problem(v, "allowWhileGuardOff")),
+        ("secretPaths", lambda v: _list_problem(v, "secretPaths")),
+        ("deniedHosts", lambda v: _hosts_problem(v, "deniedHosts")),
+        ("removeDefaults", _removed_problem),
+        ("harnessConfigRepository", _repository_problem),
+        ("classifierModel", lambda v: _string_problem(v, "classifierModel")),
+        ("anthropicBaseUrl", lambda v: _string_problem(v, "anthropicBaseUrl")),
+    )
+    for key, check in checks:
+        if key in data:
+            problem = check(data[key])
+            if problem is not None:
+                return problem
+    return None
+
+
+def policy_problem(home: Path) -> Optional[str]:
+    """Why the guard cannot apply the policy, naming the file that holds the problem,
+    or None."""
+    if shipped_problem() is not None:
+        return f"{DEFAULT_CONFIG_PATH} is unreadable or malformed"
+    problem = config_problem(home)
+    if problem is not None:
+        return f"{user_config_path(home)}: {problem}"
     return None
 
 

@@ -652,10 +652,11 @@ def holds_control(path: Path, home: Path) -> bool:
 
 
 def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
-    """True when path matches one of the secret path globs (fnmatch syntax), in any
-    letter case."""
-    value = str(path).lower()
-    return any(fnmatch.fnmatchcase(value, pattern.lower()) for pattern in secret_paths)
+    """True when path, or a directory it lies in, matches one of the secret path globs
+    (fnmatch syntax, in any letter case). A secret directory covers what is below it."""
+    names = [str(p).lower() for p in (path, *path.parents)]
+    return any(fnmatch.fnmatchcase(name, pattern.lower())
+               for pattern in secret_paths for name in names)
 
 
 def secret_areas(secret_paths: tuple[str, ...]) -> tuple[str, ...]:
