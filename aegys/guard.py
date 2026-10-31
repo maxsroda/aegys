@@ -17,7 +17,7 @@ has no way to switch the guard itself.
 
 For ``run_command``, in order:
 1. **Deterministic hard-deny (all states):** a command matching a bash deny rule
-   from ``aegys/data/pi-automode-config.json`` or ``aegys/vibe_tool_guard.py``
+   from ``aegys/data/pi-automode-config.json`` or ``aegys/command_checks.py``
    (``rg --pre``, ``fd -x``, recursive deletes of critical paths, secret reads,
    writes or redirects to harness and control files, dangerous git config,
    exfiltration or private URLs) returns ``{"decision": "deny", ...}``.
@@ -80,7 +80,7 @@ from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlsplit
 
 from .config import harness_config_repository, load_aegys_config
-from .vibe_tool_guard import (
+from .command_checks import (
     BASH_RULES,
     PACKAGE_DIR,
     PRIVILEGE_WRAPPERS,
@@ -107,7 +107,7 @@ from .vibe_tool_guard import (
     urls_in,
     written_operands,
 )
-from .vibe_worktree_guard import WRITERS
+from .shell_words import WRITERS
 
 # Policy data shipped with aegys: pi-automode's deny and allow rules, and the static
 # allowlist agy uses while the guard is off.
@@ -300,7 +300,7 @@ CLASSIFIER_DECISION_TOOL = {
 }
 
 # The guard's own code, and the files that configure agy and pi-automode. The harness
-# config repository adds its agy settings directories (see agy_control_dirs).
+# config repository adds its permission settings directories (see agy_control_dirs).
 AGY_EXTRA_CONTROL_DIRS = (PACKAGE_DIR,)
 AGY_HOME_CONTROL_DIRS = (
     ".gemini/config",
@@ -312,7 +312,6 @@ AGY_HOME_CONTROL_DIRS = (
 )
 AGY_CONTROL_SPELLINGS = (
     "aegys/guard",
-    "aegys/vibe_",
     "aegys/data/",
     ".local/bin/aegys",
     ".gemini/config/",
@@ -344,7 +343,7 @@ def agy_control_dirs(home: Path) -> tuple[Path, ...]:
     repository = harness_config_repository(home)
     return (
         *AGY_EXTRA_CONTROL_DIRS,
-        *(repository.agy_settings_dirs if repository else ()),
+        *(repository.permission_settings_dirs if repository else ()),
         *((home / rel).resolve() for rel in AGY_HOME_CONTROL_DIRS),
     )
 
@@ -364,7 +363,7 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
         return None
     repository = harness_config_repository(home)
     script_dirs = repository.script_dirs if repository else ()
-    spellings = (*AGY_CONTROL_SPELLINGS, *(repository.agy_control_spellings if repository else ()))
+    spellings = (*AGY_CONTROL_SPELLINGS, *(repository.permission_control_spellings if repository else ()))
     for stage in stages:
         executed = executed_file(stage, home)
         if executed is not None and any(inside(executed, d) for d in script_dirs):
@@ -1659,7 +1658,7 @@ SEARCH_TOOL_NAMES = ("list_directory", "grep_search", "find")
 RECURSIVE_SEARCH_TOOL_NAMES = ("grep_search", "find")
 GUARDED_TOOL_NAMES = ("run_command", *FILE_TOOL_NAMES, *SEARCH_TOOL_NAMES)
 # Credential files that agy and Claude Code keep under $HOME, beyond the pi-automode
-# patterns that vibe_tool_guard.secret() already covers.
+# patterns that command_checks.secret() already covers.
 AGY_CREDENTIAL_PATTERNS = (
     "*/.gemini/gemini-credentials.json",
     "*/.gemini/antigravity-cli/antigravity-oauth-token*",

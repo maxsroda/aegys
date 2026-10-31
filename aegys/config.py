@@ -10,10 +10,10 @@ protects it. Its keys, each a list of directories relative to ``path``:
   may write them; a file tool's write goes to the classifier. A shell command
   that runs one of these files is the user's own code and is not held to its
   operands.
-- ``vibeSettingsDirs``: Mistral Vibe settings and rules. No shell command may
-  write them; a shell read of a Vibe settings file there is sent to ``read_file``.
-- ``agySettingsDirs``: agy and pi-automode settings. No tool may write them, and
-  inline code that names one is denied.
+- ``harnessSettingsDirs``: settings and rules of the harnesses. No shell command
+  may write them; a file tool's write goes to the classifier.
+- ``permissionSettingsDirs``: permission settings of the harnesses. No tool may
+  write them, and inline code that names one is denied.
 - ``controlSpellings``: file names that, written anywhere in inline code, count
   as a write to the repository's control files.
 
@@ -43,14 +43,14 @@ class HarnessConfigRepository:
     path: Path
     launcher_dirs: tuple[Path, ...]
     script_dirs: tuple[Path, ...]
-    vibe_settings_dirs: tuple[Path, ...]
-    agy_settings_dirs: tuple[Path, ...]
+    harness_settings_dirs: tuple[Path, ...]
+    permission_settings_dirs: tuple[Path, ...]
     control_spellings: tuple[str, ...]
 
     @property
     def control_dirs(self) -> tuple[Path, ...]:
         """The directories no shell command may write."""
-        return (*self.launcher_dirs, *self.script_dirs, *self.vibe_settings_dirs)
+        return (*self.launcher_dirs, *self.script_dirs, *self.harness_settings_dirs)
 
     @property
     def code_dir_names(self) -> tuple[str, ...]:
@@ -58,16 +58,16 @@ class HarnessConfigRepository:
         return tuple(str(d.relative_to(self.path)) for d in (*self.launcher_dirs, *self.script_dirs))
 
     @property
-    def vibe_control_spellings(self) -> tuple[str, ...]:
-        """vibeSettingsDirs as written in the config, each with a trailing slash, and
+    def harness_control_spellings(self) -> tuple[str, ...]:
+        """harnessSettingsDirs as written in the config, each with a trailing slash, and
         controlSpellings."""
-        return (*(f"{d.relative_to(self.path)}/" for d in self.vibe_settings_dirs),
+        return (*(f"{d.relative_to(self.path)}/" for d in self.harness_settings_dirs),
                 *self.control_spellings)
 
     @property
-    def agy_control_spellings(self) -> tuple[str, ...]:
-        """agySettingsDirs as written in the config, each with a trailing slash."""
-        return tuple(f"{d.relative_to(self.path)}/" for d in self.agy_settings_dirs)
+    def permission_control_spellings(self) -> tuple[str, ...]:
+        """permissionSettingsDirs as written in the config, each with a trailing slash."""
+        return tuple(f"{d.relative_to(self.path)}/" for d in self.permission_settings_dirs)
 
 
 def harness_config_repository(home: Path) -> Optional[HarnessConfigRepository]:
@@ -87,7 +87,7 @@ def harness_config_repository(home: Path) -> Optional[HarnessConfigRepository]:
         path=path,
         launcher_dirs=tuple(path / d for d in names("launcherDirs")),
         script_dirs=tuple(path / d for d in names("scriptDirs")),
-        vibe_settings_dirs=tuple(path / d for d in names("vibeSettingsDirs")),
-        agy_settings_dirs=tuple(path / d for d in names("agySettingsDirs")),
+        harness_settings_dirs=tuple(path / d for d in names("harnessSettingsDirs")),
+        permission_settings_dirs=tuple(path / d for d in names("permissionSettingsDirs")),
         control_spellings=names("controlSpellings"),
     )

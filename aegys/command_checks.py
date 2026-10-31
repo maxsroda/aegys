@@ -1,42 +1,21 @@
-#!/usr/bin/env python3
-"""Mistral Vibe pre_tool hook: deny what the allowlist cannot see.
+"""Deterministic checks on shell commands, file paths and URLs, for the aegys guard.
 
-What Vibe's permission model cannot express, closed here:
+guard.py runs these checks before it decides a command. Each check denies on its
+own, whatever the policy lists in the config say:
 
-1. Bash matches command *prefixes*, and trailing arguments ride along. A few
-   read-only commands carry a flag that turns them into "run any program":
-   ``rg --pre CMD``, ``fd -x CMD``. The deny list uses the same prefix match,
-   so it only sees a flag in first position. This hook sees the whole command.
+1. ``rg --pre CMD`` and ``fd -x CMD``: flags that run a command on every file.
+   The check sees the flag anywhere in its stage of the command.
+2. Secret paths (``SECRET_PATTERNS``): no command may read or write them, and a
+   recursive search that starts above one is denied.
+3. Control files: a write, redirect or inline code that names one changes what
+   the harnesses, git or this guard run or allow, so it is denied. So are a
+   recursive delete of a critical path and git settings that can run a program.
+4. URLs: each URL in a command is checked against the hosts of
+   ``DENIED_HOSTS`` and against private, loopback, link-local and metadata
+   addresses (SSRF).
 
-2. A tool set to ``permission = "always"`` (web_fetch, Firecrawl, the web-search
-   connector) has no per-call check at all, so nothing in config.toml can deny a
-   URL. This hook scans every string argument of every tool call for URLs and
-   denies hosts on the list below: exfiltration and out-of-band endpoints, URL
-   shorteners that hide the destination, IP loggers, private and cloud-metadata
-   addresses (SSRF), and a few on-the-fence sites.
-
-3. Edits. A write whose resolved target decides what Vibe or git runs or allows
-   (any .vibe directory but its worktrees and plans, the Vibe settings in the
-   harness config repository, what ~/.vibe links to, this guard, any .git directory) needs the
-   user's Allow for that one write, except a config.toml change confined to
-   which model runs and how. A write outside every git repository, temporary
-   directory and ~/.vibe/plans needs the user's Allow once per file per
-   session. A runner's exchange directories (VIBE_WORKTREE_GUARD_EXTRA) are
-   exempt. Vibe's session logs and this hook's approval store are never
-   writable. The Allow arrives through ask_user_question; the post_tool entry
-   of this script records it.
-
-4. Bash: a recursive delete of a critical path or of a target the hook cannot
-   see, any read of a secret (also by a recursive search from above it), any
-   write to a control file, and git config writes; a read of a Vibe settings
-   file is sent to read_file. Directory changes inside the command are followed.
-
-Contract (Vibe hooks, v2.25+): JSON on stdin with ``tool_name`` (``bash``, or
-``file_system.bash`` under the unified harness) and ``tool_input``; exit 0 with a JSON object on stdout; ``{"decision": "deny",
-"reason": ...}`` turns the call into a tool error the model sees. With
-``strict = true`` in hooks.toml any crash here is also a denial: fail closed.
-Run as a ``post_tool`` hook on ask_user_question, it records the user's Allow
-and prints nothing, or ``{"hook_specific_output": {"additional_context": ...}}``.
+Commands are split into stages by ``aegys/shell_words.py``. Directory changes
+inside the command are followed.
 
 This is a pattern check, not a shell parser or a threat feed. It cannot know a
 host is malicious, only that it is on the list; it will not see a URL built
@@ -47,28 +26,19 @@ from __future__ import annotations
 
 import fnmatch
 import glob
-import hashlib
 import ipaddress
-import json
 import os
 import re
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from .config import harness_config_repository
-from .vibe_worktree_guard import (
+from .shell_words import (
     FIND_WRITE_FLAGS, PRINTERS, READERS, SEARCHERS, SHELLS, WRITERS, brace_expansions,
     git_config_writes, git_subcommand_index, inside, split_stages, unwrap,
 )
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # python < 3.11: every config edit then needs the user
-    tomllib = None  # type: ignore[assignment]
 
 # --- bash: allow-listed commands with an exec flag ----------------------------
 
@@ -566,7 +536,7 @@ def critical_operand(program: str, operands: list[str], filtered: bool, stage: S
     return None
 
 
-# --- paths that decide what Vibe or git runs or allows, and secrets --------------
+# --- paths that decide what the harnesses or git run or allow, and secrets --------------
 
 # The code that runs as the guard: this package. Editing it edits the guard.
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -582,26 +552,11 @@ CONTROL_SPELLINGS = (
     "aegys/", ".gitconfig",
     ".local/bin/", ".cargo/bin/", ".config/git/", "/opt/homebrew/bin/", "/usr/local/bin/",
 )
-VIBE_DIR_SPELLING = re.compile(r"\.vibe(?:/(?!(?:worktrees|plans)(?:/|$|[\s'\"]))|$|[\s'\"])")
-# Under a .vibe directory these hold ordinary work, not settings.
-VIBE_WORK_DIRS = ("worktrees", "plans")
-# Under ~/.vibe these are written only by Vibe and this hook: session transcripts
-# and the approvals this hook reads. No tool call may write them, approved or not.
-VIBE_TAMPER_PROOF_DIRS = ("logs", "tool-guard")
 # Keys and credentials no tool may read, as directories and as their contents.
 SECRET_PATTERNS = (
     "*/.ssh", "*/.ssh/*", "*/.gnupg", "*/.gnupg/*", "*/.aws", "*/.aws/*",
     "*/.vibe/.env", "*/.netrc", "*/.docker/config.json", "*/.config/gh/hosts.yml",
 )
-
-
-def in_vibe_settings(path: Path) -> bool:
-    """True for anything under a `.vibe` directory other than its worktrees and
-    plans, at any depth: ~/.vibe, a project's .vibe/, and a .vibe/ inside a
-    Vibe-managed worktree alike."""
-    parts = path.parts
-    return any(part == ".vibe" and not (i + 1 < len(parts) and parts[i + 1] in VIBE_WORK_DIRS)
-               for i, part in enumerate(parts))
 
 
 def control_dirs(home: Path) -> tuple[Path, ...]:
@@ -614,19 +569,18 @@ def control_dirs(home: Path) -> tuple[Path, ...]:
 def control_spellings(home: Path) -> tuple[str, ...]:
     """CONTROL_SPELLINGS, and those of the harness config repository."""
     repository = harness_config_repository(home)
-    return (*CONTROL_SPELLINGS, *(repository.vibe_control_spellings if repository else ()))
+    return (*CONTROL_SPELLINGS, *(repository.harness_control_spellings if repository else ()))
 
 
 def control_areas(home: Path) -> tuple[Path, ...]:
     """The fixed control directories and files, for the ancestor rule."""
-    return (*control_dirs(home), *(home / name for name in HOME_CONTROL), *ABSOLUTE_CONTROL,
-            (home / ".vibe").resolve())
+    return (*control_dirs(home), *(home / name for name in HOME_CONTROL), *ABSOLUTE_CONTROL)
 
 
 def harness_control(path: Path, home: Path) -> bool:
-    """True when writing path (resolved) changes what Vibe, git or this guard
-    runs or allows."""
-    if ".git" in path.parts or in_vibe_settings(path):
+    """True when writing path (resolved) changes what the harnesses, git or this
+    guard runs or allows."""
+    if ".git" in path.parts:
         return True
     if any(inside(path, d) for d in control_dirs(home)) or any(inside(path, d) for d in ABSOLUTE_CONTROL):
         return True
@@ -640,19 +594,13 @@ def holds_control(path: Path, home: Path) -> bool:
     return any(inside(area, path) for area in control_areas(home))
 
 
-def tamper_proof(path: Path, home: Path) -> bool:
-    vibe = (home / ".vibe").resolve()
-    return any(inside(path, vibe / name) for name in VIBE_TAMPER_PROOF_DIRS)
-
-
 def secret(path: Path) -> bool:
     return any(fnmatch.fnmatch(str(path), pattern) for pattern in SECRET_PATTERNS)
 
 
-# The secret areas below $HOME, from SECRET_PATTERNS, plus Vibe's session
-# transcripts, which have held API tokens: no recursive search may start above them.
-SECRET_AREAS = (*dict.fromkeys(p.removeprefix("*/").removesuffix("/*") for p in SECRET_PATTERNS),
-                ".vibe/logs")
+# The secret areas below $HOME, from SECRET_PATTERNS: no recursive search may start
+# above them.
+SECRET_AREAS = tuple(dict.fromkeys(p.removeprefix("*/").removesuffix("/*") for p in SECRET_PATTERNS))
 RECURSIVE_SEARCHERS = {"rg", "grep", "egrep", "fgrep"}
 # Options that take a separate value, which is then neither the pattern nor a
 # start directory.
@@ -768,7 +716,6 @@ INPUT_REDIRECT = re.compile(r"^(?:<|<&)$")
 def input_targets(words: list[str]) -> list[str]:
     return [following for word, following in zip(words, [*words[1:], ""])
             if INPUT_REDIRECT.match(word) and not HARMLESS_REDIRECT_TARGET.match(following)]
-
 
 
 # git settings sections none of whose keys make git run a program, and harmless
@@ -908,8 +855,6 @@ def git_checkout_paths(words: list[str]) -> list[str] | None:
                 paths.append(arg)
         return paths
     return None
-
-
 
 
 def script_index(words: list[str]) -> int | None:
@@ -1271,13 +1216,12 @@ def spelled_control(text: str, home: Path, in_config_repository: bool = False) -
         match = code_spelling.search(text)
         if match:
             return match.group(1)
-    match = VIBE_DIR_SPELLING.search(text)
-    return match.group(0).strip() if match else None
+    return None
 
 
 CONTROL_WRITE = (
-    "this command can write {control}, which decides what Vibe, git or the tool guard "
-    "runs or allows. Change it with the edit tool, where the change is checked, or "
+    "this command can write {control}, which decides what the harnesses, git or the guard "
+    "run or allow. Change it with the edit tool, where the change is checked, or "
     "leave it to the user"
 )
 
@@ -1285,10 +1229,9 @@ CONTROL_WRITE = (
 # hook cannot tell whether it writes it.
 UNKNOWN_PROGRAM_ON_CONTROL = (
     "{program} is not known to only read files, and it names {control}, which decides "
-    "what Vibe, git or the tool guard runs or allows. If it only reads, ask the user to "
+    "what the harnesses, git or the guard run or allow. If it only reads, ask the user to "
     "run it, or run it on a copy in a worktree"
 )
-TAMPER_PROOF_WRITE = "{path} is written only by Vibe and this hook; no tool call may change it"
 
 
 def inline_code(words: list[str]) -> list[str]:
@@ -1311,8 +1254,8 @@ def inline_code(words: list[str]) -> list[str]:
 
 
 CONTROL_ANCESTOR_WRITE = (
-    "this command writes into {directory}, which holds files that decide what Vibe, git "
-    "or the tool guard runs or allows. Write into a directory below it, or leave it to "
+    "this command writes into {directory}, which holds files that decide what the harnesses, "
+    "git or the guard run or allow. Write into a directory below it, or leave it to "
     "the user"
 )
 # Added when a relative target after a `cd` is what reached that directory.
@@ -1326,44 +1269,6 @@ AFTER_CD = (
 # GIT_CONFIG_KEY_0, GIT_CONFIG_GLOBAL, ...).
 GIT_LOCATION_WORD = re.compile(r"(?:^|\s)GIT_(?:DIR|WORK_TREE|COMMON_DIR)=")
 GIT_CONFIG_WORD = re.compile(r"(?:^|\s)GIT_CONFIG\w*=")
-
-
-# The files read_file reads with no prompt, besides the Vibe settings directories of
-# the harness config repository (see read_file_allowlist).
-READ_FILE_ALLOWLIST = ("*/.vibe/config.toml",)
-# Programs that print what they read, so their read can go to read_file instead.
-FILE_READERS = {"cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "sed",
-                "wc", "nl", "cut", "sort", "jq", "diff"}
-
-
-def read_file_allowlist(home: Path) -> tuple[str, ...]:
-    repository = harness_config_repository(home)
-    return (*READ_FILE_ALLOWLIST,
-            *(f"*/{d.relative_to(home.resolve())}/*" if inside(d, home.resolve()) else f"{d}/*"
-              for d in (repository.vibe_settings_dirs if repository else ())))
-
-
-def read_file_instead(stages: list[Stage], command: str, home: Path) -> Path | None:
-    """A Vibe settings file a bash command reads for the model, naming a `.vibe`
-    path (which makes Vibe ask the user), where read_file would read it with no
-    prompt: every stage naming a `.vibe` path is a reader of such files only, and
-    no output goes to a file. None otherwise (listings, copies, other files)."""
-    if not VIBE_DIR_SPELLING.search(command) or any(redirect_targets(s.raw) for s in stages):
-        return None
-    files = []
-    for stage in stages:
-        if not stage.words or os.path.basename(stage.words[0]) in CWD_CHANGERS:
-            continue
-        named = [path for path in stage_paths(stage, home, stage.words[1:]) if in_vibe_settings(path)]
-        if not named:
-            continue
-        if os.path.basename(stage.words[0]) not in FILE_READERS or program_writes(stage.words):
-            return None
-        if not all(path.is_file() and any(fnmatch.fnmatch(str(path), pattern)
-                                          for pattern in read_file_allowlist(home)) for path in named):
-            return None
-        files += named
-    return files[0] if files else None
 
 
 def git_environment(earlier: list[Stage], stage: Stage) -> str:
@@ -1419,10 +1324,9 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
     creates a repository outside the working directory and the temporary
     directories; a stage whose program writes writes a control file or into a
     directory above one; git settings come from the environment; git or patch
-    rewrites files of the harness config repository without naming them; or a read
-    of a Vibe settings file belongs to read_file. A stage that runs a file in
-    the repository's control directories runs the user's own guarded code, so its
-    operands are not held against it."""
+    rewrites files of the harness config repository without naming them. A stage
+    that runs a file in the repository's control directories runs the user's own
+    guarded code, so its operands are not held against it."""
     stages = command_stages(command, cwd, home)
     if stages is None:
         return None
@@ -1449,8 +1353,6 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
                 for path in resolved:
                     if secret(path):
                         return f"{path} holds keys or credentials, which no tool may read or write"
-                    if target in outputs and tamper_proof(path, home):
-                        return TAMPER_PROOF_WRITE.format(path=path)
                     if target in outputs and harness_control(path, home):
                         return CONTROL_WRITE.format(control=path)
         injected = git_config_injection(stage.words)
@@ -1485,8 +1387,6 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
         if writes:
             known_writer = stage.refused or program in WRITERS or program in READ_ONLY_PROGRAMS
             for path in stage_paths(stage, home, operands):
-                if tamper_proof(path, home):
-                    return TAMPER_PROOF_WRITE.format(path=path)
                 if harness_control(path, home):
                     if known_writer:
                         return CONTROL_WRITE.format(control=path)
@@ -1524,149 +1424,7 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
                 "their paths; for a worktree, name it with `git -C WORKTREE`; otherwise leave "
                 "it to the user"
             )
-    settings = read_file_instead(stages, command, home)
-    if settings is not None:
-        return (f"{settings} is one of Vibe's settings files: read it with the read_file tool, "
-                "which needs no prompt, instead of bash, which asks the user whenever a command "
-                "names a .vibe path")
     return None
-
-
-# --- approvals: the user's "Allow" from ask_user_question ------------------------
-
-APPROVAL_QUESTION = "Allow Vibe to write {path}?"
-# The question exactly as the hook asked for it: a path without glob characters,
-# then `?`, then nothing or the hook's change summary.
-APPROVAL_PATTERN = re.compile(r"Allow Vibe to write ([~/][^?*\[\]]*)\?(?: Changes: .*)?$")
-# The question tool's exact qualified name; a provided tool with the same leaf
-# name (mcp_<server>.ask_user_question) must not be able to record consent.
-APPROVAL_TOOL_NAMES = frozenset({"ui.ask_user_question"})
-
-
-def session_key(payload: dict[str, Any]) -> str | None:
-    """A subagent shares its parent's approvals: the user answered the parent."""
-    return payload.get("parent_session_id") or payload.get("session_id")
-
-
-class ApprovalStore:
-    """What the user allowed in one session, in
-    ~/.vibe/tool-guard/approvals/<session>.json. Only this hook writes there.
-
-    files    paths outside git the user allowed for the rest of the session
-    pending  control-file writes the hook denied: path -> the call's hash and the
-             change summary the question had to show the user
-    calls    [path, call hash] pairs the user allowed, each good for that one call
-    """
-
-    def __init__(self, home: Path, session: str | None) -> None:
-        valid = bool(session) and re.fullmatch(r"[A-Za-z0-9_-]+", str(session))
-        self.file = (
-            home / ".vibe" / "tool-guard" / "approvals" / f"{session}.json" if valid else None
-        )
-
-    def _load(self) -> dict[str, Any]:
-        data: dict[str, Any] = {"files": [], "pending": {}, "calls": []}
-        if self.file is None:
-            return data
-        try:
-            stored = json.loads(self.file.read_text())
-        except (OSError, ValueError):
-            return data
-        if isinstance(stored, dict):
-            data["files"] = [p for p in stored.get("files", []) if isinstance(p, str)]
-            data["pending"] = {k: v for k, v in (stored.get("pending") or {}).items()
-                               if isinstance(v, dict)}
-            data["calls"] = [c for c in stored.get("calls", []) if isinstance(c, list) and len(c) == 2]
-        return data
-
-    def _save(self, data: dict[str, Any]) -> None:
-        if self.file is None:
-            return
-        self.file.parent.mkdir(parents=True, exist_ok=True)
-        partial = self.file.with_suffix(".partial")
-        partial.write_text(json.dumps(data, sort_keys=True))
-        os.replace(partial, self.file)
-
-    def add(self, path: Path) -> None:
-        data = self._load()
-        if str(path) not in data["files"]:
-            data["files"].append(str(path))
-        self._save(data)
-
-    def has(self, path: Path) -> bool:
-        return str(path) in self._load()["files"]
-
-    def pend(self, path: Path, call: str, summary: str) -> None:
-        data = self._load()
-        data["pending"][str(path)] = {"call": call, "summary": summary}
-        self._save(data)
-
-    def approve(self, path: Path, question: str) -> None:
-        """The user answered Allow to `question` about `path`. A pending control
-        write whose summary the question showed becomes an allowed call; anything
-        else becomes a session approval of the file, which control files ignore."""
-        data = self._load()
-        pending = data["pending"].pop(str(path), None)
-        expected = APPROVAL_QUESTION.format(path=path)
-        if pending is not None and pending.get("summary"):
-            expected += f" {pending['summary']}"
-        if pending is not None and question == expected:
-            data["calls"].append([str(path), pending.get("call")])
-        elif str(path) not in data["files"]:
-            data["files"].append(str(path))
-        self._save(data)
-
-    def take(self, path: Path, call: str) -> bool:
-        data = self._load()
-        if [str(path), call] not in data["calls"]:
-            return False
-        data["calls"].remove([str(path), call])
-        self._save(data)
-        return True
-
-
-def canonical_path(spelled: str, home: Path) -> Path | None:
-    """The path the user saw, if it is absolute after `~` expansion and already
-    its own resolved form; None for any other spelling."""
-    expanded = expand_home(spelled.strip(), home)
-    if not expanded.startswith("/") or os.path.normpath(expanded) != expanded:
-        return None
-    path = Path(expanded)
-    try:
-        return path if path.resolve() == path else None
-    except (ValueError, OSError, RuntimeError):
-        return None
-
-
-def record_approvals(payload: dict[str, Any], home: Path) -> list[str]:
-    """Store every path the user allowed in an ask_user_question answer; return them."""
-    if str(payload.get("tool_name", "")) not in APPROVAL_TOOL_NAMES:
-        return []
-    if payload.get("tool_status") != "success":
-        return []
-    output = payload.get("tool_output")
-    if not isinstance(output, dict):
-        try:
-            output = json.loads(payload.get("tool_output_text") or "")
-        except ValueError:
-            return []
-    answers = output.get("answers") if isinstance(output, dict) else None
-    store = ApprovalStore(home, session_key(payload))
-    if store.file is None or not isinstance(answers, list):
-        return []
-    recorded = []
-    for answer in answers:
-        if not isinstance(answer, dict) or answer.get("isOther"):
-            continue
-        if str(answer.get("answer", "")).strip() != "Allow":
-            continue
-        question = str(answer.get("question", "")).strip()
-        match = APPROVAL_PATTERN.match(question)
-        path = canonical_path(match.group(1), home) if match else None
-        if path is not None:
-            store.approve(path, question)
-            recorded.append(str(path))
-    return recorded
 
 
 # --- URLs: hosts no tool may contact --------------------------------------------
@@ -1765,278 +1523,6 @@ def urls_in(tool_input: dict[str, Any]):
             yield "https://" + text.strip()
 
 
-# --- edits: only where git can undo them, or with the user's Allow ---------------
-
-# `search_replace` is the unified harness's name for the edit tool.
-EDITING_TOOLS = {"edit", "write_file", "search_replace"}
-# config.toml keys a session may change on its own: which model runs and how.
-SAFE_CONFIG_KEYS = frozenset({"active_model", "theme", "models"})
-
-
-def config_files(home: Path) -> set[Path]:
-    """The live Vibe config."""
-    return {(home / ".vibe" / "config.toml").resolve()}
-
-
-def edited_text(old: str, tool_name: str, tool_input: dict[str, Any]) -> str | None:
-    """The file's text after this call, or None when the hook cannot reproduce it."""
-    if tool_name == "write_file":
-        content = tool_input.get("content")
-        return content if isinstance(content, str) else None
-    blocks = tool_input.get("content")
-    if not isinstance(blocks, list):
-        blocks = [{"old_str": tool_input.get("old_string"),
-                   "new_str": tool_input.get("new_string"),
-                   "replace_all": tool_input.get("replace_all", False)}]
-    text = old
-    for block in blocks:
-        if not isinstance(block, dict):
-            return None
-        find, put = block.get("old_str"), block.get("new_str")
-        if not isinstance(find, str) or not isinstance(put, str) or not find or find not in text:
-            return None
-        text = text.replace(find, put, -1 if block.get("replace_all") else 1)
-    return text
-
-
-def model_key(entry: dict[str, Any]) -> object:
-    return entry.get("alias") or entry.get("name")
-
-
-def models_change_is_safe(old: dict[str, Any], new: dict[str, Any]) -> bool:
-    """A models change is safe when the classifier's model entry is untouched, every
-    model uses a provider the file already had, and no model gains a connector
-    the file did not already enable."""
-    classifier = str((old.get("utility_models") or {}).get("smart_approve") or "").strip()
-    if classifier:
-        before = [m for m in old.get("models", []) if model_key(m) == classifier]
-        after = [m for m in new.get("models", []) if model_key(m) == classifier]
-        if before != after:
-            return False
-    providers = {p.get("name") for p in old.get("providers", [])}
-    providers |= {m.get("provider") for m in old.get("models", [])}
-    enabled = {c.get("name") for c in old.get("connectors", []) if not c.get("disabled")}
-    for model in new.get("models", []):
-        if model.get("provider") not in providers:
-            return False
-        for connector in model.get("connectors", []):
-            if not connector.get("disabled") and connector.get("name") not in enabled:
-                return False
-    return True
-
-
-def config_edit_is_safe(path: Path, tool_name: str, tool_input: dict[str, Any]) -> bool:
-    """True when the call changes only which model runs and how; False when it
-    changes anything else, or the hook cannot tell."""
-    if tomllib is None:
-        return False
-    try:
-        old_text = path.read_text()
-        new_text = edited_text(old_text, tool_name, tool_input)
-        if new_text is None:
-            return False
-        old, new = tomllib.loads(old_text), tomllib.loads(new_text)
-        changed = {key for key in old.keys() | new.keys() if old.get(key) != new.get(key)}
-        if not changed <= SAFE_CONFIG_KEYS:
-            return False
-        return "models" not in changed or models_change_is_safe(old, new)
-    except (OSError, UnicodeDecodeError, AttributeError, TypeError, tomllib.TOMLDecodeError):
-        return False
-
-
-def git_undoable(path: Path, home: Path) -> bool:
-    """True when path lies in a git work tree that is not rooted at $HOME or above
-    (a dotfiles repository at $HOME does not make every file under it undoable)."""
-    for parent in path.parents:
-        if parent == home or parent in home.parents:
-            return False
-        if (parent / ".git").exists():
-            return True
-    return False
-
-
-def call_hash(tool_name: str, tool_input: dict[str, Any]) -> str:
-    """Identifies one exact call, so an Allow covers that call and no other."""
-    text = json.dumps({"tool": tool_name, "input": tool_input}, sort_keys=True, default=str)
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
-
-
-def change_summary(path: Path, tool_name: str, tool_input: dict[str, Any], home: Path) -> str:
-    """What the user is asked to allow: the config keys and tool tables a config
-    edit changes, or the file's name."""
-    if path in config_files(home) and tomllib is not None:
-        try:
-            old_text = path.read_text()
-            new_text = edited_text(old_text, tool_name, tool_input)
-            old = tomllib.loads(old_text)
-            new = tomllib.loads(new_text) if new_text is not None else None
-        except (OSError, UnicodeDecodeError, TypeError, tomllib.TOMLDecodeError):
-            new = None
-        if new is not None:
-            return "Changes: " + ("; ".join(describe_change("", old, new)) or "nothing")
-    return f"Changes: {path.name}"
-
-
-def describe_change(path: str, was: object, now: object) -> list[str]:
-    """Each changed leaf, as `key.sub = value`, `list +added -removed`, or
-    `models[alias].field = value` for entries matched by alias or name."""
-    if was == now:
-        return []
-    if isinstance(was, dict) and isinstance(now, dict):
-        return [line for key in sorted(was.keys() | now.keys())
-                for line in describe_change(f"{path}.{key}" if path else key, was.get(key), now.get(key))]
-    if all(isinstance(v, list) and all(isinstance(e, dict) for e in v) for v in (was, now)):
-        def keyed(entries: list) -> dict:
-            return {str(e.get("alias") or e.get("name")): e for e in entries}
-        before, after = keyed(was), keyed(now)
-        return [line for key in sorted(before.keys() | after.keys())
-                for line in describe_change(f"{path}[{key}]", before.get(key), after.get(key))]
-    if isinstance(was, list) or isinstance(now, list):
-        was, now = was if isinstance(was, list) else [], now if isinstance(now, list) else []
-        delta = [f"+{x}" for x in now if x not in was] + [f"-{x}" for x in was if x not in now]
-        return [f"{path} " + " ".join(map(str, delta))]
-    return [f"{path} = {now!r}"]
-
-
-def approval_reason(path: Path, why: str, summary: str = "") -> str:
-    question = APPROVAL_QUESTION.format(path=path) + (f" {summary}" if summary else "")
-    return (
-        f"{why}. Ask the user with ask_user_question, the question exactly "
-        f"\"{question}\" and the options \"Allow\" and \"Don't allow\". If they choose "
-        "Allow, repeat this call unchanged. Otherwise stop and report what is left "
-        "undone; do not change this file another way"
-    )
-
-
-def edit_denial(
-    tool_name: str, tool_input: dict[str, Any], cwd: Path, home: Path,
-    session: str | None, temp_roots: tuple[Path, ...], extra_dirs: tuple[Path, ...],
-) -> str | None:
-    raw = tool_input.get("file_path") or tool_input.get("path")
-    if not raw:
-        return None  # Vibe rejects a call without a path itself
-    try:
-        target = resolve_word(str(raw), cwd, home)
-    except (ValueError, OSError, RuntimeError):
-        return f"cannot resolve the path {raw!r}"
-    if tamper_proof(target, home):
-        return TAMPER_PROOF_WRITE.format(path=target)
-    if any(inside(target, directory) for directory in extra_dirs):
-        return None  # a runner's exchange directory: the headless worker's own output
-    store = ApprovalStore(home, session)
-    if harness_control(target, home):
-        if target in config_files(home) and config_edit_is_safe(target, tool_name, tool_input):
-            return None
-        call = call_hash(tool_name, tool_input)
-        if store.take(target, call):
-            return None
-        summary = change_summary(target, tool_name, tool_input, home)
-        store.pend(target, call, summary)
-        return approval_reason(
-            target, f"{target} decides what Vibe, git or the tool guard runs or allows", summary)
-    vibe_plans = (home / ".vibe" / "plans").resolve()
-    if git_undoable(target, home) or inside(target, vibe_plans):
-        return None
-    if any(inside(target, root) for root in temp_roots) or store.has(target):
-        return None
-    return approval_reason(
-        target, f"{target} is outside every git repository, so this write could not be undone"
-    )
-
-
 SYSTEM_TEMP_ROOTS = tuple({Path(p).resolve() for p in ("/tmp", "/var/tmp", tempfile.gettempdir())})
 
 
-def guard_extra_dirs() -> tuple[Path, ...]:
-    """Directories a runner names as a headless worker's own output."""
-    raw = os.environ.get("VIBE_WORKTREE_GUARD_EXTRA", "")
-    return tuple(Path(p).expanduser().resolve() for p in raw.split(os.pathsep) if p.strip())
-
-
-def decide(
-    tool_name: str,
-    tool_input: dict[str, Any],
-    cwd: str | None = None,
-    home: str | None = None,
-    session: str | None = None,
-    temp_roots: Any = None,
-    extra_dirs: Any = None,
-) -> tuple[str, str | None]:
-    home_path = Path(home or os.environ.get("HOME", "~")).expanduser().resolve()
-    cwd_path = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
-    roots = SYSTEM_TEMP_ROOTS if temp_roots is None else tuple(temp_roots)
-    extras = guard_extra_dirs() if extra_dirs is None else tuple(extra_dirs)
-
-    if tool_name in EDITING_TOOLS:
-        why = edit_denial(tool_name, tool_input, cwd_path, home_path, session, roots, extras)
-        if why:
-            return "deny", f"Blocked by the tool-guard hook: {why}."
-
-    if tool_name == "bash":
-        command = str(tool_input.get("command", ""))
-        for name, pattern, reason in BASH_RULES:
-            if pattern.search(command):
-                return "deny", f"Blocked by the tool-guard hook ({name}): {reason}"
-        if command_stages(command, cwd_path, home_path) is None:
-            return (
-                "deny",
-                "Blocked by the tool-guard hook: it cannot split this command into words "
-                "(an unbalanced quote, often inside a here-document), so it cannot check "
-                "it. Write multi-line content with the edit tool, or run simpler commands.",
-            )
-        why = critical_removal(command, cwd_path, home_path)
-        if why:
-            return "deny", f"Blocked by the tool-guard hook (critical path): {why}."
-        why = bash_path_denial(command, cwd_path, home_path, roots)
-        if why:
-            return "deny", f"Blocked by the tool-guard hook: {why}."
-
-    for url in urls_in(tool_input):
-        try:
-            host = urlsplit(url).hostname or ""
-        except ValueError:
-            # A URL the parser rejects cannot be checked, so it is not allowed.
-            return "deny", f"Blocked by the tool-guard hook: cannot parse URL {url!r}."
-        why = host_denial_reason(host)
-        if why:
-            return (
-                "deny",
-                f"Blocked by the tool-guard hook: {host} is denied ({why}). "
-                "Do not try another route to the same host.",
-            )
-    return "allow", None
-
-
-def bare_tool_name(name: str) -> str:
-    """The unified harness names built-in tools `file_system.bash` and
-    `file_system.search_replace`, the legacy harness `bash` and `edit`: compare on
-    the last dotted component, or every tool-specific rule above is skipped."""
-    return name.rsplit(".", 1)[-1]
-
-
-def main() -> int:
-    payload = json.load(sys.stdin)
-    home = Path(os.environ.get("HOME", "~")).expanduser().resolve()
-    if payload.get("hook_event_name") == "post_tool":
-        recorded = record_approvals(payload, home)
-        if recorded:
-            note = ("The user allowed writing " + ", ".join(recorded)
-                    + ". Repeat the blocked call unchanged.")
-            print(json.dumps({"hook_specific_output": {"additional_context": note}}))
-        return 0
-    tool_input = payload.get("tool_input")
-    decision, reason = decide(
-        bare_tool_name(str(payload.get("tool_name", ""))),
-        tool_input if isinstance(tool_input, dict) else {},
-        cwd=payload.get("cwd"),
-        home=str(home),
-        session=session_key(payload),
-    )
-    out: dict[str, str] = {"decision": decision}
-    if reason:
-        out["reason"] = reason
-    print(json.dumps(out))
-    return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())

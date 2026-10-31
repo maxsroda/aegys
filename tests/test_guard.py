@@ -30,8 +30,8 @@ HARNESS_CONFIG_REPOSITORY = {
     "path": "~/harness-config",
     "launcherDirs": ["hooks", "bin"],
     "scriptDirs": ["scripts"],
-    "vibeSettingsDirs": ["vibe-settings"],
-    "agySettingsDirs": ["agy-settings"],
+    "harnessSettingsDirs": ["harness-settings"],
+    "permissionSettingsDirs": ["permission-settings"],
     "controlSpellings": ["bin/launcher.sh"],
 }
 
@@ -307,7 +307,7 @@ class AegysTest(unittest.TestCase):
             ("write_file", PACKAGE_DIR / "guard.py"),
             ("edit_file", PACKAGE_DIR / "data" / "agy-settings.json"),
             ("write_file", self.home / "harness-config" / "bin" / "lib.sh"),
-            ("edit_file", self.home / "harness-config" / "agy-settings" / "rules.json"),
+            ("edit_file", self.home / "harness-config" / "permission-settings" / "rules.json"),
             ("write_file", self.home / ".gemini" / "config" / "hooks.json"),
             (
                 "write_file",
@@ -786,7 +786,7 @@ class AegysTest(unittest.TestCase):
         agents = self.home / "harness-config"
         for tool_name, path in (
             ("write_file", agents / "scripts" / "setup.sh"),
-            ("edit_file", agents / "vibe-settings" / "config.toml"),
+            ("edit_file", agents / "harness-settings" / "config.toml"),
             ("edit_file", agents / "README.md"),
             ("write_file", agents / "notes" / "x.md"),
             ("write_file", self.home / ".gemini" / "projects.json"),
@@ -816,8 +816,8 @@ class AegysTest(unittest.TestCase):
             "echo x > scripts/setup.sh",
             "cp README.md scripts/x.sh",
             "echo x > hooks/x.py",
-            "echo x > vibe-settings/config.toml",
-            "echo x > agy-settings/rules.json",
+            "echo x > harness-settings/config.toml",
+            "echo x > permission-settings/rules.json",
             "git checkout -- scripts/setup.sh",
             "git checkout -- .",
             "python3 -c \"open('hooks/x.py', 'w')\"",
@@ -840,18 +840,62 @@ class AegysTest(unittest.TestCase):
     def test_inline_code_naming_a_control_spelling_is_denied(self) -> None:
         for cmd in (
             "python3 -c \"open('bin/launcher.sh', 'w')\"",
-            "python3 -c \"open('agy-settings/rules.json', 'w')\"",
-            "python3 -c \"open('vibe-settings/config.toml', 'w')\"",
+            "python3 -c \"open('permission-settings/rules.json', 'w')\"",
+            "python3 -c \"open('harness-settings/config.toml', 'w')\"",
         ):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_the_package_modules_are_control_files_by_name(self) -> None:
+        for cmd in (
+            "python3 -c \"open('aegys/command_checks.py', 'w')\"",
+            "python3 -c \"open('aegys/shell_words.py', 'w')\"",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_vibe_settings_are_read_like_any_other_file(self) -> None:
+        # Shell reads of ~/.vibe/config.toml are no longer redirected to read_file.
+        (self.home / ".vibe").mkdir(exist_ok=True)
+        (self.home / ".vibe" / "config.toml").write_text("active_model = 'x'\n", encoding="utf-8")
+        self.assertEqual(
+            self.evaluate("cat ~/.vibe/config.toml", classifier_caller=allow_caller),
+            {"decision": "allow"},
+        )
+
+    def test_vibe_session_logs_are_writable_by_the_classifier_only(self) -> None:
+        # No .vibe directory is tamper-proof any more: the classifier judges the write.
+        self.assertEqual(
+            self.evaluate("echo x > ~/.vibe/logs/session.jsonl", classifier_caller=allow_caller),
+            {"decision": "allow"},
+        )
+
+    def test_recursive_search_inside_vibe_logs_is_not_denied(self) -> None:
+        # The session logs are no longer a secret area.
+        (self.home / ".vibe" / "logs").mkdir(parents=True, exist_ok=True)
+        self.assertEqual(
+            self.evaluate("grep -r token ~/.vibe/logs", classifier_caller=allow_caller),
+            {"decision": "allow"},
+        )
+
+    def test_vibe_directory_named_in_inline_code_is_not_a_control_spelling(self) -> None:
+        self.assertEqual(
+            self.evaluate(
+                "python3 -c \"open('.vibe/notes.txt', 'w')\"", classifier_caller=allow_caller
+            ),
+            {"decision": "allow"},
+        )
+        self.assertEqual(
+            self.evaluate("echo x > ~/.vibe/notes.txt", classifier_caller=allow_caller),
+            {"decision": "allow"},
+        )
 
     def test_without_a_harness_config_repository_no_repository_is_guarded(self) -> None:
         self.write_aegys_config({})
         repository = self.home / "harness-config"
         for tool_name, path in (
             ("write_file", repository / "hooks" / "x.py"),
-            ("edit_file", repository / "agy-settings" / "rules.json"),
+            ("edit_file", repository / "permission-settings" / "rules.json"),
         ):
             res = self.evaluate_file(
                 tool_name, str(path), workspace=repository, classifier_caller=unexpected_caller
