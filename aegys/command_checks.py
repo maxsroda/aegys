@@ -660,9 +660,11 @@ def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
 
 
 def secret_areas(secret_paths: tuple[str, ...]) -> tuple[str, ...]:
-    """The directories and files of the secret paths, relative to $HOME, as
-    `.ssh` for `*/.ssh/*`. A pattern with a wildcard left over is no area: it names
-    no fixed place. No recursive search may start above an area."""
+    """The directories and files of the secret paths, as `.ssh` for `*/.ssh/*`,
+    read relative to $HOME, or `/home/u/.key` for `/home/u/.key/*` (an entry
+    written with `~/` is already absolute), read as itself. A pattern with a
+    wildcard left over is no area: it names no fixed place. No recursive search
+    may start above an area."""
     areas = (pattern.removeprefix("*/").removesuffix("/*") for pattern in secret_paths)
     return tuple(dict.fromkeys(area for area in areas if not set(area) & set("*?[")))
 
