@@ -170,6 +170,11 @@ def load_policy(home: Path) -> Optional[Policy]:
     )
 
 
+def shipped_problem() -> Optional[str]:
+    """Why the shipped policy cannot be used, or None. The guard then fails closed."""
+    return None if shipped_lists() is not None else "default-config.json unreadable"
+
+
 def config_problem(home: Path) -> Optional[str]:
     """Why the user's config.json cannot be used as written, or None. A missing file is
     fine. An unreadable or unparsable one, or an unknown key under

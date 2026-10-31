@@ -1330,13 +1330,13 @@ class AegysTest(unittest.TestCase):
         self.assertIn("internal test", res.get("reason", ""))
 
     def test_moved_entries_are_not_fast_allowed_by_default(self) -> None:
-        for cmd in ("git push origin feature-x", "pytest -q", "gh pr create --fill"):
+        for cmd in ("git push origin feature-x", "git commit -m msg", "pytest -q", "gh pr create --fill"):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "force_ask", (cmd, res))
 
     def test_moved_entries_are_not_allowed_while_guard_off_by_default(self) -> None:
         self.slash("/aegys off")
-        for cmd in ("git push origin feature-x", "gh pr create --fill", "cargo test"):
+        for cmd in ("git push origin feature-x", "git commit -m msg", "gh pr create --fill", "cargo test"):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "force_ask", (cmd, res))
 
@@ -1359,13 +1359,9 @@ class AegysTest(unittest.TestCase):
                 self.evaluate("git status", classifier_caller=unexpected_caller).get("decision"),
                 "force_ask",
             )
-            self.assertEqual(
-                self.evaluate_file(
-                    "read_file", str(self.work / "a.py"), classifier_caller=unexpected_caller
-                ),
-                {"decision": "allow"},
-            )
             for tool_name, path in (
+                ("read_file", self.work / "a.py"),
+                ("view_file", self.work / "a.py"),
                 ("write_file", self.work / "a.py"),
                 ("read_file", self.home / "notes.txt"),
             ):
@@ -1413,6 +1409,15 @@ class AegysTest(unittest.TestCase):
         )
         self.assertTrue(line.startswith(ALERT_RED), line)
         self.assertIn("aegys ✗ unknown config key vibeSettingsDirs", line)
+
+    def test_the_status_line_flags_an_unreadable_shipped_policy(self) -> None:
+        missing = self.home / "missing-default-config.json"
+        with patch.object(config_module, "DEFAULT_CONFIG_PATH", missing):
+            line = format_status_line(
+                {"conversation_id": "conv-1234", "cycle_mode": "accept-edits"}, home=self.home
+            )
+        self.assertTrue(line.startswith(ALERT_RED), line)
+        self.assertIn("aegys ✗ default-config.json unreadable", line)
 
 
 if __name__ == "__main__":

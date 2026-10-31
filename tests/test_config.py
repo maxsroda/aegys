@@ -15,7 +15,7 @@ from aegys.config import config_problem, load_policy
 MOVED_ALLOW = (
     "orca snapshot*", "orca tab current*", "orca tab list*", "orca tab show*",
     "orca terminal list*", "orca terminal show*", "julia --version*", "firecrawl*",
-    "git push*", "gh pr create*", "gh issue create*", "gh pr comment*", "pytest*",
+    "git push*", "git commit*", "gh pr create*", "gh issue create*", "gh pr comment*", "pytest*",
     "python3 -m pytest*", "python3 -m unittest*", "python3 tests/*", "bash tests/*",
     "tests/*", "scripts/install.sh*", "uv run pytest*", "cargo test*", "cargo test* 2>&1",
     "cargo clippy*", "cargo clippy* 2>&1",
@@ -27,7 +27,7 @@ MOVED_DENY = (
 MOVED_ALLOW_WHILE_OFF = (
     "orca snapshot", "orca tab current", "orca tab list", "orca tab show",
     "orca terminal list", "orca terminal show", "julia --version", "firecrawl", "git push",
-    "gh pr create", "gh issue create", "gh pr comment", "cargo test", "cargo clippy",
+    "git commit", "gh pr create", "gh issue create", "gh pr comment", "cargo test", "cargo clippy",
     "regex:bash tests/.*", "regex:python3 tests/.*",
 )
 

@@ -61,15 +61,16 @@ otherwise allow.
 The lists in items 1, 3 and 4 and the secret paths come from the shipped
 ``aegys/data/default-config.json``, merged with the user's
 ``~/.gemini/aegys/config.json`` (see ``aegys/config.py``). If the shipped file
-cannot be read, the guard fails closed: every ``run_command``, and every file or
-search tool call that is not a plain read inside the workspace, returns
-``{"decision": "force_ask", ...}``, except for the denies that need no list.
+cannot be read, the guard fails closed: every ``run_command``, file tool call and
+search tool call returns ``{"decision": "force_ask", ...}``, except for the denies
+that need no list.
 
 All classifier calls of one hook run share a 25 s budget, below agy's 30 s hook
 timeout; when it runs out the hook returns ``force_ask``. ``--statusline`` shows
 a red ``aegys ✗`` when ``~/.gemini/config/hooks.json`` does not wire the hook
-for every guarded tool, or when the user's config does not parse or names an
-unknown ``harnessConfigRepository`` key.
+for every guarded tool, when the user's config does not parse or names an
+unknown ``harnessConfigRepository`` key, or when the shipped defaults cannot be
+read.
 """
 from __future__ import annotations
 
@@ -94,6 +95,7 @@ from .config import (
     harness_config_repository,
     load_aegys_config,
     load_policy,
+    shipped_problem,
 )
 from .command_checks import (
     BASH_RULES,
@@ -983,7 +985,7 @@ def format_status_line(
     sandbox is on. `ca:`/`cd:` appear once the classifier has decided a command."""
     data = payload if isinstance(payload, dict) else {}
     home_path = (home or Path(os.environ.get("HOME", "~")).expanduser()).resolve()
-    problem = hook_install_problem(home_path) or config_problem(home_path)
+    problem = hook_install_problem(home_path) or config_problem(home_path) or shipped_problem()
     if problem is None and always_proceed_enabled(home_path):
         problem = "toolPermission always-proceed: prompts become denies"
     conv_id = extract_conversation_id(data)
@@ -1657,15 +1659,13 @@ def evaluate_file_access(
         inside(path, r) for r in classified_write_roots(home)
     ):
         root = None
-    # Without a policy, only a plain read inside the workspace passes.
-    may_pass = policy is not None or tool_name not in WRITE_TOOL_NAMES
-    if root is not None and may_pass and not any(
+    if policy is None:
+        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
+    if root is not None and not any(
         part in DEFAULT_PROTECTED_PATHS for part in path.relative_to(root).parts
     ):
         record_guard_decision(home, conversation_id, allowed=True)
         return {"decision": "allow"}
-    if policy is None:
-        return {"decision": "force_ask", "reason": policy_unavailable_reason()}
 
     if not guard_enabled(home, conversation_id):
         return {

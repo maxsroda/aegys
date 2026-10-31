@@ -1539,24 +1539,22 @@ def host_denial_reason(host: str, denied_hosts: dict[str, str] | None) -> str | 
     return None
 
 
-def iter_strings(value: Any, key: str | None = None):
+def iter_strings(value: Any):
+    """Every string inside a nested tool input, in order."""
     if isinstance(value, str):
-        yield key, value
+        yield value
     elif isinstance(value, dict):
-        for k, v in value.items():
-            yield from iter_strings(v, str(k))
+        for v in value.values():
+            yield from iter_strings(v)
     elif isinstance(value, list):
         for v in value:
-            yield from iter_strings(v, key)
+            yield from iter_strings(v)
 
 
 def urls_in(tool_input: dict[str, Any]):
-    for key, text in iter_strings(tool_input):
-        for match in URL_PATTERN.findall(text):
-            yield match
-        # web_fetch and open_url accept a bare host; Vibe prepends https://.
-        if key == "url" and "://" not in text and text.strip():
-            yield "https://" + text.strip()
+    """Every full http(s) URL in the strings of a tool input."""
+    for text in iter_strings(tool_input):
+        yield from URL_PATTERN.findall(text)
 
 
 SYSTEM_TEMP_ROOTS = tuple({Path(p).resolve() for p in ("/tmp", "/var/tmp", tempfile.gettempdir())})
