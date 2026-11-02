@@ -67,7 +67,7 @@
 <text x="298" y="131" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#606368" text-anchor="start" xml:space="preserve">Gemini 3.8 Flash (Medium)</text>
 <text x="298" y="150" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#606368" text-anchor="start" xml:space="preserve">~/projects/aegys</text>
 <line x1="182" y1="174" x2="898" y2="174" stroke="#dbdce0" stroke-width="1.5"/>
-<text x="182" y="200" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" xml:space="preserve"><tspan fill="#406bc0">&gt;</tspan><tspan fill="#606368"> Accept-edits mode: file edits auto-approved (shift+tab to cycle)</tspan></text>
+<text x="182" y="200" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" xml:space="preserve"><tspan fill="#406bc0">&gt;</tspan></text>
 <line x1="182" y1="216" x2="898" y2="216" stroke="#dbdce0" stroke-width="1.5"/>
 <text x="182" y="240" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#606368" text-anchor="start" xml:space="preserve">? for shortcuts</text>
 <text x="898" y="240" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" text-anchor="end" xml:space="preserve"><tspan fill="#3c7d40">accept-edits</tspan><tspan fill="#606368"> · Gemini 3.8 Flash · medium</tspan></text>
