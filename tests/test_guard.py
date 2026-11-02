@@ -267,8 +267,10 @@ class AegysTest(unittest.TestCase):
             ("gh repo delete owner/repo", "deny rule"),
             ("printenv", "deny rule"),
             ("curl https://webhook.site/abc", "webhook.site"),
-            ("echo hacked > ~/.gemini/config/hooks.json", "controls agy"),
-            ("echo hacked > ~/.gemini/antigravity-cli/settings.json", "controls agy"),
+            ("echo hacked > ~/.gemini/config/hooks.json", "controls the coding agents' permissions"),
+            ("echo hacked > ~/.gemini/antigravity-cli/settings.json", "controls the coding agents' permissions"),
+            ("echo hacked > ~/.gemini/aegys/config.json", "controls the coding agents' permissions"),
+            ("echo hacked > ~/.pi/agent/settings.json", "controls the coding agents' permissions"),
         ):
             res = self.evaluate(cmd)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
