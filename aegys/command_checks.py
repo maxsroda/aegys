@@ -896,6 +896,17 @@ def excludes_env_pathspec(word: str) -> bool:
     return "exclude" in magic and set(magic) <= {"exclude", "icase", "top"}
 
 
+# The long options of git add (the hidden --unified and --inter-hunk-context included, which
+# make --u and --inter ambiguous), and those that stage a whole tree or a list.
+GIT_ADD_LONG_OPTIONS = (
+    "--all", "--chmod", "--dry-run", "--edit", "--force", "--ignore-errors", "--ignore-missing",
+    "--ignore-removal", "--intent-to-add", "--inter-hunk-context", "--interactive", "--no-all",
+    "--no-ignore-removal", "--patch", "--pathspec-file-nul", "--pathspec-from-file", "--refresh",
+    "--renormalize", "--sparse", "--unified", "--update", "--verbose",
+)
+GIT_ADD_BROAD_OPTIONS = {"--all", "--update", "--interactive", "--pathspec-from-file"}
+
+
 def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path) -> bool:
     """True for `git add` of `.`, a directory, a glob, `-A`/`--all`, `-u`/`--update`,
     `-i`/`--interactive` or a pathspec file, which stages every un-ignored `.env.*` the
@@ -912,8 +923,8 @@ def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path)
     if any(excludes_env_pathspec(word) for word in operands):
         return False
     # -i stages untracked files from its piped answers; -p and -e touch tracked files only.
-    if any(word in ("--all", "--update", "--interactive") or word.startswith("--pathspec-from-file")
-           or (len(word) > 6 and "--interactive".startswith(word.partition("=")[0]))
+    # git reads an unambiguous prefix of a long option as the full name (`--al` is `--all`).
+    if any(resolve_long_option(word.partition("=")[0], GIT_ADD_LONG_OPTIONS) in GIT_ADD_BROAD_OPTIONS
            or re.fullmatch(r"-[A-Za-z]*[Aui][A-Za-z]*", word) for word in options):
         return True
     for operand in operands:

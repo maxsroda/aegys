@@ -1788,7 +1788,9 @@ class AegysTest(unittest.TestCase):
             "git add .", "git add -A", "git add --all", "git add -u", "git add --update",
             "git add -A -- .", "git add src", "git add src/", "git add 'src/*'", "git -C . add .",
             "git add --pathspec-from-file=list.txt", "git add . ':!.env'",
-            "git add -i", "git add --interactive", "git add --inter", "printf '4\\n*\\n\\nq\\n' | git add -i",
+            "git add -i", "git add --interactive", "git add --interac",
+            "git add --a", "git add --al", "git add --up", "git add --upd", "git add --upda",
+            "git add --pathspec-from=list.txt", "printf '4\\n*\\n\\nq\\n' | git add -i",
             # these spellings do not exclude: `literal` reads * literally, `glob` does not cross /
             "git add . ':(exclude,literal)*.env*'", "git add . ':(literal,exclude)*.env*'",
             "git add . ':(exclude,glob)*.env*'", "git add . ':(glob,exclude)*.env*'",
@@ -1798,6 +1800,8 @@ class AegysTest(unittest.TestCase):
                     "git add -A ':!*.env*'", "git add -u ':(exclude)*.env*'", "git add . ':^*.env*'",
                     "git add . ':(exclude,icase)*.env*'", "git add . ':(top,exclude)*.env*'",
                     "git add . ':(exclude,top,icase)*.env*'", "git add -p", "git add -e",
+                    # ambiguous prefixes are errors in git, and stage nothing
+                    "git add --inter src/a.py", "git add --u src/a.py", "git add --verb src/a.py",
                     # the readers of the index are not guarded one by one
                     "git diff --cached", "git diff HEAD", "git status -v", "git diff-index -p HEAD",
                     "git show :.env.staging"):
