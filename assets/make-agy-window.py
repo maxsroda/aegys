@@ -85,7 +85,7 @@ rule1 = top + 10 * cell + 22
 add(f'<line x1="{left}" y1="{rule1}" x2="{right}" y2="{rule1}" stroke="{RULE}" stroke-width="1.5"/>')
 prompt_y = rule1 + 26
 add(f'<text x="{left}" y="{prompt_y}" font-family="{FONT}" font-size="{font_size}" xml:space="preserve">'
-    f'<tspan fill="{BLUE}">&gt;</tspan><tspan fill="{GRAY}"> Accept-edits mode: file edits auto-approved (shift+tab to cycle)</tspan></text>')
+    f'<tspan fill="{BLUE}">&gt;</tspan></text>')
 rule2 = prompt_y + 16
 add(f'<line x1="{left}" y1="{rule2}" x2="{right}" y2="{rule2}" stroke="{RULE}" stroke-width="1.5"/>')
 
