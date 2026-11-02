@@ -130,6 +130,45 @@ class UninstallTest(AgyHome):
         uninstall(self.home)
         self.assertEqual(self.read(self.settings)["statusLine"], own)
 
+    def test_a_grant_the_user_had_before_install_survives_uninstall(self) -> None:
+        self.write(self.settings, {"permissions": {"allow": ["read_file($HOME)"]}})
+        install(self.home)
+        uninstall(self.home)
+        self.assertEqual(self.read(self.settings), {"permissions": {"allow": ["read_file($HOME)"]}})
+
+    def test_reinstall_keeps_track_of_the_grants_the_first_install_added(self) -> None:
+        install(self.home)
+        install(self.home)
+        uninstall(self.home)
+        self.assertEqual(self.read(self.settings), {})
+
+    def test_a_hand_wired_aegys_status_line_is_removed(self) -> None:
+        install(self.home)
+        settings = self.read(self.settings)
+        settings["statusLine"]["padding"] = 1
+        self.write(self.settings, settings)
+        uninstall(self.home)
+        self.assertNotIn("statusLine", self.read(self.settings))
+
+    def test_without_an_install_record_all_three_grants_go_and_the_note_says_so(self) -> None:
+        self.write(self.settings, {"permissions": {"allow": ["command(ls)", "command(regex:(?s).*)", "read_file($HOME)", "write_file($HOME)"]}})
+        self.write(self.hooks, {"aegys": {}})
+        notes = uninstall(self.home)
+        self.assertEqual(self.read(self.settings), {"permissions": {"allow": ["command(ls)"]}})
+        self.assertTrue(any("read_file($HOME)" in note for note in notes))
+
+    def test_uninstall_keeps_the_pre_install_backup(self) -> None:
+        self.write(self.settings, {"theme": "light"})
+        install(self.home)
+        uninstall(self.home)
+        backup = self.settings.with_name("settings.json.aegys-backup")
+        self.assertEqual(self.read(backup), {"theme": "light"})
+
+    def test_uninstall_removes_the_install_record(self) -> None:
+        install(self.home)
+        uninstall(self.home)
+        self.assertFalse((self.home / ".gemini" / "aegys" / "installed.json").exists())
+
     def test_uninstall_works_without_the_launcher(self) -> None:
         install(self.home)
         self.launcher.unlink()

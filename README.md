@@ -70,7 +70,7 @@ aegys ● a:12 d:2 ca:5 cd:1
 
 The chip turns amber with a `⚠` note when *agy*'s own auto mode or its sandbox is on, and red `aegys ✗` with the reason when the hook is missing or your config is broken. The chip and its counters follow [pi-automode](https://github.com/czottmann/pi-automode)'s `AM ● a:… d:… ca:… cd:…`.
 
-No chip means *aegys* isn't running. If its program is gone but its hooks stay, *agy* refuses every shell command with a `hook failed` error instead of running it unchecked. To uninstall, run `aegys uninstall`, which removes the hooks, the grants and the aegys status line and keeps the rest, then `uv tool uninstall aegys`.
+No chip means *aegys* isn't running. If its program is gone but its hooks stay, *agy* refuses every shell command with a `hook failed` error instead of running it unchecked. To uninstall, run `aegys uninstall`, then `uv tool uninstall aegys`. `aegys install` records which grants it added in `~/.gemini/aegys/installed.json`, so the uninstall takes back only those, plus the hooks and the aegys status line; grants you had before stay.
 
 ## Trust, but verify
 
