@@ -842,7 +842,9 @@ def control_areas(home: Path) -> tuple[Path, ...]:
 def harness_control(path: Path, home: Path) -> bool:
     """True when writing path (resolved) changes what the harnesses, git or this
     guard runs or allows."""
-    if ".git" in path.parts:
+    if any(p.lower() == ".git" for p in path.parts):
+        return True
+    if git_settings_match(path, home) is not None:
         return True
     if any(inside(path, d) for d in control_dirs(home)) or any(inside(path, d) for d in ABSOLUTE_CONTROL):
         return True
@@ -1094,6 +1096,63 @@ def git_config_target(words: list[str], cwd: Path, home: Path) -> Path | None:
     if "--system" in rest:
         return Path("/etc/gitconfig")
     return cwd / ".git" / "config"
+
+
+def git_settings_match(path: Path, home: Path) -> Path | None:
+    """The git settings file that path is, or shares a file with, or None. git runs the
+    programs these files name (core.fsmonitor, diff drivers' textconv). They are
+    ~/.gitconfig and ~/.config/git/config, which git reads on every run, and a `config`
+    under a `.git` directory (a repository's, or a submodule's .git/modules/<name>/config),
+    which git reads when it runs in that repository. A name matches in any letter case.
+    A path shares a file with a settings file when it is a symbolic or hard link to it,
+    checked with os.path.samefile against those files and the .git/config files above
+    path. Not seen: a hard link to a settings file of a repository that does not contain
+    path (a sibling, or one elsewhere under home), since only the files above path are
+    checked; `cp -l` and `cp --link` make such a link only after the classifier, and the
+    file tools then allow writes through it. Also not seen: the file a .git/config in a
+    repository below path links to."""
+    home_settings = (home / ".gitconfig", home / ".config" / "git" / "config")
+    lowered = str(path).lower()
+    for setting in home_settings:
+        if lowered == str(setting).lower():
+            return setting
+    if path.name.lower() == "config" and any(p.lower() == ".git" for p in path.parts[:-1]):
+        return path
+    if not path.is_file():
+        return None
+    for setting in (*home_settings, *repository_settings(path)):
+        try:
+            if setting.is_file() and os.path.samefile(path, setting):
+                return setting
+        except OSError:
+            continue
+    return None
+
+
+def repository_settings(path: Path) -> list[Path]:
+    """The `.git/config` and submodule `.git/modules/*/config` files of the directories
+    above path."""
+    settings: list[Path] = []
+    for directory in path.parents:
+        git_dir = directory / ".git"
+        if git_dir.is_dir():
+            settings.append(git_dir / "config")
+            settings.extend(submodule_settings(git_dir / "modules"))
+    return settings
+
+
+def submodule_settings(modules: Path) -> list[Path]:
+    """The `config` of each submodule git directory under `modules`, nested submodules
+    included. Only the module directories are listed, never their objects."""
+    try:
+        entries = [entry for entry in modules.iterdir() if entry.is_dir()]
+    except OSError:
+        return []
+    settings: list[Path] = []
+    for module in entries:
+        settings.append(module / "config")
+        settings.extend(submodule_settings(module / "modules"))
+    return settings
 
 
 def git_repository_created(words: list[str], cwd: Path, home: Path) -> Path | None:
@@ -1543,7 +1602,7 @@ def spelled_control(text: str, home: Path, in_config_repository: bool = False) -
 
 CONTROL_WRITE = (
     "this command can write {control}, which decides what the harnesses, git or the guard "
-    "run or allow. Change it with the edit tool, where the change is checked, or "
+    "run or allow. Change it with the edit tool if the edit tool allows that change, or "
     "leave it to the user"
 )
 
@@ -1581,6 +1640,49 @@ def inline_code(words: list[str]) -> list[str]:
             return []
         i += 1
     return code
+
+
+LINK_CONTROL = (
+    "this command makes a hard link to {control}, which decides what the harnesses, git or "
+    "the guard run or allow, and a write through the link would change it. Use a symbolic "
+    "link (`ln -s`), or leave it to the user"
+)
+
+
+def ln_command(words: list[str]) -> tuple[bool, list[str]]:
+    """Whether an `ln` command makes symbolic links, and the words that may name the
+    files it touches: its operands and the `-t`/`--target-directory` directory. The value
+    of `-S` and `--suffix` is read as a value, so a `-s` after `-S` is a suffix, not the
+    symbolic-link flag."""
+    symbolic = False
+    names: list[str] = []
+    rest = iter(words[1:])
+    for word in rest:
+        if word == "--":
+            names.extend(rest)
+            break
+        if word.startswith("--"):
+            option, equals, value = word.partition("=")
+            if option == "--symbolic":
+                symbolic = True
+            elif option in ("--suffix", "--target-directory"):
+                if not equals:
+                    value = next(rest, "")
+                if option == "--target-directory":
+                    names.append(value)
+            continue
+        if word.startswith("-") and len(word) > 1:
+            for index, letter in enumerate(word[1:], start=1):
+                if letter == "s":
+                    symbolic = True
+                elif letter in "St":
+                    value = word[index + 1:] or next(rest, "")
+                    if letter == "t":
+                        names.append(value)
+                    break
+            continue
+        names.append(word)
+    return symbolic, names
 
 
 CONTROL_ANCESTOR_WRITE = (
@@ -1717,6 +1819,13 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
         in_config_repository = repository is not None and any(
             git_top(directory) == repository.path for directory in repo_dirs)
         program = os.path.basename(stage.words[0]) if stage.words else ""
+        if program == "ln":
+            symbolic, names = ln_command(stage.words)
+            if not symbolic:
+                # Any operand may be the control file: the source, or the one `ln -t DIR` names.
+                for path in stage_paths(stage, home, names):
+                    if harness_control(path, home):
+                        return LINK_CONTROL.format(control=path)
         writes = stage.refused or program_writes(stage.words)
         operands = stage.words if stage.refused else written_operands(stage.words) if writes else []
         if writes:

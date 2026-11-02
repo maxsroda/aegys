@@ -339,6 +339,160 @@ class AegysTest(unittest.TestCase):
             self.assertEqual(res.get("decision"), "deny", (tool_name, path, res))
             self.assertIn("aegys", res.get("reason", ""), (tool_name, path, res))
 
+    def test_file_tools_deny_writes_to_git_settings_files(self) -> None:
+        # git runs the programs its settings name (core.fsmonitor, diff textconv),
+        # so a write to these files is refused before the classifier sees it.
+        for tool_name, path in (
+            ("write_file", self.home / ".gitconfig"),
+            ("edit_file", self.home / ".gitconfig"),
+            ("write_file", self.home / ".config" / "git" / "config"),
+            ("edit_file", self.work / ".git" / "config"),
+            ("write_file", self.work / "sub" / ".git" / "config"),
+        ):
+            res = self.evaluate_file(
+                tool_name, str(path), classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (tool_name, path, res))
+            self.assertIn("git settings file", res.get("reason", ""), (tool_name, path, res))
+
+    def test_file_tools_deny_writes_through_symlink_to_git_settings(self) -> None:
+        # A dotfile manager often links ~/.gitconfig into a dotfiles repository. The
+        # target is written under its own name, and a workspace link resolves to it.
+        dotfiles = self.home / "dotfiles"
+        dotfiles.mkdir()
+        (dotfiles / "gitconfig").write_text("", encoding="utf-8")
+        (self.home / ".gitconfig").symlink_to(dotfiles / "gitconfig")
+        (self.work / "link").symlink_to(self.home / ".gitconfig")
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        (self.work / "link2").symlink_to(self.work / ".git" / "config")
+        for tool_name, path in (
+            ("write_file", dotfiles / "gitconfig"),
+            ("write_file", self.work / "link"),
+            ("write_file", self.work / "link2"),
+        ):
+            res = self.evaluate_file(
+                tool_name, str(path), classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (tool_name, path, res))
+
+    def test_file_tools_deny_writes_to_file_a_repository_config_links_to(self) -> None:
+        (self.work / "dotfiles").mkdir()
+        (self.work / "dotfiles" / "repo-cfg").write_text("", encoding="utf-8")
+        (self.work / ".git" / "config").symlink_to(self.work / "dotfiles" / "repo-cfg")
+        res = self.evaluate_file(
+            "write_file",
+            str(self.work / "dotfiles" / "repo-cfg"),
+            classifier_caller=unexpected_caller,
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_file_tools_deny_writes_to_hard_link_of_git_config(self) -> None:
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        os.link(self.work / ".git" / "config", self.work / "hardlink")
+        res = self.evaluate_file(
+            "write_file", str(self.work / "hardlink"), classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_file_tools_deny_hard_link_to_submodule_git_config(self) -> None:
+        module = self.work / ".git" / "modules" / "a" / "modules" / "b"
+        module.mkdir(parents=True)
+        (module / "config").write_text("", encoding="utf-8")
+        os.link(module / "config", self.work / "submodule-hardlink")
+        res = self.evaluate_file(
+            "write_file", str(self.work / "submodule-hardlink"),
+            classifier_caller=unexpected_caller,
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_file_tools_deny_submodule_git_config(self) -> None:
+        for path in (
+            self.work / "sup" / ".git" / "modules" / "lib" / "config",
+            self.work / "sup" / ".git" / "modules" / "a" / "modules" / "b" / "config",
+        ):
+            res = self.evaluate_file(
+                "edit_file", str(path), classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (path, res))
+
+    def test_file_tools_deny_git_settings_names_in_any_letter_case(self) -> None:
+        # On a case-insensitive filesystem these names are the settings files.
+        for path in (
+            self.work / ".GIT" / "config",
+            self.work / ".Git" / "Config",
+            self.work / ".git" / "CONFIG",
+            self.home / ".GITCONFIG",
+        ):
+            res = self.evaluate_file(
+                "write_file", str(path), classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (path, res))
+
+    def test_file_tools_deny_git_config_spelled_with_dots_and_slashes(self) -> None:
+        for spelling in (
+            ".git/config", "./.git/config", "x/../.git/config",
+            ".git//config", ".git/config/", ".git/./config",
+        ):
+            res = self.evaluate_file(
+                "write_file", spelling, classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (spelling, res))
+
+    def test_file_tools_read_git_settings_files_without_denial(self) -> None:
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        for tool_name, path in (
+            ("read_file", self.home / ".gitconfig"),
+            ("view_file", self.work / ".git" / "config"),
+        ):
+            res = self.evaluate_file(
+                tool_name, str(path), classifier_caller=allow_caller
+            )
+            self.assertNotEqual(res.get("decision"), "deny", (tool_name, path, res))
+
+    def test_file_tools_keep_ordinary_config_names_fast(self) -> None:
+        for path in (
+            "config", "src/config.py", "git/config", "docs/.git-config.md", "configs/.git_config",
+        ):
+            res = self.evaluate_file(
+                "write_file", path, classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res, {"decision": "allow"}, path)
+
+    def test_shell_writes_to_git_config_by_case_or_hard_link_are_denied(self) -> None:
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        os.link(self.work / ".git" / "config", self.work / "hardlink")
+        for command in (
+            "echo x >> .GIT/config",
+            "echo x >> hardlink",
+            "ln .git/config hl2",
+        ):
+            res = self.evaluate(command, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (command, res))
+
+    def test_shell_symbolic_link_to_git_config_is_not_denied_at_creation(self) -> None:
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        for command in (
+            "ln -s .git/config sym", "ln -fs .git/config sym", "ln -sf .git/config sym",
+            "ln -S x -s .git/config sym", "ln --suffix=x -s .git/config sym",
+        ):
+            res = self.evaluate(command, classifier_caller=allow_caller)
+            self.assertNotEqual(res.get("decision"), "deny", (command, res))
+
+    def test_shell_hard_link_to_git_config_is_denied_whatever_the_options(self) -> None:
+        # `-S` and `--suffix` take a value, so the `-s` after them is a suffix, not the
+        # symbolic-link flag; `-t` names the directory the links go into.
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        for command in (
+            "ln -S -s .git/config hl",
+            "ln --suffix -s .git/config hl",
+            "ln -S ~ .git/config hl",
+            "ln -t . .git/config",
+            "ln -t. .git/config",
+            "ln -fS -s .git/config hl",
+        ):
+            res = self.evaluate(command, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (command, res))
+
     def test_file_tools_allow_workspace_files_without_classifier(self) -> None:
         for tool_name in ("read_file", "write_file", "edit_file"):
             res = self.evaluate_file(
@@ -384,7 +538,7 @@ class AegysTest(unittest.TestCase):
             return allow_caller(sys_prompt, msgs, max_tokens, tools)
 
         res = self.evaluate_file(
-            "write_file", str(self.work / ".git" / "config"), classifier_caller=counting_caller
+            "write_file", str(self.work / ".vscode" / "settings.json"), classifier_caller=counting_caller
         )
         self.assertEqual(res, {"decision": "allow"})
         self.assertEqual(len(calls), 1)

@@ -53,7 +53,10 @@ For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
 1. **Hard-deny (all states):** a path matching ``secretPaths`` (credential files
    of agy and of the other harnesses included); a write into agy's control directories or into
    the launcher directories of the harness config repository (see
-   ``aegys/config.py``).
+   ``aegys/config.py``); a write that changes a git settings file (``~/.gitconfig``,
+   ``~/.config/git/config``, or a ``config`` under a ``.git`` directory, a submodule's
+   included), by name or by sharing a file with one through a symbolic or hard link
+   (see ``git_settings_match`` in ``aegys/command_checks.py``).
 2. **Workspace fast allow:** a path under a workspace root or the working
    directory, unless a protected name such as ``.git`` or ``.gemini`` occurs in
    it, or the call writes into the harness config repository, ``~/.gemini`` or
@@ -121,6 +124,7 @@ from .command_checks import (
     expand_home,
     expand_word,
     gh_shows_token,
+    git_settings_match,
     host_denial_reason,
     inline_code,
     input_targets,
@@ -1714,14 +1718,15 @@ def policy_unavailable_reason(home: Path) -> str:
             "check this; confirm it manually.")
 
 
-def file_tool_path(args: dict[str, Any], cwd: Path) -> Path | None:
+def file_tool_absolute_path(args: dict[str, Any], cwd: Path) -> Path | None:
+    """The Path argument made absolute, with symlinks left as spelled."""
     raw = args.get("Path")
     if not isinstance(raw, str) or not raw.strip():
         return None
     path = Path(raw.strip()).expanduser()
     if not path.is_absolute():
         path = cwd / path
-    return path.resolve()
+    return path
 
 
 def evaluate_file_access(
@@ -1743,9 +1748,20 @@ def evaluate_file_access(
             user_turn=current_turn,
         )
 
-    path = file_tool_path(args, cwd)
-    if path is None:
+    spelled = file_tool_absolute_path(args, cwd)
+    if spelled is None:
         return deny(f"{tool_name} has no Path argument.")
+    path = spelled.resolve()
+    spelled_normal = Path(os.path.normpath(spelled))
+    settings = None
+    if tool_name in WRITE_TOOL_NAMES:
+        # The name given, and the file it resolves to, are both judged.
+        settings = git_settings_match(spelled_normal, home) or git_settings_match(path, home)
+    if settings is not None:
+        return deny(
+            f"writing {spelled_normal} changes {settings}, a git settings file; git runs the "
+            f"programs it names (core.fsmonitor, diff textconv), so {tool_name} is refused."
+        )
     if policy is not None and secret(path, policy.secret_paths):
         return deny(f"{path} holds credentials, so {tool_name} is refused.")
     if tool_name in WRITE_TOOL_NAMES and (
@@ -1773,7 +1789,7 @@ def evaluate_file_access(
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     if root is not None and not any(
-        part in DEFAULT_PROTECTED_PATHS for part in path.relative_to(root).parts
+        part.lower() in DEFAULT_PROTECTED_PATHS for part in path.relative_to(root).parts
     ):
         record_guard_decision(home, conversation_id, allowed=True)
         return {"decision": "allow"}
