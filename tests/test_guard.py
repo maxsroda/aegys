@@ -1333,7 +1333,8 @@ class AegysTest(unittest.TestCase):
             "lsblk",
         ))
         for cmd in ("ls -la", "ls", "wc -l f.txt", "du -sh .", "ps aux", "stat f.txt",
-                    "hostname", "tr a b", "fd foo", "cat f.txt 2>&1", "command -v git"):
+                    "hostname", "tr a b", "fd foo", "cat f.txt 2>&1", "command -v git",
+                    "2>/dev/null ls -la"):
             self.assertEqual(
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
@@ -1384,10 +1385,10 @@ class AegysTest(unittest.TestCase):
             "find -fprint0 out.txt",
             "find -fls out.txt",
             "find -delete",
-            "find -exec ./evil ;",
-            "find -execdir ./evil ;",
-            "find -ok ./evil ;",
-            "find -okdir ./evil ;",
+            "find -exec ./evil \\;",
+            "find -execdir ./evil \\;",
+            "find -ok ./evil \\;",
+            "find -okdir ./evil \\;",
             "find . -fprint out.txt",
         ):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)

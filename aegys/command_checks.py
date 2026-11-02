@@ -137,7 +137,8 @@ BASH_RULES: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "gh auth status --show-token",
-        # -t, or -t among combined short flags (-at); a capital -T is --template.
+        # -t, or -t among combined short flags; the pattern is case-sensitive, as
+        # gh's flags are.
         re.compile(rf"{CMD_START}gh\s+auth\s+status\b{STAGE}\s"
                    r"(?:--show-token(?:=|\s|$)|-[a-zA-Z]*t[a-zA-Z]*(?:\s|$))"),
         "gh auth status --show-token prints the GitHub token into the conversation; "

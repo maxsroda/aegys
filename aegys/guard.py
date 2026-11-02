@@ -644,10 +644,13 @@ def stage_matches_allow_patterns(
                 pat_base = pattern[: -(len(suffix) + 1)]
                 break
         # `ls*` means the program `ls` with any arguments, not every program whose
-        # name starts with `ls`: the stage's first word must be `ls` itself.
+        # name starts with `ls`: the first word of the command text, and the program
+        # that runs after wrappers are removed, must both be `ls` itself.
         first_word = pat_base.split(" ", 1)[0]
         if first_word.endswith("*") and "*" not in first_word[:-1]:
-            if canonicalize_case(stage.raw[0]) != canonicalize_case(first_word[:-1]):
+            program_name = canonicalize_case(first_word[:-1])
+            if program_name != canonicalize_case(base_cmd.split(" ", 1)[0]) \
+                    or program_name != canonicalize_case(stage.words[0]):
                 continue
         if redirects:
             if pat_redir != redirects[0]:
