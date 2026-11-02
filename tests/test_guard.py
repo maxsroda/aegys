@@ -339,6 +339,45 @@ class AegysTest(unittest.TestCase):
             self.assertEqual(res.get("decision"), "deny", (tool_name, path, res))
             self.assertIn("aegys", res.get("reason", ""), (tool_name, path, res))
 
+    def test_file_tools_deny_writes_to_git_settings_files(self) -> None:
+        # git runs the programs its settings name (core.fsmonitor, diff textconv),
+        # so a write to these files is refused before the classifier sees it.
+        for tool_name, path in (
+            ("write_file", self.home / ".gitconfig"),
+            ("edit_file", self.home / ".gitconfig"),
+            ("write_file", self.home / ".config" / "git" / "config"),
+            ("edit_file", self.work / ".git" / "config"),
+            ("write_file", self.work / "sub" / ".git" / "config"),
+        ):
+            res = self.evaluate_file(
+                tool_name, str(path), classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (tool_name, path, res))
+            self.assertIn("git settings file", res.get("reason", ""), (tool_name, path, res))
+
+    def test_file_tools_deny_git_settings_files_reached_through_symlinks(self) -> None:
+        # A dotfile manager often links ~/.gitconfig into a dotfiles repository, so the
+        # write is judged both as spelled and where the link resolves.
+        dotfiles = self.home / "dotfiles"
+        dotfiles.mkdir()
+        (dotfiles / "gitconfig").write_text("", encoding="utf-8")
+        (self.home / ".gitconfig").symlink_to(dotfiles / "gitconfig")
+        (self.work / "link").symlink_to(self.home / ".gitconfig")
+        for tool_name, path in (
+            ("write_file", self.home / ".gitconfig"),
+            ("write_file", self.work / "link"),
+        ):
+            res = self.evaluate_file(
+                tool_name, str(path), classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (tool_name, path, res))
+
+    def test_file_tools_read_git_settings_files_without_denial(self) -> None:
+        res = self.evaluate_file(
+            "read_file", str(self.home / ".gitconfig"), classifier_caller=allow_caller
+        )
+        self.assertNotEqual(res.get("decision"), "deny", res)
+
     def test_file_tools_allow_workspace_files_without_classifier(self) -> None:
         for tool_name in ("read_file", "write_file", "edit_file"):
             res = self.evaluate_file(
@@ -384,7 +423,7 @@ class AegysTest(unittest.TestCase):
             return allow_caller(sys_prompt, msgs, max_tokens, tools)
 
         res = self.evaluate_file(
-            "write_file", str(self.work / ".git" / "config"), classifier_caller=counting_caller
+            "write_file", str(self.work / ".vscode" / "settings.json"), classifier_caller=counting_caller
         )
         self.assertEqual(res, {"decision": "allow"})
         self.assertEqual(len(calls), 1)

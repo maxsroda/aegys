@@ -1030,6 +1030,15 @@ def git_config_target(words: list[str], cwd: Path, home: Path) -> Path | None:
     return cwd / ".git" / "config"
 
 
+def git_settings_file(path: Path, home: Path) -> bool:
+    """True when path is a git settings file that git reads on every run: ~/.gitconfig,
+    ~/.config/git/config, or any `.git/config`, by name or as the file those names
+    link to. git runs the programs these name (core.fsmonitor, diff drivers' textconv)."""
+    home_settings = (home / ".gitconfig", home / ".config" / "git" / "config")
+    return path in home_settings or path in {p.resolve() for p in home_settings} or (
+        path.name == "config" and path.parent.name == ".git")
+
+
 def git_repository_created(words: list[str], cwd: Path, home: Path) -> Path | None:
     """Where `git init [dir]` or `git clone URL DIR` creates a repository, or None."""
     if not words or os.path.basename(words[0]) != "git":
@@ -1477,7 +1486,7 @@ def spelled_control(text: str, home: Path, in_config_repository: bool = False) -
 
 CONTROL_WRITE = (
     "this command can write {control}, which decides what the harnesses, git or the guard "
-    "run or allow. Change it with the edit tool, where the change is checked, or "
+    "run or allow. Change it with the edit tool if the edit tool allows that change, or "
     "leave it to the user"
 )
 
