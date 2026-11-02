@@ -1788,9 +1788,16 @@ class AegysTest(unittest.TestCase):
             "git add .", "git add -A", "git add --all", "git add -u", "git add --update",
             "git add -A -- .", "git add src", "git add src/", "git add 'src/*'", "git -C . add .",
             "git add --pathspec-from-file=list.txt", "git add . ':!.env'",
+            "git add -i", "git add --interactive", "git add --inter", "printf '4\\n*\\n\\nq\\n' | git add -i",
+            # these spellings do not exclude: `literal` reads * literally, `glob` does not cross /
+            "git add . ':(exclude,literal)*.env*'", "git add . ':(literal,exclude)*.env*'",
+            "git add . ':(exclude,glob)*.env*'", "git add . ':(glob,exclude)*.env*'",
+            "git add . ':(exclude,attr:x)*.env*'",
         ))
         for cmd in ("git add src/a.py", "git add -- src/a.py", "git add . ':!*.env*'",
                     "git add -A ':!*.env*'", "git add -u ':(exclude)*.env*'", "git add . ':^*.env*'",
+                    "git add . ':(exclude,icase)*.env*'", "git add . ':(top,exclude)*.env*'",
+                    "git add . ':(exclude,top,icase)*.env*'", "git add -p", "git add -e",
                     # the readers of the index are not guarded one by one
                     "git diff --cached", "git diff HEAD", "git status -v", "git diff-index -p HEAD",
                     "git show :.env.staging"):

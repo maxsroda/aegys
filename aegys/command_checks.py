@@ -880,14 +880,27 @@ def reads_a_file_list(words: list[str]) -> bool:
                     for word in words[1:]))
 
 
-ENV_EXCLUDING_PATHSPEC = re.compile(r"^:(?:!|\^|\((?:[a-z,]*,)?exclude(?:,[a-z]*)?\))\*\.env\*$")
+ENV_PATHSPEC = re.compile(r"^:(?:[!^]|\((?P<magic>[^)]*)\))\*\.env\*$")
+
+
+def excludes_env_pathspec(word: str) -> bool:
+    """Whether a pathspec excludes `*.env*` from the root down: `:!`, `:^` or `:(exclude)`,
+    with at most `icase` and `top` beside it. `literal` reads the `*` literally and `glob`
+    stops it at a `/`, so neither excludes a nested or any `.env.*` file."""
+    match = ENV_PATHSPEC.match(word)
+    if match is None:
+        return False
+    if match.group("magic") is None:
+        return True
+    magic = match.group("magic").split(",")
+    return "exclude" in magic and set(magic) <= {"exclude", "icase", "top"}
 
 
 def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path) -> bool:
-    """True for `git add` of `.`, a directory, a glob, `-A`/`--all`, `-u`/`--update` or a
-    pathspec file, which stages every un-ignored `.env.*` the work tree holds (and
-    `git diff --cached`, `git status -v` and others then print it), unless the command
-    carries an excluding pathspec such as `':!*.env*'`. Guarding the staging step holds
+    """True for `git add` of `.`, a directory, a glob, `-A`/`--all`, `-u`/`--update`,
+    `-i`/`--interactive` or a pathspec file, which stages every un-ignored `.env.*` the
+    work tree holds (and `git diff --cached`, `git status -v` and others then print it),
+    unless the command carries an excluding pathspec such as `':!*.env*'`. Guarding the staging step holds
     for every reader of the index."""
     if not words or os.path.basename(words[0]) != "git" or "add" not in words[1:]:
         return False
@@ -896,10 +909,12 @@ def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path)
     options = rest[:rest.index("--")] if "--" in rest else rest
     operands += [word for word in options if not word.startswith("-")]
     options = [word for word in options if word.startswith("-")]
-    if any(ENV_EXCLUDING_PATHSPEC.match(word) for word in operands):
+    if any(excludes_env_pathspec(word) for word in operands):
         return False
-    if any(word in ("--all", "--update") or word.startswith("--pathspec-from-file")
-           or re.fullmatch(r"-[A-Za-z]*[Au][A-Za-z]*", word) for word in options):
+    # -i stages untracked files from its piped answers; -p and -e touch tracked files only.
+    if any(word in ("--all", "--update", "--interactive") or word.startswith("--pathspec-from-file")
+           or (len(word) > 6 and "--interactive".startswith(word.partition("=")[0]))
+           or re.fullmatch(r"-[A-Za-z]*[Aui][A-Za-z]*", word) for word in options):
         return True
     for operand in operands:
         if operand.endswith("/") or set(operand) & set("*?[") or operand.startswith(":"):
