@@ -1040,8 +1040,11 @@ def git_settings_match(path: Path, home: Path) -> Path | None:
     which git reads when it runs in that repository. A name matches in any letter case.
     A path shares a file with a settings file when it is a symbolic or hard link to it,
     checked with os.path.samefile against those files and the .git/config files above
-    path. Not seen: the file a .git/config in a repository below path links to, and a
-    hard link to a settings file in such a repository."""
+    path. Not seen: a hard link to a settings file of a repository that does not contain
+    path (a sibling, or one elsewhere under home), since only the files above path are
+    checked; `cp -l` and `cp --link` make such a link only after the classifier, and the
+    file tools then allow writes through it. Also not seen: the file a .git/config in a
+    repository below path links to."""
     home_settings = (home / ".gitconfig", home / ".config" / "git" / "config")
     lowered = str(path).lower()
     for setting in home_settings:
@@ -1580,11 +1583,40 @@ LINK_CONTROL = (
 )
 
 
-def symbolic_link_requested(words: list[str]) -> bool:
-    """True when an `ln` command makes a symbolic link (`-s`, `--symbolic`, or among
-    combined short options such as `-sf`)."""
-    return any(w == "--symbolic" or (w.startswith("-") and not w.startswith("--") and "s" in w)
-               for w in words[1:])
+def ln_command(words: list[str]) -> tuple[bool, list[str]]:
+    """Whether an `ln` command makes symbolic links, and the words that may name the
+    files it touches: its operands and the `-t`/`--target-directory` directory. The value
+    of `-S` and `--suffix` is read as a value, so a `-s` after `-S` is a suffix, not the
+    symbolic-link flag."""
+    symbolic = False
+    names: list[str] = []
+    rest = iter(words[1:])
+    for word in rest:
+        if word == "--":
+            names.extend(rest)
+            break
+        if word.startswith("--"):
+            option, equals, value = word.partition("=")
+            if option == "--symbolic":
+                symbolic = True
+            elif option in ("--suffix", "--target-directory"):
+                if not equals:
+                    value = next(rest, "")
+                if option == "--target-directory":
+                    names.append(value)
+            continue
+        if word.startswith("-") and len(word) > 1:
+            for index, letter in enumerate(word[1:], start=1):
+                if letter == "s":
+                    symbolic = True
+                elif letter in "St":
+                    value = word[index + 1:] or next(rest, "")
+                    if letter == "t":
+                        names.append(value)
+                    break
+            continue
+        names.append(word)
+    return symbolic, names
 
 
 CONTROL_ANCESTOR_WRITE = (
@@ -1721,12 +1753,13 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
         in_config_repository = repository is not None and any(
             git_top(directory) == repository.path for directory in repo_dirs)
         program = os.path.basename(stage.words[0]) if stage.words else ""
-        if program == "ln" and not symbolic_link_requested(stage.words):
-            # Any operand: the source, or the name of `ln -t DIR SOURCE`, may be the control file.
-            names = [w for w in stage.words[1:] if not w.startswith("-")]
-            for path in stage_paths(stage, home, names):
-                if harness_control(path, home):
-                    return LINK_CONTROL.format(control=path)
+        if program == "ln":
+            symbolic, names = ln_command(stage.words)
+            if not symbolic:
+                # Any operand may be the control file: the source, or the one `ln -t DIR` names.
+                for path in stage_paths(stage, home, names):
+                    if harness_control(path, home):
+                        return LINK_CONTROL.format(control=path)
         writes = stage.refused or program_writes(stage.words)
         operands = stage.words if stage.refused else written_operands(stage.words) if writes else []
         if writes:

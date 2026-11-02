@@ -471,8 +471,27 @@ class AegysTest(unittest.TestCase):
 
     def test_shell_symbolic_link_to_git_config_is_not_denied_at_creation(self) -> None:
         (self.work / ".git" / "config").write_text("", encoding="utf-8")
-        res = self.evaluate("ln -s .git/config sym", classifier_caller=allow_caller)
-        self.assertNotEqual(res.get("decision"), "deny", res)
+        for command in (
+            "ln -s .git/config sym", "ln -fs .git/config sym", "ln -sf .git/config sym",
+            "ln -S x -s .git/config sym", "ln --suffix=x -s .git/config sym",
+        ):
+            res = self.evaluate(command, classifier_caller=allow_caller)
+            self.assertNotEqual(res.get("decision"), "deny", (command, res))
+
+    def test_shell_hard_link_to_git_config_is_denied_whatever_the_options(self) -> None:
+        # `-S` and `--suffix` take a value, so the `-s` after them is a suffix, not the
+        # symbolic-link flag; `-t` names the directory the links go into.
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        for command in (
+            "ln -S -s .git/config hl",
+            "ln --suffix -s .git/config hl",
+            "ln -S ~ .git/config hl",
+            "ln -t . .git/config",
+            "ln -t. .git/config",
+            "ln -fS -s .git/config hl",
+        ):
+            res = self.evaluate(command, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (command, res))
 
     def test_file_tools_allow_workspace_files_without_classifier(self) -> None:
         for tool_name in ("read_file", "write_file", "edit_file"):
