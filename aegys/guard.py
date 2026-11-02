@@ -53,8 +53,10 @@ For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
 1. **Hard-deny (all states):** a path matching ``secretPaths`` (credential files
    of agy and of the other harnesses included); a write into agy's control directories or into
    the launcher directories of the harness config repository (see
-   ``aegys/config.py``); a write to a git settings file (``~/.gitconfig``,
-   ``~/.config/git/config`` or any ``.git/config``), by name or through a link.
+   ``aegys/config.py``); a write that changes a git settings file (``~/.gitconfig``,
+   ``~/.config/git/config``, or a ``config`` under a ``.git`` directory, a submodule's
+   included), by name or by sharing a file with one through a symbolic or hard link
+   (see ``git_settings_match`` in ``aegys/command_checks.py``).
 2. **Workspace fast allow:** a path under a workspace root or the working
    directory, unless a protected name such as ``.git`` or ``.gemini`` occurs in
    it, or the call writes into the harness config repository, ``~/.gemini`` or
@@ -120,7 +122,7 @@ from .command_checks import (
     executed_file,
     expand_home,
     expand_word,
-    git_settings_file,
+    git_settings_match,
     host_denial_reason,
     inline_code,
     input_targets,
@@ -1733,14 +1735,14 @@ def evaluate_file_access(
     if spelled is None:
         return deny(f"{tool_name} has no Path argument.")
     path = spelled.resolve()
-    # A link can name a git settings file, or be one, so the spelled path and the
-    # resolved path are both judged.
     spelled_normal = Path(os.path.normpath(spelled))
-    if tool_name in WRITE_TOOL_NAMES and any(
-        git_settings_file(p, home) for p in (spelled_normal, path)
-    ):
+    settings = None
+    if tool_name in WRITE_TOOL_NAMES:
+        # The name given, and the file it resolves to, are both judged.
+        settings = git_settings_match(spelled_normal, home) or git_settings_match(path, home)
+    if settings is not None:
         return deny(
-            f"{spelled_normal} is, or links to, a git settings file, and git runs the "
+            f"writing {spelled_normal} changes {settings}, a git settings file; git runs the "
             f"programs it names (core.fsmonitor, diff textconv), so {tool_name} is refused."
         )
     if policy is not None and secret(path, policy.secret_paths):
@@ -1770,7 +1772,7 @@ def evaluate_file_access(
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     if root is not None and not any(
-        part in DEFAULT_PROTECTED_PATHS for part in path.relative_to(root).parts
+        part.lower() in DEFAULT_PROTECTED_PATHS for part in path.relative_to(root).parts
     ):
         record_guard_decision(home, conversation_id, allowed=True)
         return {"decision": "allow"}
