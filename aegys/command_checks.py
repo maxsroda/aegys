@@ -29,6 +29,7 @@ import glob
 import ipaddress
 import os
 import re
+import shlex
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,8 +37,9 @@ from typing import Any
 
 from .config import Policy, harness_config_repository
 from .shell_words import (
-    FIND_WRITE_FLAGS, PRINTERS, READERS, SEARCHERS, SHELLS, WRITERS, brace_expansions,
-    git_config_writes, git_subcommand_index, inside, split_stages, unwrap,
+    FIND_WRITE_FLAGS, PRINTERS, PUNCTUATION, READERS, SEARCHERS, SEPARATOR_CHARS,
+    SHELLS, WRITERS, brace_expansions, git_config_writes, git_subcommand_index,
+    inside, split_stages, unwrap,
 )
 
 
@@ -240,22 +242,29 @@ def shell_reads_stdin(words: list[str]) -> bool:
 
 def reads_program_from_stdin(words: list[str]) -> bool:
     """Whether an interpreter (python, node, perl, ruby) takes its program from
-    standard input: an explicit `-`, or no script, module or inline-code operand."""
+    standard input: an explicit `-` before any script, module or inline-code
+    operand, or no script, module or inline-code operand."""
     args = words[1:]
-    return "-" in args or not any(a in INLINE_OR_MODULE or not a.startswith("-") for a in args)
+    first = next(
+        (
+            a
+            for a in args
+            if a in INLINE_OR_MODULE
+            or a.startswith(("--eval=", "--print="))
+            or re.fullmatch(r"-[A-Za-z]*[cep]", a)
+            or not a.startswith("-")
+        ),
+        None,
+    )
+    return first is None or first == "-"
 
 
 # A heredoc operator and its delimiter (`<<EOF`, `<<-'EOF'`, `<< "EOF"`, `<<\EOF`).
-HEREDOC_OPERATOR = re.compile(r"<<(-?)[ \t]*\\?(['\"]?)([^\s'\"<>|;&()\\]+)\2")
+HEREDOC_OPERATOR = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([^\s'\"<>|;&()\\]+)\3")
 
 
-def heredoc_bodies(command: str) -> tuple[str, list[str]]:
-    """The command without its heredoc bodies, and the bodies in order of their
-    `<<` operators; the splitter would read each body line as a command of its own.
-    Operators are found outside quotes, comments and `((...))`, across lines, so a
-    quoted `<<`, one in a comment or one inside a multi-line string is text; each
-    one found is replaced by HEREDOC_MARKER, and comments are cut, so the caller
-    splits with comments off and a mid-word `#` (`a#b`) stays in its word."""
+def _heredoc_bodies_with_quoting(command: str) -> tuple[str, list[tuple[str, bool]]]:
+    """Return `(stripped_command, [(body, is_unquoted), ...])` in order of `<<`."""
     out, bodies, pending, quote, arithmetic, i, n = [], [], [], "", 0, 0, len(command)
     while i < n:
         c = command[i]
@@ -285,7 +294,8 @@ def heredoc_bodies(command: str) -> tuple[str, list[str]]:
         elif not arithmetic and command.startswith("<<", i) and not command.startswith("<<<", i):
             match = HEREDOC_OPERATOR.match(command, i)
             if match:
-                pending.append((match.group(3), match.group(1) == "-"))
+                unquoted = not (match.group(2) or match.group(3))
+                pending.append((match.group(4), match.group(1) == "-", unquoted))
                 out.append(f" {HEREDOC_MARKER} ")
                 i = match.end()
                 continue
@@ -296,7 +306,7 @@ def heredoc_bodies(command: str) -> tuple[str, list[str]]:
         elif c == "\n" and pending:
             out.append(c)
             i += 1
-            for delimiter, strip_tabs in pending:  # each body runs to its delimiter line
+            for delimiter, strip_tabs, unquoted in pending:  # each body runs to its delimiter line
                 body = []
                 while i < n:
                     end = command.find("\n", i)
@@ -305,7 +315,7 @@ def heredoc_bodies(command: str) -> tuple[str, list[str]]:
                     if (line.lstrip("\t") if strip_tabs else line) == delimiter:
                         break
                     body.append(line)
-                bodies.append("\n".join(body))
+                bodies.append(("\n".join(body), unquoted))
             pending = []
             continue
         out.append(c)
@@ -313,10 +323,23 @@ def heredoc_bodies(command: str) -> tuple[str, list[str]]:
     return "".join(out), bodies
 
 
-def command_substitutions(text: str) -> list[str]:
-    """Every `$(...)` and `` `...` `` command substitution in `text` (outside
-    single quotes and `$((...))` arithmetic), in order."""
-    subs: list[str] = []
+def heredoc_bodies(command: str) -> tuple[str, list[str]]:
+    """The command without its heredoc bodies, and the bodies in order of their
+    `<<` operators; the splitter would read each body line as a command of its own.
+    Operators are found outside quotes, comments and `((...))`, across lines, so a
+    quoted `<<`, one in a comment or one inside a multi-line string is text; each
+    one found is replaced by HEREDOC_MARKER, and comments are cut, so the caller
+    splits with comments off and a mid-word `#` (`a#b`) stays in its word."""
+    stripped, pairs = _heredoc_bodies_with_quoting(command)
+    return stripped, [body for body, _unquoted in pairs]
+
+
+def _scan_substitutions(text: str) -> tuple[list[tuple[int, str]], str]:
+    """Return `([(offset, sub), ...], masked_text)` where unquoted backtick spans
+    are replaced with underscores of equal length so `shlex` keeps surrounding words
+    in the same stage while the backtick body is walked separately."""
+    subs: list[tuple[int, str]] = []
+    masked = list(text)
     quote = ""
     i = 0
     n = len(text)
@@ -362,6 +385,10 @@ def command_substitutions(text: str) -> list[str]:
                     j += 2
                 else:
                     j += 1
+            if depth_arith == 0:
+                inner_subs, _ = _scan_substitutions(text[i + 3 : j - 2])
+                for sub_off, sub in inner_subs:
+                    subs.append((i + 3 + sub_off, sub))
             i = j
             continue
         if text.startswith("$(", i):
@@ -376,11 +403,11 @@ def command_substitutions(text: str) -> list[str]:
                 elif ch == "\\" and j + 1 < n:
                     j += 2
                     continue
-                elif sub_quote == '"':
-                    if ch == '"':
+                elif sub_quote in ('"', "`"):
+                    if ch == sub_quote:
                         sub_quote = ""
                 else:
-                    if ch in ("'", '"'):
+                    if ch in ("'", '"', "`"):
                         sub_quote = ch
                     elif ch == "(":
                         depth_parens += 1
@@ -390,7 +417,7 @@ def command_substitutions(text: str) -> list[str]:
                             break
                 j += 1
             if depth_parens == 0:
-                subs.append(text[i + 2 : j])
+                subs.append((i, text[i + 2 : j]))
                 i = j + 1
                 continue
         if c == "`":
@@ -404,11 +431,46 @@ def command_substitutions(text: str) -> list[str]:
                     buf.append(text[j])
                     j += 1
             if j < n and text[j] == "`":
-                subs.append("".join(buf))
+                subs.append((i, "".join(buf)))
+                if not quote:
+                    for k in range(i, j + 1):
+                        masked[k] = "_"
                 i = j + 1
                 continue
         i += 1
-    return subs
+    return subs, "".join(masked)
+
+
+def command_substitutions(text: str) -> list[str]:
+    """Every `$(...)` and `` `...` `` command substitution in `text` (outside
+    single quotes, including inside `$((...))` arithmetic), in order."""
+    subs, _ = _scan_substitutions(text)
+    return [sub for _off, sub in subs]
+
+
+def _split_stages_with_ends(command: str) -> list[tuple[list[str], int]]:
+    """Split `command` (comments already cut) into `(raw_stage, end_offset)` pairs."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION)
+    lexer.commenters = ""
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    stages: list[tuple[list[str], int]] = []
+    stage: list[str] = []
+    for token in lexer:
+        if token and (set(token) <= SEPARATOR_CHARS or re.fullmatch(r"[<>]+\(+", token)):
+            if stage:
+                pos = (
+                    lexer.instream.tell()
+                    - len(getattr(lexer, "_pushback_chars", ()))
+                    - len(lexer.pushback)
+                )
+                stages.append((stage, pos))
+                stage = []
+        else:
+            stage.append(token)
+    if stage:
+        stages.append((stage, len(command)))
+    return stages
 
 
 @dataclass
@@ -423,33 +485,77 @@ class Stage:
     raw: list[str]            # the stage's words as split, redirects and wrappers included
 
 
-def command_stages(command: str, cwd: Path, home: Path, depth: int = 0) -> list[Stage] | None:
+def command_stages(
+    command: str,
+    cwd: Path,
+    home: Path,
+    depth: int = 0,
+    initial_cwds: tuple[Path, ...] | None = None,
+    initial_known: bool = True,
+) -> list[Stage] | None:
     """The command's stages in order. Relative paths are checked against the
     session's directory and, after a `cd`/`pushd` or `-C DIR`, that directory
     too: subshells are not tracked, so both stay candidates. `sh -c` strings,
-    `eval` and a heredoc a shell runs are expanded; a heredoc another interpreter
-    runs joins its words as code; any other heredoc is data. None when the command
-    does not parse."""
-    command, bodies = heredoc_bodies(command)
+    `eval`, `$(...)` and backtick command substitutions, and a heredoc a shell
+    runs are expanded; a heredoc another interpreter runs joins its words as code;
+    any other heredoc is data (with command substitutions in unquoted heredocs
+    still walked). None when the command does not parse."""
+    command, bodies = _heredoc_bodies_with_quoting(command)
+    subs_with_offsets, masked_command = _scan_substitutions(command)
     try:
-        raw_stages = split_stages(command, comments=False)
+        raw_stages_with_ends = _split_stages_with_ends(masked_command)
     except ValueError:
         return None
+    subs_by_stage: dict[int, list[str]] = {}
+    if raw_stages_with_ends:
+        for sub_off, sub in subs_with_offsets:
+            idx = next(
+                (i for i, (_r, end_off) in enumerate(raw_stages_with_ends) if end_off > sub_off),
+                len(raw_stages_with_ends) - 1,
+            )
+            subs_by_stage.setdefault(idx, []).append(sub)
     stages: list[Stage] = []
-    current, known = cwd, True
-    for raw in raw_stages:
+    base_cwds = initial_cwds if initial_cwds is not None else (cwd,)
+    current, known = cwd, initial_known
+    for stage_idx, (raw, _end_off) in enumerate(raw_stages_with_ends):
         words, refused = run_words(raw)
         words = without_redirects(words)
         program = os.path.basename(words[0]) if words else ""
-        stage_bodies = [bodies.pop(0) for word in raw if word == HEREDOC_MARKER and bodies]
-        stage_bodies += [raw[k + 1] for k, word in enumerate(raw[:-1]) if word == "<<<"]  # here-strings
+        stage_heredocs = [bodies.pop(0) for word in raw if word == HEREDOC_MARKER and bodies]
+        stage_bodies = [body for body, _unquoted in stage_heredocs]
+        unquoted_bodies = [body for body, unquoted in stage_heredocs if unquoted]
+        here_strings = [raw[k + 1] for k, word in enumerate(raw[:-1]) if word == "<<<"]
+        stage_bodies += here_strings
+        unquoted_bodies += here_strings
+        cwds = [*base_cwds, current]
+        for i, word in enumerate(words[:-1]):
+            if word == "-C":
+                try:
+                    cwds.append(resolve_word(words[i + 1], current, home))
+                except (ValueError, OSError, RuntimeError):
+                    known = False
+        stage_cwds = tuple(dict.fromkeys(cwds))
+        if depth < 3:
+            stage_subs = list(subs_by_stage.get(stage_idx, ()))
+            if not (stage_bodies and program in SHELLS and shell_reads_stdin(words)):
+                for body in unquoted_bodies:
+                    stage_subs.extend(command_substitutions(body))
+            for sub in stage_subs:
+                inner = command_stages(
+                    sub, current, home, depth + 1, initial_cwds=stage_cwds, initial_known=known
+                )
+                if inner is None:
+                    return None
+                stages.extend(inner)
         # A stage expanded into its inner commands still has redirects of its own.
-        redirects_only = Stage([], tuple(dict.fromkeys([cwd, current])), known, refused, " ".join(raw), raw)
+        redirects_only = Stage([], stage_cwds, known, refused, " ".join(raw), raw)
         if stage_bodies and program in SHELLS:
             if shell_reads_stdin(words) and depth < 3:
                 stages.append(redirects_only)
                 for body in stage_bodies:  # the shell runs the body
-                    inner = command_stages(body, current, home, depth + 1)
+                    inner = command_stages(
+                        body, current, home, depth + 1, initial_cwds=stage_cwds, initial_known=known
+                    )
                     if inner is None:
                         return None
                     stages.extend(inner)
@@ -459,25 +565,22 @@ def command_stages(command: str, cwd: Path, home: Path, depth: int = 0) -> list[
         if depth < 3 and program in SHELLS:
             flag = next((i for i, a in enumerate(words[1:-1], 1) if SHELL_STRING_FLAG.match(a)), None)
             if flag is not None:
-                inner = command_stages(words[flag + 1], current, home, depth + 1)
+                inner = command_stages(
+                    words[flag + 1], current, home, depth + 1, initial_cwds=stage_cwds, initial_known=known
+                )
                 if inner is None:
                     return None
                 stages.extend([redirects_only, *inner])
                 continue
         if depth < 3 and program == "eval":
-            inner = command_stages(" ".join(words[1:]), current, home, depth + 1)
+            inner = command_stages(
+                " ".join(words[1:]), current, home, depth + 1, initial_cwds=stage_cwds, initial_known=known
+            )
             if inner is None:
                 return None
             stages.extend([redirects_only, *inner])
             continue
-        cwds = [cwd, current]
-        for i, word in enumerate(words[:-1]):
-            if word == "-C":
-                try:
-                    cwds.append(resolve_word(words[i + 1], current, home))
-                except (ValueError, OSError, RuntimeError):
-                    known = False
-        stages.append(Stage(words, tuple(dict.fromkeys(cwds)), known, refused, " ".join(raw), raw))
+        stages.append(Stage(words, stage_cwds, known, refused, " ".join(raw), raw))
         if program in CWD_CHANGERS:
             target = words[1] if len(words) > 1 else "~"
             if target == "-" or "$" in target or "`" in target:
@@ -487,12 +590,6 @@ def command_stages(command: str, cwd: Path, home: Path, depth: int = 0) -> list[
                     current = resolve_word(target, current, home)
                 except (ValueError, OSError, RuntimeError):
                     known = False
-    if depth < 3:
-        for sub in command_substitutions(command):
-            inner = command_stages(sub, current, home, depth + 1)
-            if inner is None:
-                return None
-            stages.extend(inner)
     return stages
 
 
@@ -1415,14 +1512,22 @@ def inline_code(words: list[str]) -> list[str]:
     program = os.path.basename(words[0]) if words else ""
     if not INTERPRETER.match(program) or program in SHELLS:
         return []
-    code = []
-    for i, arg in enumerate(words[1:], 1):
+    code, i, n = [], 1, len(words)
+    while i < n:
+        arg = words[i]
         if arg == "-":
             return [*code, *words[i + 1:]]
+        if arg in ("-m", "--"):
+            return code
         if arg.startswith(("--eval=", "--print=")):
             code.append(arg.split("=", 1)[1])
-        elif (arg in ("--eval", "--print") or re.fullmatch(r"-[A-Za-z]*[cep]", arg)) and i + 1 < len(words):
+        elif (arg in ("--eval", "--print") or re.fullmatch(r"-[A-Za-z]*[cep]", arg)) and i + 1 < n:
             code.append(words[i + 1])
+            i += 2
+            continue
+        elif not arg.startswith("-") and not code:
+            return []
+        i += 1
     return code
 
 

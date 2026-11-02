@@ -22,6 +22,7 @@ from aegys.guard import (
     guard_enabled,
     pre_invocation_response,
     load_guard_state,
+    read_state_file,
 )
 
 # The checkout root: the tests run from here, so `python -m aegys.guard` imports this package.
@@ -1618,6 +1619,89 @@ class AegysTest(unittest.TestCase):
         )
         self.assertEqual(res_soft2_after_user.get("decision"), "deny", res_soft2_after_user)
         self.assertNotIn("attempt 1 at a goal", res_soft2_after_user.get("reason", ""))
+
+    def test_explicit_user_intent_clears_strike_counter_and_timestamp(self) -> None:
+        cmd = 'd=$(mktemp -d) && git clone . "$d"'
+        res1 = self.evaluate(cmd, last_user_input="Task", classifier_caller=soft_deny_caller)
+        self.assertEqual(res1.get("decision"), "deny", res1)
+        res2 = self.evaluate(cmd, last_user_input="Task", classifier_caller=soft_deny_caller)
+        self.assertEqual(res2.get("decision"), "deny", res2)
+        self.assertIn("attempt 1 at a goal", res2.get("reason", ""))
+        state_before = read_state_file(self.home, "conv-1234")
+        self.assertEqual(state_before.get("strikes"), 1, state_before)
+        self.assertIn("strike_at", state_before)
+
+        def explicit_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": CLASSIFIER_DECISION_TOOL_NAME,
+                        "input": {
+                            "decision": "allow",
+                            "tier": "explicit_intent",
+                            "reason": "Direct user authorization after deny.",
+                        },
+                    }
+                ],
+            }
+
+        res3 = self.evaluate(
+            cmd,
+            last_user_input="I PERMIT THIS ACTION: clone repo into temp folder",
+            classifier_caller=explicit_caller,
+        )
+        self.assertEqual(res3, {"decision": "allow"}, res3)
+        state_after = read_state_file(self.home, "conv-1234")
+        self.assertEqual(state_after.get("strikes"), 0, state_after)
+        self.assertNotIn("strike_at", state_after)
+
+    def test_evasion_deny_repeated_after_new_user_message_is_not_auto_strike(self) -> None:
+        cmd = 'd=$(mktemp -d) && git clone . "$d/evasion-test"'
+
+        def evasion_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": CLASSIFIER_DECISION_TOOL_NAME,
+                        "input": {
+                            "decision": "block",
+                            "tier": "evasion",
+                            "reason": "Circumvents earlier deny.",
+                        },
+                    }
+                ],
+            }
+
+        res1 = self.evaluate(cmd, last_user_input="Task 1: do work", classifier_caller=evasion_caller)
+        self.assertEqual(res1.get("decision"), "deny", res1)
+        self.assertIn("attempt 1 at a goal", res1.get("reason", ""))
+
+        res2 = self.evaluate(
+            cmd,
+            last_user_input="Task 2: try again please",
+            classifier_caller=soft_deny_caller,
+        )
+        self.assertEqual(res2.get("decision"), "deny", res2)
+        self.assertNotIn("attempt 2 at a goal", res2.get("reason", ""))
+        self.assertNotIn("attempt 1 at a goal", res2.get("reason", ""))
 
 
 if __name__ == "__main__":

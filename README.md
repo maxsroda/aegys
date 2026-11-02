@@ -28,7 +28,7 @@
 - Blocks recursive deletes of critical paths, reads of credential files, and writes to *agy*'s and git's control files and to *aegys* itself.
 - Blocks URLs on a deny list and private or cloud-metadata addresses.
 - Asks you before `sudo`, `doas`, and commands on your own ask list.
-- Sends the rest to a classifier model of your choice, which allows or denies. When the agent retries a denied goal by another route, *aegys* denies again and tells it to change course.
+- Sends the rest to a classifier model of your choice, which allows or denies. When the agent retries a denied risky operation by another route without your authorization, *aegys* denies again and tells it to change course.
 - Allows file reads and writes inside your workspace, except config files such as `.git` or `.bashrc`; checks the rest the same way as commands.
 - `/aegys off` hands decisions back to you for one conversation: hard blocks stay, and most commands ask first. `/aegys on` switches the guard back.
 - Reads your own allow/ask/deny lists and settings from `~/.gemini/aegys/config.json` on top of the shipped defaults.

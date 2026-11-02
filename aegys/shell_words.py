@@ -98,7 +98,10 @@ def unwrap(words: list[str]) -> tuple[list[str], str | None]:
             continue
         if words[0] in ("for", "select"):                    # for NAME [in WORDS...]; select NAME [in WORDS...]
             if len(words) >= 3 and words[2] == "in":
-                return ["for", *words[3:]], None
+                return [words[0], *words[3:]], None
+            if len(words) >= 3 and words[2] == "do":         # for NAME do CMD; done
+                del words[:3]
+                continue
             return [], None
         if words[0] == "case":                               # case WORD in ...
             return (["case", words[1]] if len(words) >= 2 else []), None

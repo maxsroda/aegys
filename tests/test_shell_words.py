@@ -67,8 +67,16 @@ class UnwrapTest(unittest.TestCase):
         )
         self.assertEqual(words.unwrap(["for", "f"]), ([], None))
         self.assertEqual(
+            words.unwrap(["for", "f", "do", "rm", "-rf", "~"]),
+            (["rm", "-rf", "~"], None),
+        )
+        self.assertEqual(
             words.unwrap(["select", "opt", "in", "x", "y"]),
-            (["for", "x", "y"], None),
+            (["select", "x", "y"], None),
+        )
+        self.assertEqual(
+            words.unwrap(["select", "opt", "do", "rm", "-rf", "~"]),
+            (["rm", "-rf", "~"], None),
         )
         self.assertEqual(words.unwrap(["case", "$x", "in"]), (["case", "$x"], None))
 

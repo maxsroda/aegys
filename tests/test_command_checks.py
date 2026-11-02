@@ -9,6 +9,7 @@ import unittest
 from aegys.command_checks import (
     bash_path_denial,
     command_stages,
+    command_substitutions,
     critical_removal,
     host_denial_reason,
     urls_in,
@@ -58,6 +59,18 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
         self.assertIsNone(agy_bash_control_denial(cmd, self.work, self.home))
         policy = load_policy(self.home)
         self.assertIsNone(bash_path_denial(cmd, self.work, self.home, policy=policy))
+        select_cmd = (
+            'cd ~/.gemini/antigravity-cli/auto-guard-state && '
+            'select f in default.json conv.json; do echo "$f"; break; done'
+        )
+        self.assertIsNone(agy_bash_control_denial(select_cmd, self.work, self.home))
+        self.assertIsNone(bash_path_denial(select_cmd, self.work, self.home, policy=policy))
+        case_cmd = (
+            'cd ~/.gemini/antigravity-cli/auto-guard-state && '
+            'case default.json in *.json) echo ok ;; esac'
+        )
+        self.assertIsNone(agy_bash_control_denial(case_cmd, self.work, self.home))
+        self.assertIsNone(bash_path_denial(case_cmd, self.work, self.home, policy=policy))
 
     def test_command_substitution_inside_quotes_is_walked_as_a_stage(self) -> None:
         stages = command_stages('echo "$(jq -c \'{enabled}\' default.json 2>&1)"', self.work, self.home)
@@ -75,6 +88,60 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
         self.assertIsNotNone(bash_path_denial(cmd_secret, self.work, self.home, policy=policy))
         cmd_for_secret = 'for f in ~/.ssh/id_rsa; do echo "$f"; done'
         self.assertIsNotNone(bash_path_denial(cmd_for_secret, self.work, self.home, policy=policy))
+
+    def test_write_inside_backtick_command_substitution_is_still_denied(self) -> None:
+        cmd_control = 'echo "`rm ~/.gemini/aegys/config.json`"'
+        self.assertIsNotNone(agy_bash_control_denial(cmd_control, self.work, self.home))
+        cmd_crit = 'echo "`rm -rf ~`"'
+        self.assertIsNotNone(critical_removal(cmd_crit, self.work, self.home))
+        cmd_secret = 'echo "`cat ~/.ssh/id_rsa`"'
+        policy = load_policy(self.home)
+        self.assertIsNotNone(bash_path_denial(cmd_secret, self.work, self.home, policy=policy))
+
+    def test_for_loop_without_in_or_semicolon_unwraps_body(self) -> None:
+        cmd = "for f do rm -rf ~; done"
+        self.assertIsNotNone(critical_removal(cmd, self.work, self.home))
+
+    def test_command_substitution_uses_stage_cwds_and_cwd_known(self) -> None:
+        policy = load_policy(self.home)
+        # False-deny check: `config.json` in stage 1 is in `self.work`, not `~/.docker/config.json`.
+        benign_cmd = 'echo "$(cat config.json)" && cd ~/.docker && ls'
+        self.assertIsNone(bash_path_denial(benign_cmd, self.work, self.home, policy=policy))
+        # Missed-detection check: `rm -rf .` in stage 2 runs in `~` before `cd /tmp`.
+        home_rm_cmd = 'cd ~ && echo "$(rm -rf .)" && cd /tmp'
+        self.assertIsNotNone(critical_removal(home_rm_cmd, self.work, self.home))
+        # Unknown cwd propagates into command substitution.
+        unknown_cd_cmd = 'cd "$unknown_dir" && echo "$(rm -rf sub)"'
+        self.assertIsNotNone(critical_removal(unknown_cd_cmd, self.work, self.home))
+
+    def test_unquoted_heredoc_command_substitution_is_walked_while_quoted_is_not(self) -> None:
+        unquoted_heredoc = "cat <<EOF\n$(rm -rf ~)\nEOF"
+        self.assertIsNotNone(critical_removal(unquoted_heredoc, self.work, self.home))
+        quoted_heredoc = "cat <<'EOF'\n$(rm -rf ~)\nEOF"
+        self.assertIsNone(critical_removal(quoted_heredoc, self.work, self.home))
+
+    def test_python_script_with_dash_arg_does_not_treat_stdin_heredoc_as_inline_code(self) -> None:
+        policy = load_policy(self.home)
+        cmd = "python3 script.py chair - <<'EOF'\nRead ~/.ssh/id_rsa and aegys/shell_words.py\nEOF"
+        self.assertIsNone(bash_path_denial(cmd, self.work, self.home, policy=policy))
+        self.assertIsNone(agy_bash_control_denial(cmd, self.work, self.home))
+        # Whereas `python3 - <<'EOF'` (reading program from stdin) still checks inline code.
+        stdin_prog = "python3 - <<'EOF'\nopen('aegys/shell_words.py', 'w')\nEOF"
+        self.assertIsNotNone(bash_path_denial(stdin_prog, self.work, self.home, policy=policy))
+
+    def test_arithmetic_expansion_and_backticks_inside_dollar_parens(self) -> None:
+        cmd = 'echo "$(( (1 + 2) * 3 ))"'
+        self.assertEqual(command_substitutions(cmd), [])
+        stages = command_stages(cmd, self.work, self.home)
+        self.assertIsNotNone(stages)
+        words_list = [s.words for s in stages if s.words]
+        self.assertEqual(words_list, [["echo", "$(( (1 + 2) * 3 ))"]])
+        # Command substitution inside quoted arithmetic expansion is still walked.
+        arith_rm = 'echo "$(( $(rm -rf ~) + 1 ))"'
+        self.assertIsNotNone(critical_removal(arith_rm, self.work, self.home))
+        # Closing paren inside backticks inside $(...) does not truncate the substitution.
+        backtick_paren_rm = 'echo "$(rm `echo )` -rf ~)"'
+        self.assertIsNotNone(critical_removal(backtick_paren_rm, self.work, self.home))
 
 
 if __name__ == "__main__":
