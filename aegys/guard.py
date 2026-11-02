@@ -9,7 +9,7 @@ classifier. It gates ``run_command``, the file tools (``read_file``,
 Shift+Tab).
 
 ``aegys install`` wires these hooks, agy's permission grants and the status line
-into agy's config (see ``aegys/install.py``).
+into agy's config, and ``aegys uninstall`` removes them (see ``aegys/install.py``).
 
 The user types ``/aegys off`` to switch the guard off for one conversation,
 ``/aegys on`` to switch it back and ``/aegys`` to see its state. agy has no
@@ -380,7 +380,7 @@ def agy_holds_control(path: Path, home: Path) -> bool:
 
 
 def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
-    """Deny writes or redirects to agy or pi control files, and `aegys install`."""
+    """Deny writes or redirects to agy or pi control files, and `aegys install` or `uninstall`."""
     stages = command_stages(command, cwd, home)
     if stages is None:
         return None
@@ -404,9 +404,9 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
                             f"this command redirects output to {path}, which controls "
                             "the coding agents' permissions"
                         )
-        if stage.words[:1] and Path(stage.words[0]).name == "aegys" and stage.words[1:2] == ["install"]:
+        if stage.words[:1] and Path(stage.words[0]).name == "aegys" and stage.words[1:2] in (["install"], ["uninstall"]):
             return (
-                "aegys install rewrites the coding agents' permissions; "
+                f"aegys {stage.words[1]} rewrites the coding agents' permissions; "
                 "only the user runs it, in their own terminal"
             )
         writes = stage.refused or program_writes(stage.words)
@@ -1942,10 +1942,10 @@ def decide_pre_tool_use(
 
 
 def main() -> int:
-    if sys.argv[1:] == ["install"]:
+    if sys.argv[1:] in (["install"], ["uninstall"]):
         from .install import main as install_main
 
-        return install_main()
+        return install_main(sys.argv[1])
     if sys.argv[1:] in (["on"], ["off"]):
         verb = sys.argv[1]
         print(f"aegys switches per agy conversation: type /aegys {verb} in the agy session.")

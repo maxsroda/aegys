@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from aegys.guard import hook_install_problem
-from aegys.install import InstallError, install
+from aegys.install import InstallError, install, uninstall
 
 AEGYS_STATUS_LINE = {
     "type": "command",
@@ -17,7 +17,9 @@ AEGYS_STATUS_LINE = {
 }
 
 
-class InstallTest(unittest.TestCase):
+class AgyHome(unittest.TestCase):
+    """A throwaway home with the aegys launcher in ~/.local/bin."""
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
@@ -39,6 +41,8 @@ class InstallTest(unittest.TestCase):
     def read(self, path: Path) -> dict:
         return json.loads(path.read_text(encoding="utf-8"))
 
+
+class InstallTest(AgyHome):
     def test_fresh_home_gets_a_hook_the_status_line_accepts(self) -> None:
         install(self.home)
         self.assertIsNone(hook_install_problem(self.home))
@@ -106,6 +110,45 @@ class InstallTest(unittest.TestCase):
         install(self.home)
         leftovers = [p.name for p in self.settings.parent.iterdir() if p.name.endswith(".tmp")]
         self.assertEqual(leftovers, [])
+
+
+class UninstallTest(AgyHome):
+    def test_uninstall_removes_what_install_added_and_keeps_the_rest(self) -> None:
+        self.write(self.hooks, {"lint": {"PostToolUse": []}})
+        self.write(self.settings, {"theme": "light", "permissions": {"allow": ["command(ls)"]}})
+        install(self.home)
+        uninstall(self.home)
+        self.assertEqual(self.read(self.hooks), {"lint": {"PostToolUse": []}})
+        self.assertEqual(
+            self.read(self.settings), {"theme": "light", "permissions": {"allow": ["command(ls)"]}}
+        )
+
+    def test_another_status_line_is_kept(self) -> None:
+        own = {"type": "command", "command": "my-status", "enabled": True}
+        self.write(self.settings, {"statusLine": own})
+        install(self.home)
+        uninstall(self.home)
+        self.assertEqual(self.read(self.settings)["statusLine"], own)
+
+    def test_uninstall_works_without_the_launcher(self) -> None:
+        install(self.home)
+        self.launcher.unlink()
+        uninstall(self.home)
+        self.assertNotIn("aegys", self.read(self.hooks))
+
+    def test_uninstall_on_a_home_without_aegys_changes_nothing(self) -> None:
+        notes = uninstall(self.home)
+        self.assertFalse(self.hooks.exists())
+        self.assertFalse(self.settings.exists())
+        self.assertTrue(any("nothing changed" in note for note in notes))
+
+    def test_a_file_that_does_not_parse_stops_the_uninstall_before_any_write(self) -> None:
+        install(self.home)
+        hooks_before = self.hooks.read_text()
+        self.write(self.settings, "{not json")
+        with self.assertRaises(InstallError):
+            uninstall(self.home)
+        self.assertEqual(self.hooks.read_text(), hooks_before)
 
 
 if __name__ == "__main__":
