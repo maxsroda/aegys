@@ -66,8 +66,12 @@ For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
 4. **Classifier:** the verdict rules of 5, with the file action as input.
 
 For ``list_directory``, ``grep_search`` and ``find``: deny when a path argument
-is a credential path or, for the two recursive searches, lies above one;
-otherwise allow.
+is a credential path or, for the two recursive searches, lies above one, or, for
+``grep_search``, has a secret file (a project's ``.env``) or a repository's
+``.git/config`` below it; otherwise allow. A tree of more than 5,000 entries cannot
+be checked in full: ``grep_search`` of it goes to the classifier, and so does a
+shell command with a recursive search (``grep -r``, ``rg --hidden``, ``diff -r``,
+``git diff --no-index``) of it, which is not fast-allowed.
 
 The lists in items 1 to 4 and the secret paths come from the shipped
 ``aegys/data/default-config.json``, merged with the user's
@@ -124,6 +128,7 @@ from .command_checks import (
     expand_home,
     expand_word,
     gh_shows_token,
+    git_add_forces,
     git_settings_match,
     host_denial_reason,
     inline_code,
@@ -135,6 +140,9 @@ from .command_checks import (
     redirect_targets,
     resolve_word,
     secret,
+    Search,
+    recursive_search_reach,
+    secret_area_below,
     secret_below,
     sed_writes,
     stage_paths,
@@ -631,6 +639,10 @@ def stage_matches_allow_patterns(
     if len(redirects) > 1:
         return False
     if stage_touches_protected_path(stage, home):
+        return False
+    # `git add -f` stages a file the repository ignores (a .env), and `git diff --cached`
+    # then prints it: the classifier judges it.
+    if git_add_forces(stage.words):
         return False
     # A repository's .git/config holds its remote URLs, which may embed a credential:
     # reading it takes a classifier check (writing it already does, as a protected path).
@@ -1826,21 +1838,39 @@ def path_arguments(args: dict[str, Any], cwd: Path) -> list[Path]:
 
 def evaluate_search_access(
     tool_name: str, args: dict[str, Any], payload: dict[str, Any], cwd: Path, home: Path,
-    policy: Policy | None,
+    policy: Policy | None, classifier_caller: ClassifierCaller | None = None,
 ) -> dict[str, Any]:
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     conversation_id = extract_conversation_id(payload)
+    # The tool's search is read as a recursive one that follows links and skips nothing.
+    search = Search([], skips_hidden=False, follows_symlinks=True)
+    unchecked = False
     for path in path_arguments(args, cwd):
         area = path if secret(path, policy.secret_paths) else None
         if area is None and tool_name in RECURSIVE_SEARCH_TOOL_NAMES:
-            area = secret_below(path, home, skips_hidden=False, secret_paths=policy.secret_paths)
+            area = secret_area_below(path, home, False, policy.secret_paths)
+        if area is None and tool_name == "grep_search":  # `find` lists names, not contents
+            reach = secret_below(path, home, search, policy.secret_paths)
+            area = reach.secret
+            unchecked |= not reach.complete
         if area is not None:
             return escalated_deny(
                 home, conversation_id, f"{tool_name} {path}",
                 f"Blocked by {GUARD_NAME}: {tool_name} of {path} reaches credentials in {area}.",
                 user_turn=user_turn_digest(payload),
             )
+    if unchecked:  # a tree too large to check in full: the classifier judges the search
+        if not guard_enabled(home, conversation_id):
+            return {
+                "decision": "force_ask",
+                "reason": f"aegys is off for this conversation; {tool_name} of a large tree "
+                          "requires confirmation.",
+            }
+        return classifier_decision(
+            safe_json({"toolName": tool_name, "input": args}), payload, home, conversation_id,
+            [str(p) for p in payload.get("workspacePaths") or []], classifier_caller,
+        )
     record_guard_decision(home, conversation_id, allowed=True)
     return {"decision": "allow"}
 
@@ -1945,7 +1975,9 @@ def decide_pre_tool_use(
             tool_name, tool_args, payload, cwd_path, home_path, classifier_caller, policy
         )
     if tool_name in SEARCH_TOOL_NAMES:
-        return evaluate_search_access(tool_name, tool_args, payload, cwd_path, home_path, policy)
+        return evaluate_search_access(
+            tool_name, tool_args, payload, cwd_path, home_path, policy, classifier_caller
+        )
     if tool_name != "run_command":
         return {"decision": "allow"}
 
@@ -2003,6 +2035,10 @@ def decide_pre_tool_use(
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home_path)}
 
+    search_denial, search_unchecked = recursive_search_reach(stages, home_path, policy.secret_paths)
+    if search_denial:
+        return deny(f"Blocked by {GUARD_NAME}: {search_denial}.")
+
     stage_candidates = [command.strip()]
     for st in stages:
         if st.text.strip():
@@ -2041,7 +2077,9 @@ def decide_pre_tool_use(
     # added only while the status line last reported this conversation's sandbox on.
     sandbox_on = read_state_file(home_path, conv_id).get("sandbox_on") is True
     overwrite = {"overwrite": {"BypassSandbox": True}} if sandbox_on and not bypass_sandbox else {}
-    if command_fast_allowed(command, stages, list(policy.shell_allow), home_path):
+    if not search_unchecked and command_fast_allowed(
+        command, stages, list(policy.shell_allow), home_path
+    ):
         record_guard_decision(home_path, conv_id, allowed=True)
         return {"decision": "allow", **overwrite}
 

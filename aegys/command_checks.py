@@ -866,6 +866,14 @@ def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
                for pattern in secret_paths for name in names)
 
 
+def git_add_forces(words: list[str]) -> bool:
+    """True for `git add` with -f or --force (also among combined short flags)."""
+    if not words or os.path.basename(words[0]) != "git" or "add" not in words[1:]:
+        return False
+    return any(word == "--force" or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", word)
+               for word in words[words.index("add") + 1:])
+
+
 GH_TOKEN_FLAG = re.compile(r"^(?:--show-token(?:=.*)?|-[A-Za-z]*t[A-Za-z]*(?:=.*)?)$")
 
 
@@ -908,20 +916,110 @@ GREP_VALUE_OPTIONS = {
 }
 
 
-def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
+@dataclass(frozen=True)
+class Search:
+    """A stage that reads every file below the paths it names."""
+
+    starts: list[str]           # the paths it starts from (default `.`)
+    skips_hidden: bool          # skips hidden files and directories, as rg does without --hidden
+    follows_symlinks: bool      # follows a link met below a start (grep -R, rg -L), not just one named
+    excluded_files: tuple[str, ...] = ()   # glob patterns of file names it skips
+    excluded_dirs: tuple[str, ...] = ()    # glob patterns of directory names it skips
+    exclusion_words: frozenset[int] = frozenset()  # indexes in the stage's words of the exclusions
+
+
+# Options of diff that take a separate value, then neither an operand nor a path.
+DIFF_VALUE_LETTERS = "xXIFLUCSWD"
+DIFF_VALUE_LONG_OPTIONS = {"--exclude", "--exclude-from", "--ignore-matching-lines", "--label",
+                           "--starting-file", "--width", "--ifdef", "--show-function-line"}
+
+
+def diff_search(words: list[str]) -> Search | None:
+    """`diff -r A B` and `diff --recursive A B` read every file below A and B, and so
+    does `git diff --no-index A B`. None for any other diff."""
+    program = os.path.basename(words[0])
+    args = words[1:]
+    if program == "git":
+        subcommand = None
+        skip = False
+        for index, arg in enumerate(args):
+            if skip:
+                skip = False
+            elif arg in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+                skip = True
+            elif not arg.startswith("-"):
+                subcommand = index
+                break
+        if subcommand is None or args[subcommand] != "diff" or "--no-index" not in args[subcommand:]:
+            return None
+        operands = [arg for arg in args[subcommand + 1:] if not arg.startswith("-") or arg == "-"]
+        return Search(operands or ["."], skips_hidden=False, follows_symlinks=True)
+    recursive, excluded, positions, operands, i = False, [], set(), [], 0
+    while i < len(args):
+        first, arg, i = i + 1, args[i], i + 1  # `first` indexes arg in `words`
+        if arg == "--":
+            operands += args[i:]
+            break
+        if arg.startswith("--"):
+            name, separator, value = arg.partition("=")
+            if name in DIFF_VALUE_LONG_OPTIONS and not separator:
+                value, i = (args[i] if i < len(args) else ""), i + 1
+            recursive |= name == "--recursive"
+            if name == "--exclude":
+                excluded.append(value)
+                positions.update(range(first, i + 1))
+        elif arg.startswith("-") and len(arg) > 1:
+            for j, letter in enumerate(arg[1:]):
+                recursive |= letter in "rR"
+                if letter in DIFF_VALUE_LETTERS:
+                    value = arg[j + 2:]
+                    if not value:
+                        value, i = (args[i] if i < len(args) else ""), i + 1
+                    if letter == "x":
+                        excluded.append(value)
+                        positions.update(range(first, i + 1))
+                    break
+        else:
+            operands.append(arg)
+    if not recursive:
+        return None
+    return Search(operands or ["."], skips_hidden=False, follows_symlinks=True,
+                  excluded_files=tuple(excluded), excluded_dirs=tuple(excluded),
+                  exclusion_words=frozenset(positions))
+
+
+def rg_glob_exclusion(value: str) -> str | None:
+    """The name pattern an rg glob `!NAME` or `!**/NAME` excludes; None for any other glob."""
+    if not value.startswith("!"):
+        return None
+    name = value[1:]
+    while name.startswith("**/"):
+        name = name[3:]
+    return name if name and "/" not in name else None
+
+
+def search_starts(words: list[str]) -> Search | None:
     """Where a recursive search starts (rg, or grep with -r, -R, --recursive or
-    -d recurse; default `.`), and whether it skips hidden files and directories,
-    as rg does without --hidden or -uu. None for any other stage."""
-    if not words or os.path.basename(words[0]) not in RECURSIVE_SEARCHERS:
+    -d recurse, or a recursive diff; default `.`), whether it skips hidden files and
+    directories, as rg does without --hidden or -uu, whether it follows symbolic
+    links (grep -R, rg -L), and the names it excludes. None for any other stage."""
+    if not words:
+        return None
+    if os.path.basename(words[0]) in ("diff", "git"):
+        return diff_search(words)
+    if os.path.basename(words[0]) not in RECURSIVE_SEARCHERS:
         return None
     rg = os.path.basename(words[0]) == "rg"
     if rg and "--files" in words:
         return None  # lists file names, reads no contents
     values = RG_VALUE_OPTIONS if rg else GREP_VALUE_OPTIONS
-    recursive, hidden, unrestricted, pattern_given = rg, False, 0, False
+    recursive, hidden, unrestricted, pattern_given, follows = rg, False, 0, False, False
+    excluded_files: list[str] = []
+    excluded_dirs: list[str] = []
+    positions: set[int] = set()
     operands, args, i = [], words[1:], 0
     while i < len(args):
-        arg, i = args[i], i + 1
+        first, arg, i = i + 1, args[i], i + 1  # `first` indexes arg in `words`
         if arg == "--":
             operands += args[i:]
             break
@@ -932,22 +1030,39 @@ def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
             pattern_given |= name in ("--regexp", "--file")
             hidden |= name == "--hidden"
             unrestricted += name == "--unrestricted"
+            follows |= name in ("--dereference-recursive", "--follow")
             recursive |= name in ("--recursive", "--dereference-recursive") or (
                 name == "--directories" and value == "recurse")
+            if name == "--exclude":
+                excluded_files.append(value)
+                positions.update(range(first, i + 1))
+            elif name == "--exclude-dir":
+                excluded_dirs.append(value)
+                positions.update(range(first, i + 1))
+            elif name == "--glob" and rg_glob_exclusion(value):
+                excluded_files.append(rg_glob_exclusion(value))
+                excluded_dirs.append(rg_glob_exclusion(value))
+                positions.update(range(first, i + 1))
             continue
         if arg.startswith("-") and len(arg) > 1:
             for j, letter in enumerate(arg[1:]):
                 if rg:
                     hidden |= letter == "."
                     unrestricted += letter == "u"
+                    follows |= letter == "L"
                 else:
                     recursive |= letter in "rR"
+                    follows |= letter == "R"
                 if f"-{letter}" in values:
                     value = arg[j + 2:]
                     if not value:
                         value, i = (args[i] if i < len(args) else ""), i + 1
                     pattern_given |= letter in "ef"
                     recursive |= not rg and letter == "d" and value == "recurse"
+                    if rg and letter == "g" and rg_glob_exclusion(value):
+                        excluded_files.append(rg_glob_exclusion(value))
+                        excluded_dirs.append(rg_glob_exclusion(value))
+                        positions.update(range(first, i + 1))
                     break
             continue
         operands.append(arg)
@@ -957,14 +1072,24 @@ def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
         operands = operands[1:]
     # A ripgrep config file can turn --hidden on for every search.
     configured = bool(os.environ.get("RIPGREP_CONFIG_PATH")) and "--no-config" not in args
-    return operands or ["."], rg and not hidden and unrestricted < 2 and not configured
+    return Search(operands or ["."], rg and not hidden and unrestricted < 2 and not configured,
+                  follows, tuple(excluded_files), tuple(excluded_dirs), frozenset(positions))
 
 
-def secret_below(start: Path, home: Path, skips_hidden: bool,
-                 secret_paths: tuple[str, ...]) -> Path | None:
-    """The first secret area a recursive search from start reads: one start is
-    inside, or one below start, reached unless the search skips hidden entries
-    and the way down passes one."""
+@dataclass(frozen=True)
+class SecretReach:
+    """What a recursive search reaches: the first secret file or area it would read,
+    and whether the tree was small enough to check in full."""
+
+    secret: Path | None
+    complete: bool = True
+
+
+def secret_area_below(start: Path, home: Path, skips_hidden: bool,
+                      secret_paths: tuple[str, ...]) -> Path | None:
+    """The first secret area (a directory such as `~/.ssh`) a recursive search from
+    start reads: one start is inside, or one below start, reached unless the search
+    skips hidden entries and the way down passes one."""
     for name in secret_areas(secret_paths):
         area = Path(os.path.realpath(home / name))
         if inside(start, area):
@@ -973,43 +1098,114 @@ def secret_below(start: Path, home: Path, skips_hidden: bool,
             below = area.relative_to(start).parts
             if not (skips_hidden and any(part.startswith(".") for part in below)):
                 return area
-    return secret_file_below(start, skips_hidden, secret_paths)
+    return None
 
 
-# A search reads at most this many entries of a tree when looking for secret files.
-SECRET_SEARCH_ENTRY_LIMIT = 50_000
+def secret_below(start: Path, home: Path, search: Search,
+                 secret_paths: tuple[str, ...]) -> SecretReach:
+    """The first secret area or file a recursive search from start reads."""
+    area = secret_area_below(start, home, search.skips_hidden, secret_paths)
+    return SecretReach(area) if area is not None else secret_file_below(start, search, secret_paths)
 
 
-def secret_file_below(start: Path, skips_hidden: bool,
-                      secret_paths: tuple[str, ...]) -> Path | None:
-    """The first secret file or directory below start (a project's `.env`), read
-    breadth-first so shallow ones come first, or None. A search that skips hidden
-    entries does not enter or read them. A tree with more than
-    SECRET_SEARCH_ENTRY_LIMIT entries is checked only up to that many."""
-    if not secret_paths:
-        return None
-    # One pattern for all globs, as `secret` reads them; a directory a glob matches
-    # is returned when reached, so each path is checked on its own.
-    secret_name = re.compile("|".join(fnmatch.translate(pattern.lower()) for pattern in secret_paths))
-    queue = collections.deque([start])
-    seen = 0
-    while queue:
+# A search reads at most this many entries of a tree when looking for secret files;
+# a larger tree goes to the classifier.
+SECRET_SEARCH_ENTRY_LIMIT = 5_000
+# Files a recursive search reads that are no secret path for the file tools: a
+# repository's remote URLs may embed a credential.
+SEARCHED_SECRET_PATTERNS = ("*/.git/config",)
+# Files in which rg reads a `!` line as a reason to search a hidden file it names.
+IGNORE_FILE_NAMES = (".rgignore", ".ignore", ".gitignore")
+
+
+def ignore_file_whitelists(directory: Path) -> bool:
+    """Whether an ignore file in directory has a `!` line."""
+    for name in IGNORE_FILE_NAMES:
         try:
-            entries = list(os.scandir(queue.popleft()))
+            with open(directory / name, encoding="utf-8", errors="replace") as handle:
+                if any(line.startswith("!") for line in handle.read(65536).splitlines()):
+                    return True
         except OSError:
             continue
+    return False
+
+
+def secret_file_below(start: Path, search: Search,
+                      secret_paths: tuple[str, ...]) -> SecretReach:
+    """The first secret file or directory below start (a project's `.env`), read
+    breadth-first so shallow ones come first. A search that skips hidden entries
+    does not read them, unless an ignore file whitelists a hidden file in or above
+    the directory; one that follows links reads what they lead to, once each; a name
+    the search excludes is not read. A tree with more than SECRET_SEARCH_ENTRY_LIMIT
+    entries is not complete."""
+    patterns = (*secret_paths, *SEARCHED_SECRET_PATTERNS)
+    # One pattern for all globs, as `secret` reads them; a directory a glob matches
+    # is returned when reached, so each path is checked on its own.
+    secret_name = re.compile("|".join(fnmatch.translate(pattern.lower()) for pattern in patterns))
+    hidden_read = not search.skips_hidden or any(
+        ignore_file_whitelists(directory) for directory in (start, *start.parents))
+    visited = {os.path.realpath(start)}
+    queue = collections.deque([(start, hidden_read)])
+    seen = 0
+    while queue:
+        directory, hidden_read = queue.popleft()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        hidden_read = hidden_read or ignore_file_whitelists(directory)
         for entry in entries:
-            if skips_hidden and entry.name.startswith("."):
+            name = entry.name
+            if not hidden_read and name.startswith("."):
                 continue
-            path = Path(entry.path)
-            if secret_name.match(entry.path.lower()):
-                return path
+            is_directory = entry.is_dir(follow_symlinks=search.follows_symlinks)
+            excluded = search.excluded_dirs if is_directory else search.excluded_files
+            if any(fnmatch.fnmatchcase(name, pattern) for pattern in excluded):
+                continue
+            names = [entry.path]
+            if search.follows_symlinks and entry.is_symlink():
+                names.append(os.path.realpath(entry.path))
+            if any(secret_name.match(candidate.lower()) for candidate in names):
+                return SecretReach(Path(entry.path))
             seen += 1
             if seen > SECRET_SEARCH_ENTRY_LIMIT:
-                return None
-            if entry.is_dir(follow_symlinks=False):
-                queue.append(path)
-    return None
+                return SecretReach(None, complete=False)
+            if is_directory:
+                real = os.path.realpath(entry.path) if search.follows_symlinks else entry.path
+                if real not in visited:
+                    visited.add(real)
+                    queue.append((Path(entry.path), hidden_read))
+    return SecretReach(None)
+
+
+def recursive_search_reach(stages: list[Stage], home: Path,
+                           secret_paths: tuple[str, ...]) -> tuple[str | None, bool]:
+    """`(denial, unchecked)` for a command's stages: the reason when a recursive
+    search would read a secret file, and whether some search covers a tree too large
+    to check in full, which the classifier must judge."""
+    unchecked = False
+    for stage in stages:
+        search = search_starts(stage.words)
+        if search is None:
+            continue
+        for start in stage_paths(stage, home, search.starts):
+            reach = secret_below(start, home, search, secret_paths)
+            if reach.secret is not None:
+                return search_denial(start, reach.secret), unchecked
+            unchecked |= not reach.complete
+    return None, unchecked
+
+
+def search_denial(start: Path, reached: Path) -> str:
+    """Why a recursive search from start is denied, and how to rerun it without the
+    secret it would read."""
+    excluded = ".git" if reached.parts[-2:] == (".git", "config") else reached.name
+    grep_flag = f"--exclude-dir={excluded}" if excluded == ".git" or reached.is_dir() \
+        else f"--exclude={excluded}"
+    return (f"a recursive search from {start} would read {reached}, which holds keys, "
+            "credentials or session transcripts. Rerun it without that: "
+            f"grep {grep_flag}, rg -g '!{excluded}', diff -x {excluded}; or search a "
+            "directory that does not contain it")
 
 
 # Programs that only read the files they name. A stage whose program is not here
@@ -1768,18 +1964,13 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
     # before the command, so nothing here is allowed on that account.
     secret_paths = policy.secret_paths if policy is not None else None
     for index, stage in enumerate(stages):
-        for path in stage_paths(stage, home):
+        searched = search_starts(stage.words)
+        # The names a search excludes (`--exclude=.env`) are patterns, not paths it reads.
+        named = [word for position, word in enumerate(stage.words)
+                 if searched is None or position not in searched.exclusion_words]
+        for path in stage_paths(stage, home, named):
             if secret_paths is not None and secret(path, secret_paths):
                 return f"{path} holds keys or credentials, which no tool may read or write"
-        searched = search_starts(stage.words)
-        if searched is not None and secret_paths is not None:
-            starts, skips_hidden = searched
-            for start in stage_paths(stage, home, starts):
-                reached = secret_below(start, home, skips_hidden, secret_paths)
-                if reached is not None:
-                    return (f"a recursive search from {start} would read {reached}, which holds "
-                            "keys, credentials or session transcripts. Search a directory that "
-                            "does not contain it")
         outputs = redirect_targets(stage.raw)
         for target in [*outputs, *input_targets(stage.raw)]:
             for directory in stage.cwds:
