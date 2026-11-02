@@ -8,6 +8,9 @@ classifier. It gates ``run_command``, the file tools (``read_file``,
 (``list_directory``, ``grep_search``, ``find``) in every session and does not read agy's mode (Auto,
 Shift+Tab).
 
+``aegys install`` wires these hooks, agy's permission grants and the status line
+into agy's config (see ``aegys/install.py``).
+
 The user types ``/aegys off`` to switch the guard off for one conversation,
 ``/aegys on`` to switch it back and ``/aegys`` to see its state. agy has no
 custom slash commands, so ``--pre-invocation`` (a ``PreInvocation`` hook) reads
@@ -377,7 +380,7 @@ def agy_holds_control(path: Path, home: Path) -> bool:
 
 
 def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
-    """Deny writes or redirects to agy or pi control files."""
+    """Deny writes or redirects to agy or pi control files, and `aegys install`."""
     stages = command_stages(command, cwd, home)
     if stages is None:
         return None
@@ -401,6 +404,11 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
                             f"this command redirects output to {path}, which controls "
                             "the coding agents' permissions"
                         )
+        if stage.words[:1] and Path(stage.words[0]).name == "aegys" and stage.words[1:2] == ["install"]:
+            return (
+                "aegys install rewrites the coding agents' permissions; "
+                "only the user runs it, in their own terminal"
+            )
         writes = stage.refused or program_writes(stage.words)
         if not writes:
             continue
@@ -1934,6 +1942,10 @@ def decide_pre_tool_use(
 
 
 def main() -> int:
+    if sys.argv[1:] == ["install"]:
+        from .install import main as install_main
+
+        return install_main()
     if sys.argv[1:] in (["on"], ["off"]):
         verb = sys.argv[1]
         print(f"aegys switches per agy conversation: type /aegys {verb} in the agy session.")

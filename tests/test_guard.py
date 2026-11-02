@@ -271,6 +271,9 @@ class AegysTest(unittest.TestCase):
             ("echo hacked > ~/.gemini/antigravity-cli/settings.json", "controls the coding agents' permissions"),
             ("echo hacked > ~/.gemini/aegys/config.json", "controls the coding agents' permissions"),
             ("echo hacked > ~/.pi/agent/settings.json", "controls the coding agents' permissions"),
+            ("aegys install", "aegys install rewrites"),
+            ("~/.local/bin/aegys install", "aegys install rewrites"),
+            ("cd /tmp && aegys install", "aegys install rewrites"),
         ):
             res = self.evaluate(cmd)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))

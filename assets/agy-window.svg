@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 340" width="960" height="340" role="img" aria-label="agy in a terminal window, with the aegys status chip under the prompt">
+<defs>
+<linearGradient id="desk" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7f9cf5"/><stop offset="0.5" stop-color="#b38bd9"/><stop offset="1" stop-color="#f4a6a0"/></linearGradient>
+<filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feGaussianBlur stdDeviation="12"/></filter>
+<clipPath id="win"><rect x="160" y="34" width="760" height="262" rx="10"/></clipPath>
+</defs>
+<rect width="960" height="340" rx="14" fill="url(#desk)"/>
+<rect x="160" y="44" width="760" height="262" rx="10" fill="#1a1440" fill-opacity="0.35" filter="url(#shadow)"/>
+<rect x="160" y="34" width="760" height="262" rx="10" fill="#ffffff"/>
+<g clip-path="url(#win)"><rect x="160" y="34" width="760" height="30" fill="#ececee"/><line x1="160" y1="64" x2="920" y2="64" stroke="#d6d6d9"/></g>
+<circle cx="178" cy="49.0" r="6" fill="#ff5f57"/>
+<circle cx="198" cy="49.0" r="6" fill="#febc2e"/>
+<circle cx="218" cy="49.0" r="6" fill="#28c840"/>
+<text x="540.0" y="53.5" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#6e6e73">agy — ~/projects/aegys</text>
+<rect x="221" y="82" width="7" height="7" fill="#e69743"/>
+<rect x="228" y="82" width="7" height="7" fill="#e27a44"/>
+<rect x="214" y="89" width="7" height="7" fill="#d6b24a"/>
+<rect x="221" y="89" width="7" height="7" fill="#ea9643"/>
+<rect x="228" y="89" width="7" height="7" fill="#e57b45"/>
+<rect x="235" y="89" width="7" height="7" fill="#e06444"/>
+<rect x="207" y="96" width="7" height="7" fill="#a6c158"/>
+<rect x="214" y="96" width="7" height="7" fill="#b6b351"/>
+<rect x="221" y="96" width="7" height="7" fill="#d99c4d"/>
+<rect x="228" y="96" width="7" height="7" fill="#e88244"/>
+<rect x="235" y="96" width="7" height="7" fill="#e87442"/>
+<rect x="242" y="96" width="7" height="7" fill="#df614a"/>
+<rect x="207" y="103" width="7" height="7" fill="#94c35e"/>
+<rect x="214" y="103" width="7" height="7" fill="#83b268"/>
+<rect x="221" y="103" width="7" height="7" fill="#c59758"/>
+<rect x="228" y="103" width="7" height="7" fill="#e18051"/>
+<rect x="235" y="103" width="7" height="7" fill="#d36e58"/>
+<rect x="242" y="103" width="7" height="7" fill="#d25b5c"/>
+<rect x="200" y="110" width="7" height="7" fill="#8cbf60"/>
+<rect x="207" y="110" width="7" height="7" fill="#84bf68"/>
+<rect x="214" y="110" width="7" height="7" fill="#6ea791"/>
+<rect x="221" y="110" width="7" height="7" fill="#6790b0"/>
+<rect x="228" y="110" width="7" height="7" fill="#8075ac"/>
+<rect x="235" y="110" width="7" height="7" fill="#7271be"/>
+<rect x="242" y="110" width="7" height="7" fill="#9162a4"/>
+<rect x="249" y="110" width="7" height="7" fill="#946094"/>
+<rect x="200" y="117" width="7" height="7" fill="#90c363"/>
+<rect x="207" y="117" width="7" height="7" fill="#6eb586"/>
+<rect x="214" y="117" width="7" height="7" fill="#5596d9"/>
+<rect x="235" y="117" width="7" height="7" fill="#537fde"/>
+<rect x="242" y="117" width="7" height="7" fill="#6f70c9"/>
+<rect x="249" y="117" width="7" height="7" fill="#8968b0"/>
+<rect x="200" y="124" width="7" height="7" fill="#7ac083"/>
+<rect x="207" y="124" width="7" height="7" fill="#60acab"/>
+<rect x="242" y="124" width="7" height="7" fill="#5481e4"/>
+<rect x="249" y="124" width="7" height="7" fill="#6c75d2"/>
+<rect x="193" y="131" width="7" height="7" fill="#82c398"/>
+<rect x="200" y="131" width="7" height="7" fill="#76b8d3"/>
+<rect x="207" y="131" width="7" height="7" fill="#5fa7d8"/>
+<rect x="242" y="131" width="7" height="7" fill="#4d89f4"/>
+<rect x="249" y="131" width="7" height="7" fill="#5482e9"/>
+<rect x="256" y="131" width="7" height="7" fill="#677bdb"/>
+<rect x="193" y="138" width="7" height="7" fill="#81c4a6"/>
+<rect x="200" y="138" width="7" height="7" fill="#76b5f1"/>
+<rect x="249" y="138" width="7" height="7" fill="#4987f4"/>
+<rect x="256" y="138" width="7" height="7" fill="#5282ed"/>
+<rect x="186" y="145" width="7" height="7" fill="#79b8f0"/>
+<rect x="193" y="145" width="7" height="7" fill="#76b5f1"/>
+<rect x="256" y="145" width="7" height="7" fill="#4884f2"/>
+<rect x="263" y="145" width="7" height="7" fill="#4c86f5"/>
+<text x="298" y="93" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="bold" fill="#406bc0" text-anchor="start" xml:space="preserve">Antigravity CLI 1.4.12</text>
+<text x="298" y="112" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#606368" text-anchor="start" xml:space="preserve">you@example.com (Google AI Pro)</text>
+<text x="298" y="131" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#606368" text-anchor="start" xml:space="preserve">Gemini 3.8 Flash (Medium)</text>
+<text x="298" y="150" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#606368" text-anchor="start" xml:space="preserve">~/projects/aegys</text>
+<line x1="182" y1="174" x2="898" y2="174" stroke="#dbdce0" stroke-width="1.5"/>
+<text x="182" y="200" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" xml:space="preserve"><tspan fill="#406bc0">&gt;</tspan><tspan fill="#606368"> Accept-edits mode: file edits auto-approved (shift+tab to cycle)</tspan></text>
+<line x1="182" y1="216" x2="898" y2="216" stroke="#dbdce0" stroke-width="1.5"/>
+<text x="182" y="240" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#606368" text-anchor="start" xml:space="preserve">? for shortcuts</text>
+<text x="898" y="240" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" text-anchor="end" xml:space="preserve"><tspan fill="#3c7d40">accept-edits</tspan><tspan fill="#606368"> · Gemini 3.8 Flash · medium</tspan></text>
+<text x="182" y="259" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="normal" fill="#235faa" text-anchor="start" xml:space="preserve">aegys ● a:0 d:0</text>
+<svg x="28" y="200.5" width="96" height="96" viewBox="0 0 64 64">
+
+<defs>
+  <clipPath id="logo-shield"><path d="M32 4.5 C40 8 47 9.5 54 9.5 V30 C54 44.5 44.5 54.5 32 60 C19.5 54.5 10 44.5 10 30 V9.5 C17 9.5 24 8 32 4.5 Z"/></clipPath>
+  <filter id="logo-aurora" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"/></filter>
+  <filter id="logo-drop" x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1.6"/><feOffset dy="1.6" result="b"/>
+    <feFlood flood-color="#1a237e" flood-opacity="0.35"/><feComposite in2="b" operator="in"/>
+    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="logo-twinkle" x="-100%" y="-100%" width="300%" height="300%">
+    <feGaussianBlur stdDeviation="0.8" result="g"/>
+    <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <linearGradient id="logo-edge" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#fff" stop-opacity="0.9"/><stop offset="1" stop-color="#fff" stop-opacity="0.25"/>
+  </linearGradient>
+  <linearGradient id="logo-sheen" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#fff" stop-opacity="0.3"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+  </linearGradient>
+</defs>
+<!-- aurora body -->
+<g filter="url(#logo-drop)">
+  <g clip-path="url(#logo-shield)">
+    <linearGradient id="logo-fill" x1="0.15" y1="0" x2="0.85" y2="1"><stop offset="0" stop-color="#FFE432"/><stop offset="0.3" stop-color="#FC413D"/><stop offset="0.65" stop-color="#3186FF"/><stop offset="1" stop-color="#00B95C"/></linearGradient>
+    <rect width="64" height="64" fill="url(#logo-fill)"/>
+    <!-- facets: left half in shade, right half lit, ridge down the middle -->
+    <path d="M0 0 H32 V64 H0 Z" fill="#000" fill-opacity="0.14"/>
+    <path d="M32 0 H64 V64 H32 Z" fill="#fff" fill-opacity="0.10"/>
+    <path d="M32 4.5 V60" stroke="#fff" stroke-opacity="0.35" stroke-width="0.6"/>
+    <path d="M0 0 H64 V18 C44 24 20 24 0 18 Z" fill="url(#logo-sheen)"/>
+  </g>
+</g>
+<path d="M32 4.5 C40 8 47 9.5 54 9.5 V30 C54 44.5 44.5 54.5 32 60 C19.5 54.5 10 44.5 10 30 V9.5 C17 9.5 24 8 32 4.5 Z" fill="none" stroke="url(#logo-edge)" stroke-width="1.2"/>
+<!-- bevelled chevron -->
+<path d="M19 24 L32 37 V45.5 L19 32.5 Z" fill="#E4EAFF"/>
+<path d="M45 24 L32 37 V45.5 L45 32.5 Z" fill="#fff"/>
+<!-- spark -->
+<path d="M0 -5 C0.6 -1.2 1.2 -0.6 5 0 C1.2 0.6 0.6 1.2 0 5 C-0.6 1.2 -1.2 0.6 -5 0 C-1.2 -0.6 -0.6 -1.2 0 -5 Z" fill="#fff" filter="url(#logo-twinkle)" transform="translate(44.5 15.5) scale(0.95)"/>
+</svg>
+<defs><marker id="head" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="4" markerHeight="4" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="#235faa"/></marker></defs>
+<path d="M110 270.5 C 140 272.5, 147 256.5, 173 254.5" fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+<path d="M110 270.5 C 140 272.5, 147 256.5, 173 254.5" fill="none" stroke="#235faa" stroke-width="2.5" stroke-linecap="round" marker-end="url(#head)"/>
+</svg>
