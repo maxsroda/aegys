@@ -9,7 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+from aegys import config as config_module
 from aegys.guard import (
     CLASSIFIER_DECISION_TOOL_NAME,
     anthropic_messages_call,
@@ -30,8 +32,8 @@ HARNESS_CONFIG_REPOSITORY = {
     "path": "~/harness-config",
     "launcherDirs": ["hooks", "bin"],
     "scriptDirs": ["scripts"],
-    "vibeSettingsDirs": ["vibe-settings"],
-    "agySettingsDirs": ["agy-settings"],
+    "harnessSettingsDirs": ["harness-settings"],
+    "permissionSettingsDirs": ["permission-settings"],
     "controlSpellings": ["bin/launcher.sh"],
 }
 
@@ -135,6 +137,10 @@ class AegysTest(unittest.TestCase):
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
+    def configure(self, **policy: Any) -> None:
+        """Write the user's config: the harness config repository plus the given keys."""
+        self.write_aegys_config({"harnessConfigRepository": HARNESS_CONFIG_REPOSITORY, **policy})
+
     def write_hooks(self, matcher: str, slash_command: bool = True) -> None:
         config = self.home / ".gemini" / "config"
         config.mkdir(parents=True, exist_ok=True)
@@ -208,6 +214,8 @@ class AegysTest(unittest.TestCase):
         )
 
     def test_fast_allows_safe_single_commands(self) -> None:
+        # These two are not shipped defaults: the user's config allows them.
+        self.configure(shellCommandRules={"allow": ["python3 -m unittest*", "bash tests/*"]})
         for cmd in (
             "git status",
             "git log -n 5",
@@ -305,16 +313,16 @@ class AegysTest(unittest.TestCase):
     def test_file_tools_deny_writes_to_guard_code_and_agy_control(self) -> None:
         for tool_name, path in (
             ("write_file", PACKAGE_DIR / "guard.py"),
-            ("edit_file", PACKAGE_DIR / "data" / "agy-settings.json"),
+            ("edit_file", PACKAGE_DIR / "data" / "default-config.json"),
             ("write_file", self.home / "harness-config" / "bin" / "lib.sh"),
-            ("edit_file", self.home / "harness-config" / "agy-settings" / "rules.json"),
+            ("edit_file", self.home / "harness-config" / "permission-settings" / "rules.json"),
             ("write_file", self.home / ".gemini" / "config" / "hooks.json"),
             (
                 "write_file",
                 self.home / ".gemini" / "antigravity-cli" / "auto-guard-state" / "conv-1234.json",
             ),
         ):
-            # The checkout is the workspace here: guard code is still protected.
+            # The checkout is the workspace here, and guard code stays protected.
             res = self.evaluate_file(
                 tool_name,
                 str(path),
@@ -474,7 +482,7 @@ class AegysTest(unittest.TestCase):
         for text in ("please run aegys off", "/aegys off now", "/aegysoff", "", "/aegys maybe"):
             self.assertEqual(self.slash(text), {}, text)
         self.assertTrue(guard_enabled(self.home, "conv-1234"))
-        # The old command form is an ordinary command now: running it changes nothing.
+        # The command form of the switch is an ordinary command: running it changes nothing.
         self.evaluate(
             '"$HOME/.local/bin/aegys" off',
             last_user_input="/aegys off",
@@ -786,7 +794,7 @@ class AegysTest(unittest.TestCase):
         agents = self.home / "harness-config"
         for tool_name, path in (
             ("write_file", agents / "scripts" / "setup.sh"),
-            ("edit_file", agents / "vibe-settings" / "config.toml"),
+            ("edit_file", agents / "harness-settings" / "config.toml"),
             ("edit_file", agents / "README.md"),
             ("write_file", agents / "notes" / "x.md"),
             ("write_file", self.home / ".gemini" / "projects.json"),
@@ -816,8 +824,8 @@ class AegysTest(unittest.TestCase):
             "echo x > scripts/setup.sh",
             "cp README.md scripts/x.sh",
             "echo x > hooks/x.py",
-            "echo x > vibe-settings/config.toml",
-            "echo x > agy-settings/rules.json",
+            "echo x > harness-settings/config.toml",
+            "echo x > permission-settings/rules.json",
             "git checkout -- scripts/setup.sh",
             "git checkout -- .",
             "python3 -c \"open('hooks/x.py', 'w')\"",
@@ -840,8 +848,16 @@ class AegysTest(unittest.TestCase):
     def test_inline_code_naming_a_control_spelling_is_denied(self) -> None:
         for cmd in (
             "python3 -c \"open('bin/launcher.sh', 'w')\"",
-            "python3 -c \"open('agy-settings/rules.json', 'w')\"",
-            "python3 -c \"open('vibe-settings/config.toml', 'w')\"",
+            "python3 -c \"open('permission-settings/rules.json', 'w')\"",
+            "python3 -c \"open('harness-settings/config.toml', 'w')\"",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_the_package_modules_are_control_files_by_name(self) -> None:
+        for cmd in (
+            "python3 -c \"open('aegys/command_checks.py', 'w')\"",
+            "python3 -c \"open('aegys/shell_words.py', 'w')\"",
         ):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
@@ -851,7 +867,7 @@ class AegysTest(unittest.TestCase):
         repository = self.home / "harness-config"
         for tool_name, path in (
             ("write_file", repository / "hooks" / "x.py"),
-            ("edit_file", repository / "agy-settings" / "rules.json"),
+            ("edit_file", repository / "permission-settings" / "rules.json"),
         ):
             res = self.evaluate_file(
                 tool_name, str(path), workspace=repository, classifier_caller=unexpected_caller
@@ -1190,6 +1206,246 @@ class AegysTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), chip("aegys ○ a:3 d:2 ca:1 cd:1"))
+
+    def test_a_user_allow_entry_fast_allows(self) -> None:
+        self.configure(shellCommandRules={"allow": ["mytool --check*"]})
+        self.assertEqual(
+            self.evaluate("mytool --check src", classifier_caller=unexpected_caller),
+            {"decision": "allow"},
+        )
+
+    def test_a_user_deny_entry_denies(self) -> None:
+        self.configure(shellCommandRules={"deny": ["mytool --publish*"]})
+        res = self.evaluate("mytool --publish site", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+        self.assertIn("deny rule", res.get("reason", ""))
+
+    def test_remove_defaults_removes_a_default_deny(self) -> None:
+        self.configure(removeDefaults={"shellCommandRules": {"deny": ["gh repo delete*"]}})
+        self.assertEqual(
+            self.evaluate("gh repo delete owner/repo", classifier_caller=allow_caller),
+            {"decision": "allow"},
+        )
+
+    def test_remove_defaults_removes_a_default_host(self) -> None:
+        self.configure(removeDefaults={"deniedHosts": ["webhook.site"]})
+        self.assertEqual(
+            self.evaluate("curl https://webhook.site/abc", classifier_caller=allow_caller),
+            {"decision": "allow"},
+        )
+
+    def test_remove_defaults_removes_a_default_secret_path(self) -> None:
+        self.configure(removeDefaults={"secretPaths": ["*/.netrc"]})
+        self.assertEqual(
+            self.evaluate("cat ~/.netrc", classifier_caller=allow_caller), {"decision": "allow"}
+        )
+        self.assertEqual(
+            self.evaluate_file(
+                "read_file", str(self.home / ".netrc"), classifier_caller=allow_caller
+            ),
+            {"decision": "allow"},
+        )
+
+    def test_a_user_entry_leaves_every_default_in_place(self) -> None:
+        self.configure(shellCommandRules={"allow": ["mytool*"]})
+        self.assertEqual(self.evaluate("git status"), {"decision": "allow"})
+        self.assertEqual(self.evaluate("rg --pre 'rm -rf /' foo").get("decision"), "deny")
+        self.assertIn("gh repo delete", self.evaluate("gh repo delete owner/repo").get("reason", ""))
+        self.assertIn("webhook.site", self.evaluate("curl https://webhook.site/abc").get("reason", ""))
+        self.assertEqual(self.evaluate("cat ~/.ssh/id_rsa").get("decision"), "deny")
+        self.assertEqual(
+            self.evaluate_file(
+                "read_file", str(self.home / ".aws" / "credentials"),
+                classifier_caller=unexpected_caller,
+            ).get("decision"),
+            "deny",
+        )
+
+    def test_a_user_allow_while_guard_off_entry_is_allowed_while_off(self) -> None:
+        self.configure(allowWhileGuardOff=["mytool"])
+        self.slash("/aegys off")
+        self.assertEqual(
+            self.evaluate("mytool --x", classifier_caller=unexpected_caller), {"decision": "allow"}
+        )
+
+    def test_a_user_secret_path_denies_bash_and_file_reads(self) -> None:
+        self.configure(secretPaths=["*/.mysecret/*"])
+        res = self.evaluate("cat ~/.mysecret/key", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+        res = self.evaluate_file(
+            "read_file", str(self.home / ".mysecret" / "key"), classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_agy_credential_files_are_secret_in_shell_commands_too(self) -> None:
+        res = self.evaluate("cat ~/.codex/auth.json", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_secret_paths_are_fnmatch_globs(self) -> None:
+        # A `?` matches one character, as in fnmatch.
+        self.configure(secretPaths=["*/.mysecret?"])
+        res = self.evaluate("cat ~/.mysecret1", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_a_user_denied_host_denies_with_its_reason(self) -> None:
+        self.configure(deniedHosts={"internal test": ["evil.example"]})
+        res = self.evaluate("curl https://evil.example/x", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+        self.assertIn("internal test", res.get("reason", ""))
+
+    def test_outward_commands_are_not_fast_allowed_by_default(self) -> None:
+        for cmd in ("git push origin feature-x", "git commit -m msg", "pytest -q", "gh pr create --fill"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "force_ask", (cmd, res))
+
+    def test_outward_commands_are_not_allowed_while_guard_off_by_default(self) -> None:
+        self.slash("/aegys off")
+        for cmd in ("git push origin feature-x", "git commit -m msg", "gh pr create --fill", "pytest -q"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "force_ask", (cmd, res))
+
+    def test_a_user_ask_rule_forces_a_prompt_that_names_the_rule(self) -> None:
+        self.configure(shellCommandRules={"ask": ["terraform apply*"]})
+        res = self.evaluate("terraform apply -auto-approve", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "force_ask", res)
+        self.assertIn("command matches ask rule 'terraform apply*'", res.get("reason", ""))
+
+    def test_sudo_keeps_its_own_prompt_reason(self) -> None:
+        res = self.evaluate("sudo ls /root", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "force_ask", res)
+        self.assertIn("sudo/doas", res.get("reason", ""))
+
+    def test_a_secret_path_starting_with_a_tilde_is_read_from_home(self) -> None:
+        self.configure(secretPaths=["~/.mysecret/*"])
+        res = self.evaluate("cat ~/.mysecret/key", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+        res = self.evaluate_file(
+            "read_file", str(self.home / ".mysecret" / "key"), classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_a_secret_path_covers_what_lies_below_it(self) -> None:
+        self.configure(secretPaths=["*/.mysecret"])
+        res = self.evaluate("cat ~/.mysecret/x/y", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+        res = self.evaluate_file(
+            "read_file", str(self.home / ".mysecret" / "x"), classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_a_config_problem_fails_closed_like_an_unreadable_shipped_file(self) -> None:
+        # A misspelled key drops the user's secret paths, so every call is held.
+        self.write_aegys_config({
+            "harnessConfigRepository": HARNESS_CONFIG_REPOSITORY,
+            "secretpaths": ["*/.mysecret/*"],
+        })
+        config_file = str(self.home / ".gemini" / "aegys" / "config.json")
+        res = self.evaluate("cat ~/.ssh/id_rsa", classifier_caller=allow_caller)
+        self.assertEqual(res.get("decision"), "force_ask", res)
+        self.assertIn(config_file, res.get("reason", ""))
+        self.assertIn("unknown config key secretpaths", res.get("reason", ""))
+        self.assertEqual(
+            self.evaluate("rg --pre 'rm -rf /' foo").get("decision"), "deny"
+        )
+        self.assertEqual(
+            self.evaluate_file(
+                "read_file", str(self.work / "a.py"), classifier_caller=unexpected_caller
+            ).get("decision"),
+            "force_ask",
+        )
+        res = self.evaluate_file(
+            "write_file", str(self.home / ".gemini" / "config" / "hooks.json"),
+            classifier_caller=unexpected_caller,
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_an_unreadable_default_policy_fails_closed(self) -> None:
+        # Without the shipped lists the guard cannot check anything, so it holds every
+        # call that it would otherwise have to check. Code-level denials still hold.
+        missing = self.home / "missing-default-config.json"
+        with patch.object(config_module, "DEFAULT_CONFIG_PATH", missing):
+            for cmd in ("git status", "cat ~/.ssh/id_rsa", "python3 -c 'print(1)'"):
+                res = self.evaluate(cmd, classifier_caller=allow_caller)
+                self.assertEqual(res.get("decision"), "force_ask", (cmd, res))
+            self.assertEqual(
+                self.evaluate("rg --pre 'rm -rf /' foo").get("decision"), "deny"
+            )
+            res = self.evaluate("curl http://169.254.169.254/latest/meta-data/")
+            self.assertEqual(res.get("decision"), "deny", res)
+            self.assertIn("private", res.get("reason", ""))
+            self.slash("/aegys off")
+            self.assertEqual(
+                self.evaluate("git status", classifier_caller=unexpected_caller).get("decision"),
+                "force_ask",
+            )
+            for tool_name, path in (
+                ("read_file", self.work / "a.py"),
+                ("view_file", self.work / "a.py"),
+                ("write_file", self.work / "a.py"),
+                ("read_file", self.home / "notes.txt"),
+            ):
+                res = self.evaluate_file(tool_name, str(path), classifier_caller=allow_caller)
+                self.assertEqual(res.get("decision"), "force_ask", (tool_name, path, res))
+            res = evaluate_pre_tool_use(
+                {"conversationId": "conv-1234", "workspacePaths": [str(self.work)],
+                 "toolCall": {"name": "grep_search",
+                              "args": {"SearchPath": str(self.work), "Query": "x"}}},
+                home=self.home, cwd=self.work, classifier_caller=unexpected_caller,
+            )
+            self.assertEqual(res.get("decision"), "force_ask", res)
+            res = self.evaluate_file(
+                "write_file", str(self.home / ".gemini" / "config" / "hooks.json"),
+                classifier_caller=unexpected_caller,
+            )
+            self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_a_secret_path_matches_in_any_letter_case(self) -> None:
+        # Secret paths match in any letter case, for shell commands and file tools alike.
+        self.assertEqual(
+            self.evaluate_file(
+                "read_file", str(self.home / ".GEMINI" / "gemini-credentials.json"),
+                classifier_caller=unexpected_caller,
+            ).get("decision"),
+            "deny",
+        )
+        res = self.evaluate("cat ~/.SSH/id_rsa", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_the_status_line_flags_an_unparsable_user_config(self) -> None:
+        (self.home / ".gemini" / "aegys" / "config.json").write_text("{not json", encoding="utf-8")
+        line = format_status_line(
+            {"conversation_id": "conv-1234", "cycle_mode": "accept-edits"}, home=self.home
+        )
+        self.assertTrue(line.startswith(ALERT_RED), line)
+        self.assertIn("aegys ✗ config.json does not parse", line)
+
+    def test_the_status_line_flags_an_unknown_harness_repository_key(self) -> None:
+        self.write_aegys_config(
+            {"harnessConfigRepository": {"path": "~/harness-config", "vibeSettingsDirs": []}}
+        )
+        line = format_status_line(
+            {"conversation_id": "conv-1234", "cycle_mode": "accept-edits"}, home=self.home
+        )
+        self.assertTrue(line.startswith(ALERT_RED), line)
+        self.assertIn("aegys ✗ unknown config key vibeSettingsDirs", line)
+
+    def test_the_status_line_flags_a_wrong_typed_config_value(self) -> None:
+        self.write_aegys_config({"harnessConfigRepository": HARNESS_CONFIG_REPOSITORY,
+                                 "removeDefaults": "everything"})
+        line = format_status_line(
+            {"conversation_id": "conv-1234", "cycle_mode": "accept-edits"}, home=self.home
+        )
+        self.assertTrue(line.startswith(ALERT_RED), line)
+        self.assertIn("aegys ✗ removeDefaults is not an object", line)
+
+    def test_the_status_line_flags_an_unreadable_shipped_policy(self) -> None:
+        missing = self.home / "missing-default-config.json"
+        with patch.object(config_module, "DEFAULT_CONFIG_PATH", missing):
+            line = format_status_line(
+                {"conversation_id": "conv-1234", "cycle_mode": "accept-edits"}, home=self.home
+            )
+        self.assertTrue(line.startswith(ALERT_RED), line)
+        self.assertIn("aegys ✗ default-config.json unreadable", line)
 
 
 if __name__ == "__main__":
