@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="aegys logo" width="160">
+  <img src="assets/agy-window.svg" alt="agy in a terminal window, with the aegys shield pointing at its status chip under the prompt" width="800">
 </p>
 
 <h1 align="center">aegys</h1>
@@ -38,10 +38,44 @@ You choose the classifier model and give *aegys* its API key. The default model 
 
 > **Note:** for now *aegys* speaks only Anthropic's API, so the model must be a Claude model or sit behind an Anthropic-compatible endpoint, and the key goes in `ANTHROPIC_API_KEY`. Support for other providers is tracked in [#13](https://github.com/maxsroda/aegys/issues/13).
 
+## Install
+
+```sh
+uv tool install git+https://github.com/maxsroda/aegys
+aegys install
+export ANTHROPIC_API_KEY=...   # in the shell that starts agy
+```
+
+[uv](https://docs.astral.sh/uv/) puts *aegys* in `~/.local/bin/aegys`, where the hooks run it. `aegys install` then wires it into *agy* and leaves the rest of your config alone:
+
+- `~/.gemini/config/hooks.json` gets an `aegys` entry that runs the guard before every shell command, file tool and search, and reads `/aegys on` and `/aegys off`.
+- `~/.gemini/antigravity-cli/settings.json` gets the grants that let *agy* run what *aegys* allows (`command(regex:(?s).*)`, `read_file($HOME)`, `write_file($HOME)`) and the status line. A status line of your own stays; the install tells you how to switch it.
+
+After this, **_aegys_ is the only check between the agent and your shell and home folder**: the grants switch off *agy*'s own prompts. So `aegys install` stops without changing anything if `~/.local/bin/aegys` is missing or a config file does not parse, writes the hooks before the grants, and copies each file to `*.aegys-backup` first. Running it again changes nothing. The agent itself cannot run it: *aegys* blocks `aegys install` inside *agy*.
+
+To update, run `uv tool upgrade aegys`.
+
+## The status chip
+
+The status line shows how the guard is doing in this conversation:
+
+```
+aegys ● a:12 d:2 ca:5 cd:1
+```
+
+- `●` the guard is on; `○` it is off (`/aegys off`).
+- `a:` calls allowed so far.
+- `d:` calls denied, for any reason: a deny rule, a hard block, or the classifier.
+- `ca:` / `cd:` the classifier's own allows and denies. They appear after its first decision. `a:` and `d:` include them.
+
+The chip turns amber with a `⚠` note when *agy*'s own auto mode or its sandbox is on, and red `aegys ✗` with the reason when the hook is missing or your config is broken. The chip and its counters follow [pi-automode](https://github.com/czottmann/pi-automode)'s `AM ● a:… d:… ca:… cd:…`.
+
+No chip means *aegys* isn't running. If its program is gone but its hooks stay, *agy* refuses every shell command with a `hook failed` error instead of running it unchecked. To uninstall, remove the `aegys` entry from `~/.gemini/config/hooks.json` and the three grants from `settings.json`, then run `uv tool uninstall aegys`.
+
 ## Trust, but verify
 
 Don't take this README's word for it. **Read the code**, starting with the docstring of `aegys/guard.py`, to see exactly what gets allowed. Or ask a coding agent you trust to read it for you.
 
 ## License
 
-MIT
+MIT. The classifier's rules and two-stage design come from [pi-automode](https://github.com/czottmann/pi-automode) by Carlo Zottmann, also MIT; see `LICENSE`.
