@@ -1393,6 +1393,8 @@ class AegysTest(unittest.TestCase):
         ):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
+            if "-fprint" in cmd or "-fls" in cmd:  # the others a critical-path check denies first
+                self.assertIn("deny rule", res.get("reason", ""), (cmd, res))
 
     def test_gh_auth_status_prints_no_token(self) -> None:
         for cmd in (
@@ -1401,6 +1403,19 @@ class AegysTest(unittest.TestCase):
             "gh auth status -t",
             "gh auth status -at",
             "gh auth status --hostname github.com -t",
+            # quoted, escaped, `=value` and redirect-first spellings run the same command
+            '"gh" auth status -t',
+            'gh "auth" status -t',
+            'gh auth status "-t"',
+            "gh auth status '--show-token'",
+            r"gh auth status \-t",
+            r"\gh auth status -t",
+            r"gh auth st\atus -t",
+            "gh auth status -t=true",
+            "gh auth status -t=1",
+            "gh auth status --show-token=1",
+            "gh auth status 2>&1 -t",
+            "gh auth status \\\n-t",
         ):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
@@ -1412,10 +1427,22 @@ class AegysTest(unittest.TestCase):
             )
 
     def test_rg_hostname_bin_runs_a_program_and_is_denied_like_pre(self) -> None:
-        for cmd in ("rg --hostname-bin ./x foo", "rg --hostname-bin=./x foo"):
+        for cmd in (
+            "rg --hostname-bin ./x foo",
+            "rg --hostname-bin=./x foo",
+            '"rg" --hostname-bin ./x foo',
+            r"\rg --hostname-bin ./x foo",
+            "r''g --hostname-bin ./x foo",
+            'rg "--hostname-bin" ./x foo',
+            "rg '--hostname-bin=./x' foo",
+            r"rg --hostname-bi\n ./x foo",
+            "rg foo 2>&1 --hostname-bin ./x",
+            "rg 2>&1 --hostname-bin=./x foo",
+            "rg --hostname-bin \\\n./x foo",
+        ):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
-            self.assertIn("rg --hostname-bin", res.get("reason", ""), (cmd, res))
+            self.assertIn("hostname-bin", res.get("reason", ""), (cmd, res))
 
     def test_a_star_between_two_words_of_a_deny_or_ask_entry_matches_no_arguments_too(self) -> None:
         self.configure(shellCommandRules={"deny": ["mytool * --publish*"], "ask": ["mytool * --dry-run"]})
@@ -1424,6 +1451,73 @@ class AegysTest(unittest.TestCase):
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
         res = self.evaluate("mytool --dry-run", classifier_caller=unexpected_caller)
         self.assertEqual(res.get("decision"), "force_ask", res)
+
+    def test_a_recursive_search_does_not_print_a_workspace_env_file(self) -> None:
+        (self.work / ".env").write_text("K=1\n", encoding="utf-8")
+        (self.work / "src").mkdir()
+        (self.work / "src" / "a.py").write_text("K = 1\n", encoding="utf-8")
+        for cmd in ("grep -r K .", "grep -r K", "rg --hidden K", "rg -uu K", "rg -. K",
+                    "grep -rn K ."):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        for cmd in ("rg K", "grep -r K src", "rg --hidden K src"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+        for args in ({"SearchPath": str(self.work), "Query": "K"},):
+            res = evaluate_pre_tool_use(
+                {"conversationId": "conv-1234", "workspacePaths": [str(self.work)],
+                 "toolCall": {"name": "grep_search", "args": args}},
+                home=self.home, cwd=self.work, classifier_caller=unexpected_caller,
+            )
+            self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_reading_a_repository_git_config_reaches_the_classifier(self) -> None:
+        # .git/config holds the remote URLs, which may embed a credential.
+        self.assert_not_fast_allowed(
+            ("cat .git/config", "head .git/config", "grep url .git/config", "rg url .git/config")
+        )
+
+    def test_more_credential_files_are_secret_paths(self) -> None:
+        for path in ("~/.config/git/credentials", "~/.pgpass", "~/.my.cnf",
+                     "~/.config/gcloud/application_default_credentials.json",
+                     "~/.azure/accessTokens.json", "~/.vault-token",
+                     "~/.cache/huggingface/token", "~/.terraform.d/credentials.tfrc.json",
+                     "~/.gem/credentials"):
+            res = self.evaluate(f"cat {path}", classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (path, res))
+
+    def test_the_removed_remote_url_and_token_commands_stay_out_while_the_guard_is_off(self) -> None:
+        self.slash("/aegys off")
+        for cmd in ("git config --list", "git config --get remote.origin.url",
+                    "git remote show origin", 'gh auth status "-t"', "gh auth status -t=true",
+                    "gh auth status -t"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertNotEqual(res.get("decision"), "allow", (cmd, res))
+        for cmd in ("git config --get user.name", "gh auth status"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_an_allow_entry_with_a_path_or_a_bare_star_first_word_keeps_its_glob(self) -> None:
+        self.configure(shellCommandRules={
+            "allow": ["./scripts/*", "scripts/check*", "* --version"],
+        })
+        for cmd in ("./scripts/check.sh --fast", "scripts/check.sh", "mytool --version"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_git_difftool_runs_a_command_and_is_not_fast_allowed(self) -> None:
+        self.assert_not_fast_allowed((
+            "git difftool -y -x 'touch pwned' HEAD",
+            "git difftool --extcmd=./evil HEAD",
+        ))
+        for cmd in ("git diff", "git diff HEAD~1", "git diff --stat 2>&1", "git diff 2>&1",
+                    "git diff HEAD 2>/dev/null"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
 
     def test_a_user_ask_rule_forces_a_prompt_that_names_the_rule(self) -> None:
         self.configure(shellCommandRules={"ask": ["terraform apply*"]})

@@ -85,6 +85,33 @@ def split_stages(command: str, comments: bool = True) -> list[list[str]]:
     return [s for s in stages if s]
 
 
+def join_line_continuations(command: str) -> str:
+    """The command with each backslash-newline removed, as the shell joins the lines:
+    inside double quotes and outside quotes, but not inside single quotes or after
+    an escaped backslash."""
+    joined: list[str] = []
+    in_single_quotes = in_double_quotes = False
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if in_single_quotes:
+            in_single_quotes = char != "'"
+        elif char == "\\":
+            if command[i + 1 : i + 2] == "\n":
+                i += 2
+                continue
+            joined.append(command[i : i + 2])
+            i += 2
+            continue
+        elif char == '"':
+            in_double_quotes = not in_double_quotes
+        elif char == "'" and not in_double_quotes:
+            in_single_quotes = True
+        joined.append(char)
+        i += 1
+    return "".join(joined)
+
+
 def unwrap(words: list[str]) -> tuple[list[str], str | None]:
     """Strip leading assignments and wrapper commands (env, xargs, timeout, ...);
     returns the words of the command that actually runs, or a denial."""

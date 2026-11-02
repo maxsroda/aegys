@@ -24,6 +24,7 @@ and rephrases), so patterns lean towards catching more.
 """
 from __future__ import annotations
 
+import collections
 import fnmatch
 import glob
 import ipaddress
@@ -38,6 +39,7 @@ from typing import Any
 
 from .config import Policy, harness_config_repository
 from .shell_words import (
+    join_line_continuations,
     FIND_WRITE_FLAGS, PRINTERS, PUNCTUATION, READERS, SEARCHERS, SEPARATOR_CHARS,
     SHELLS, WRITERS, brace_expansions, git_config_writes, git_subcommand_index,
     inside, unwrap,
@@ -99,10 +101,11 @@ def matches_bash_deny_pattern(arg_pattern: str, candidate: str) -> bool:
     """Whether a deny or ask pattern matches a command. A ` * ` between two words
     matches any arguments between them, including none: `find * -fprint*` matches
     `find -fprint out` as well as `find . -fprint out`. A trailing ` *` likewise
-    matches no arguments."""
+    matches no arguments. A pattern with more than five ` * ` matches them only as
+    written, one or more arguments each."""
     parts = arg_pattern.split(" * ")
     joints_choices = (
-        itertools.product((" * ", " "), repeat=len(parts) - 1) if len(parts) <= 5
+        itertools.product((" * ", " "), repeat=len(parts) - 1) if len(parts) <= 6
         else [(" * ",) * (len(parts) - 1)]
     )
     for joints in joints_choices:
@@ -129,20 +132,6 @@ BASH_RULES: list[tuple[str, re.Pattern[str], str]] = [
         "rg --pre",
         re.compile(rf"{CMD_START}rg\b{STAGE}\s--pre(?:=|\s|$)"),
         "rg --pre runs an arbitrary command on every file; use rg without --pre.",
-    ),
-    (
-        "rg --hostname-bin",
-        re.compile(rf"{CMD_START}rg\b{STAGE}\s--hostname-bin(?:=|\s|$)"),
-        "rg --hostname-bin runs an arbitrary program; use rg without --hostname-bin.",
-    ),
-    (
-        "gh auth status --show-token",
-        # -t, or -t among combined short flags; the pattern is case-sensitive, as
-        # gh's flags are.
-        re.compile(rf"{CMD_START}gh\s+auth\s+status\b{STAGE}\s"
-                   r"(?:--show-token(?:=|\s|$)|-[a-zA-Z]*t[a-zA-Z]*(?:\s|$))"),
-        "gh auth status --show-token prints the GitHub token into the conversation; "
-        "use gh auth status without -t.",
     ),
     (
         "fd --exec",
@@ -516,6 +505,7 @@ def command_stages(
     any other heredoc is data (with command substitutions in unquoted heredocs
     still walked). None when the command does not parse."""
     command, bodies = _heredoc_bodies_with_quoting(command)
+    command = join_line_continuations(command)
     subs_with_offsets, masked_command = _scan_substitutions(command)
     try:
         raw_stages_with_ends = _split_stages_with_ends(masked_command)
@@ -872,6 +862,18 @@ def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
                for pattern in secret_paths for name in names)
 
 
+GH_TOKEN_FLAG = re.compile(r"^(?:--show-token(?:=.*)?|-[A-Za-z]*t[A-Za-z]*(?:=.*)?)$")
+
+
+def gh_shows_token(words: list[str]) -> bool:
+    """True for `gh auth status` with `-t` or `--show-token`, which prints the GitHub
+    token: `-t` alone, among combined short flags (`-at`), or with a value (`-t=true`).
+    Read from the stage's words, so quoting and escaping do not hide the flag. The
+    match is case-sensitive, as gh's flags are."""
+    return (len(words) >= 3 and os.path.basename(words[0]) == "gh" and words[1:3] == ["auth", "status"]
+            and any(GH_TOKEN_FLAG.match(word) for word in words[3:]))
+
+
 def secret_areas(secret_paths: tuple[str, ...]) -> tuple[str, ...]:
     """The directories and files of the secret paths, as `.ssh` for `*/.ssh/*`,
     read relative to $HOME, or `/home/u/.key` for `/home/u/.key/*` (an entry
@@ -967,6 +969,42 @@ def secret_below(start: Path, home: Path, skips_hidden: bool,
             below = area.relative_to(start).parts
             if not (skips_hidden and any(part.startswith(".") for part in below)):
                 return area
+    return secret_file_below(start, skips_hidden, secret_paths)
+
+
+# A search reads at most this many entries of a tree when looking for secret files.
+SECRET_SEARCH_ENTRY_LIMIT = 50_000
+
+
+def secret_file_below(start: Path, skips_hidden: bool,
+                      secret_paths: tuple[str, ...]) -> Path | None:
+    """The first secret file or directory below start (a project's `.env`), read
+    breadth-first so shallow ones come first, or None. A search that skips hidden
+    entries does not enter or read them. A tree with more than
+    SECRET_SEARCH_ENTRY_LIMIT entries is checked only up to that many."""
+    if not secret_paths:
+        return None
+    # One pattern for all globs, as `secret` reads them; a directory a glob matches
+    # is returned when reached, so each path is checked on its own.
+    secret_name = re.compile("|".join(fnmatch.translate(pattern.lower()) for pattern in secret_paths))
+    queue = collections.deque([start])
+    seen = 0
+    while queue:
+        try:
+            entries = list(os.scandir(queue.popleft()))
+        except OSError:
+            continue
+        for entry in entries:
+            if skips_hidden and entry.name.startswith("."):
+                continue
+            path = Path(entry.path)
+            if secret_name.match(entry.path.lower()):
+                return path
+            seen += 1
+            if seen > SECRET_SEARCH_ENTRY_LIMIT:
+                return None
+            if entry.is_dir(follow_symlinks=False):
+                queue.append(path)
     return None
 
 

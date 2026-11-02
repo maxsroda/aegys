@@ -12,6 +12,7 @@ from aegys.command_checks import (
     command_substitutions,
     critical_removal,
     host_denial_reason,
+    matches_bash_deny_pattern,
     urls_in,
 )
 from aegys.config import load_policy
@@ -50,6 +51,18 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_a_backslash_newline_joins_the_lines_as_the_shell_does(self) -> None:
+        for command, words in (
+            ("gh auth status \\\n-t", ["gh", "auth", "status", "-t"]),
+            ("rg --pre x \\\nfoo", ["rg", "--pre", "x", "foo"]),
+            ('echo "a\\\nb"', ["echo", "ab"]),
+            ("echo 'a\\\nb'", ["echo", "a\\\nb"]),
+            ('echo "it\'s \\\nme"', ["echo", "it's me"]),
+            ("echo a\\\\\nb", ["echo", "a\\"]),
+        ):
+            stages = command_stages(command, self.work, self.home)
+            self.assertEqual(stages[0].words, words, command)
 
     def test_read_only_for_loop_with_command_substitution_and_stderr_redirect_is_not_a_write(self) -> None:
         cmd = (
@@ -146,3 +159,23 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DenyPatternTest(unittest.TestCase):
+    def test_the_shipped_find_patterns_match_a_find_without_a_path(self) -> None:
+        for flag in ("-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprint0",
+                     "-fprintf", "-ok", "-okdir"):
+            for command in (f"find {flag} x", f"find . {flag} x"):
+                self.assertTrue(
+                    any(matches_bash_deny_pattern(pattern, command)
+                        for pattern in load_policy(Path(tempfile.mkdtemp())).shell_deny),
+                    command,
+                )
+
+    def test_a_star_between_words_matches_no_arguments_up_to_five_times(self) -> None:
+        self.assertTrue(matches_bash_deny_pattern("a * b * c", "a b c"))
+        self.assertTrue(matches_bash_deny_pattern("a * b * c", "a x b c"))
+        self.assertTrue(matches_bash_deny_pattern("a * b * c * d * e * f", "a b c d e f"))
+        # Beyond five, the stars match only as written, one or more arguments.
+        self.assertFalse(matches_bash_deny_pattern("a * b * c * d * e * f * g", "a b c d e f g"))
+        self.assertTrue(matches_bash_deny_pattern("a * b * c * d * e * f * g", "a 1 b 2 c 3 d 4 e 5 f 6 g"))

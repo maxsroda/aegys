@@ -6,8 +6,9 @@ merged with the user's entries. Both files have the same keys:
 - ``shellCommandRules``: ``allow``, ``ask`` and ``deny``, each a list of glob
   patterns for a whole shell command (``git status*``). ``allow`` lets a command
   run without the classifier, ``ask`` makes agy confirm it, ``deny`` blocks it.
-  In an ``allow`` entry the first word is a whole word: ``ls*`` allows ``ls -la``
-  but not ``lsblk``. In a ``deny`` or ``ask`` entry a `` * `` between two words
+  In an ``allow`` entry a first word that ends in ``*`` is a whole program name:
+  ``ls*`` allows ``ls -la`` but not ``lsblk``. A first word with a ``/``
+  (``./scripts/*``) or a bare ``*`` is an ordinary glob. In a ``deny`` or ``ask`` entry a `` * `` between two words
   also matches no arguments: ``find * -fprint*`` matches ``find -fprint out``.
 - ``allowWhileGuardOff``: command prefixes, or ``regex:`` patterns, that agy may
   run while the guard is off (``/aegys off``).

@@ -120,6 +120,7 @@ from .command_checks import (
     executed_file,
     expand_home,
     expand_word,
+    gh_shows_token,
     host_denial_reason,
     inline_code,
     input_targets,
@@ -627,6 +628,10 @@ def stage_matches_allow_patterns(
         return False
     if stage_touches_protected_path(stage, home):
         return False
+    # A repository's .git/config holds its remote URLs, which may embed a credential:
+    # reading it takes a classifier check (writing it already does, as a protected path).
+    if any(path.parts[-2:] == (".git", "config") for path in stage_paths(stage, home)):
+        return False
     program = os.path.basename(stage.words[0])
     if program == "sed" and not sed_writes(stage.words[1:]):
         return True
@@ -645,9 +650,11 @@ def stage_matches_allow_patterns(
                 break
         # `ls*` means the program `ls` with any arguments, not every program whose
         # name starts with `ls`: the first word of the command text, and the program
-        # that runs after wrappers are removed, must both be `ls` itself.
+        # that runs after wrappers are removed, must both be `ls` itself. A first word
+        # with a `/` (`./scripts/*`) or a bare `*` is an ordinary glob.
         first_word = pat_base.split(" ", 1)[0]
-        if first_word.endswith("*") and "*" not in first_word[:-1]:
+        if len(first_word) > 1 and first_word.endswith("*") and "*" not in first_word[:-1] \
+                and "/" not in first_word:
             program_name = canonicalize_case(first_word[:-1])
             if program_name != canonicalize_case(base_cmd.split(" ", 1)[0]) \
                     or program_name != canonicalize_case(stage.words[0]):
@@ -1958,6 +1965,12 @@ def decide_pre_tool_use(
     agy_ctrl_deny = agy_bash_control_denial(command, cwd_path, home_path)
     if agy_ctrl_deny:
         return deny(f"Blocked by {GUARD_NAME}: {agy_ctrl_deny}.")
+
+    if any(gh_shows_token(st.words) for st in stages):
+        return deny(
+            f"Blocked by {GUARD_NAME}: gh auth status -t / --show-token prints the GitHub "
+            "token into the conversation; use gh auth status without it."
+        )
 
     for url in urls_in({"command": command}):
         try:
