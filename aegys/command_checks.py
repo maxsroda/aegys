@@ -39,7 +39,6 @@ from typing import Any
 
 from .config import Policy, harness_config_repository
 from .shell_words import (
-    join_line_continuations,
     FIND_WRITE_FLAGS, PRINTERS, PUNCTUATION, READERS, SEARCHERS, SEPARATOR_CHARS,
     SHELLS, WRITERS, brace_expansions, git_config_writes, git_subcommand_index,
     inside, unwrap,
@@ -279,18 +278,22 @@ HEREDOC_OPERATOR = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([^\s'\"<>|;&()\\]+)\3"
 
 
 def _heredoc_bodies_with_quoting(command: str) -> tuple[str, list[tuple[str, bool]]]:
-    """Return `(stripped_command, [(body, is_unquoted), ...])` in order of `<<`."""
+    """Return `(stripped_command, [(body, is_unquoted), ...])` in order of `<<`.
+    The stripped command has its comments cut, its heredoc bodies taken out, and each
+    backslash-newline outside single quotes removed, as the shell joins the lines."""
     out, bodies, pending, quote, arithmetic, i, n = [], [], [], "", 0, 0, len(command)
     while i < n:
         c = command[i]
         if quote:
             if c == "\\" and quote == '"' and i + 1 < n:
-                out.append(command[i:i + 2])
+                if command[i + 1] != "\n":  # inside double quotes a backslash-newline joins lines
+                    out.append(command[i:i + 2])
                 i += 2
                 continue
             quote = "" if c == quote else quote
         elif c == "\\" and i + 1 < n:
-            out.append(command[i:i + 2])
+            if command[i + 1] != "\n":  # a backslash-newline joins the lines, before any `#` is read
+                out.append(command[i:i + 2])
             i += 2
             continue
         elif c in "'\"":
@@ -314,7 +317,7 @@ def _heredoc_bodies_with_quoting(command: str) -> tuple[str, list[tuple[str, boo
                 out.append(f" {HEREDOC_MARKER} ")
                 i = match.end()
                 continue
-        elif c == "#" and (i == 0 or command[i - 1] in " \t\n;|&()"):
+        elif c == "#" and (not out or out[-1][-1] in " \t\n;|&()"):
             end = command.find("\n", i)  # a comment runs to the end of its line, and goes
             i = n if end < 0 else end
             continue
@@ -505,7 +508,6 @@ def command_stages(
     any other heredoc is data (with command substitutions in unquoted heredocs
     still walked). None when the command does not parse."""
     command, bodies = _heredoc_bodies_with_quoting(command)
-    command = join_line_continuations(command)
     subs_with_offsets, masked_command = _scan_substitutions(command)
     try:
         raw_stages_with_ends = _split_stages_with_ends(masked_command)

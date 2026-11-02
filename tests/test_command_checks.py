@@ -64,6 +64,16 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
             stages = command_stages(command, self.work, self.home)
             self.assertEqual(stages[0].words, words, command)
 
+    def test_a_hash_after_a_backslash_newline_is_not_a_comment(self) -> None:
+        # The shell joins the lines, so `#;rm -rf ~` follows `ls` in the same word.
+        stages = command_stages("ls\\\n#;rm -rf ~", self.work, self.home)
+        self.assertEqual([stage.words for stage in stages], [["ls#"], ["rm", "-rf", "~"]])
+        # A comment ends at its newline, backslash or not: `rm` runs.
+        stages = command_stages("ls # \\\nrm -rf ~", self.work, self.home)
+        self.assertEqual([stage.words for stage in stages], [["ls"], ["rm", "-rf", "~"]])
+        stages = command_stages("echo '#\\\n#x'", self.work, self.home)
+        self.assertEqual([stage.words for stage in stages], [["echo", "#\\\n#x"]])
+
     def test_read_only_for_loop_with_command_substitution_and_stderr_redirect_is_not_a_write(self) -> None:
         cmd = (
             'cd ~/.gemini/antigravity-cli/auto-guard-state && '
