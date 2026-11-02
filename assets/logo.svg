@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="aegys">
+<title>aegys</title>
+<defs>
+  <clipPath id="shield"><path d="M32 4.5 C40 8 47 9.5 54 9.5 V30 C54 44.5 44.5 54.5 32 60 C19.5 54.5 10 44.5 10 30 V9.5 C17 9.5 24 8 32 4.5 Z"/></clipPath>
+  <filter id="aurora" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6"/></filter>
+  <filter id="drop" x="-30%" y="-30%" width="160%" height="160%">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="1.6"/><feOffset dy="1.6" result="b"/>
+    <feFlood flood-color="#1a237e" flood-opacity="0.35"/><feComposite in2="b" operator="in"/>
+    <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <filter id="twinkle" x="-100%" y="-100%" width="300%" height="300%">
+    <feGaussianBlur stdDeviation="0.8" result="g"/>
+    <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#fff" stop-opacity="0.9"/><stop offset="1" stop-color="#fff" stop-opacity="0.25"/>
+  </linearGradient>
+  <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#fff" stop-opacity="0.3"/><stop offset="1" stop-color="#fff" stop-opacity="0"/>
+  </linearGradient>
+</defs>
+<!-- aurora body -->
+<g filter="url(#drop)">
+  <g clip-path="url(#shield)">
+    <linearGradient id="fill" x1="0.15" y1="0" x2="0.85" y2="1"><stop offset="0" stop-color="#FFE432"/><stop offset="0.3" stop-color="#FC413D"/><stop offset="0.65" stop-color="#3186FF"/><stop offset="1" stop-color="#00B95C"/></linearGradient>
+    <rect width="64" height="64" fill="url(#fill)"/>
+    <!-- facets: left half in shade, right half lit, ridge down the middle -->
+    <path d="M0 0 H32 V64 H0 Z" fill="#000" fill-opacity="0.14"/>
+    <path d="M32 0 H64 V64 H32 Z" fill="#fff" fill-opacity="0.10"/>
+    <path d="M32 4.5 V60" stroke="#fff" stroke-opacity="0.35" stroke-width="0.6"/>
+    <path d="M0 0 H64 V18 C44 24 20 24 0 18 Z" fill="url(#sheen)"/>
+  </g>
+</g>
+<path d="M32 4.5 C40 8 47 9.5 54 9.5 V30 C54 44.5 44.5 54.5 32 60 C19.5 54.5 10 44.5 10 30 V9.5 C17 9.5 24 8 32 4.5 Z" fill="none" stroke="url(#edge)" stroke-width="1.2"/>
+<!-- bevelled chevron -->
+<path d="M19 24 L32 37 V45.5 L19 32.5 Z" fill="#E4EAFF"/>
+<path d="M45 24 L32 37 V45.5 L45 32.5 Z" fill="#fff"/>
+<!-- spark -->
+<path d="M0 -5 C0.6 -1.2 1.2 -0.6 5 0 C1.2 0.6 0.6 1.2 0 5 C-0.6 1.2 -1.2 0.6 -5 0 C-1.2 -0.6 -0.6 -1.2 0 -5 Z" fill="#fff" filter="url(#twinkle)" transform="translate(44.5 15.5) scale(0.95)"/>
+</svg>

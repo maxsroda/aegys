@@ -39,7 +39,8 @@ For ``run_command``, in order:
    ``soft_deny``, ``hard_deny``, or malformed/truncated output fail closed with
    ``{"decision": "deny", ...}`` so the model sees the error and adapts. The
    classifier also sees the conversation's recent denied actions; ``evasion``, a
-   denied goal pursued by another route, returns ``force_ask``. If the
+   denied goal pursued by another route, returns ``deny`` and counts as a strike
+   whose reason tells the agent to change course. If the
    classifier API or network fails after 3 retries, the hook returns
    ``{"decision": "force_ask", ...}`` so agy pauses and warns the user.
 
