@@ -454,14 +454,16 @@ def command_substitutions(text: str) -> list[str]:
     return [sub for _off, sub in subs]
 
 
-def _split_stages_with_ends(command: str) -> list[tuple[list[str], int]]:
-    """Split `command` (comments already cut) into `(raw_stage, end_offset)` pairs."""
+def _split_stages_with_ends(command: str) -> list[tuple[list[str], int, bool]]:
+    """Split `command` (comments already cut) into `(raw_stage, end_offset, piped)`
+    triples; `piped` is whether a pipe (`|`, `|&`) leads into the stage."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION)
     lexer.commenters = ""
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
-    stages: list[tuple[list[str], int]] = []
+    stages: list[tuple[list[str], int, bool]] = []
     stage: list[str] = []
+    piped_in = piped_next = False
     for token in lexer:
         if token and (set(token) <= SEPARATOR_CHARS or re.fullmatch(r"[<>]+\(+", token)):
             if stage:
@@ -470,12 +472,16 @@ def _split_stages_with_ends(command: str) -> list[tuple[list[str], int]]:
                     - len(getattr(lexer, "_pushback_chars", ()))
                     - len(lexer.pushback)
                 )
-                stages.append((stage, pos))
+                stages.append((stage, pos, piped_in))
                 stage = []
+                piped_in = False
+            # a newline after a pipe continues the pipeline
+            piped_next = token.rstrip("\n") in ("|", "|&") or (piped_next and token == "\n")
+            piped_in = piped_next
         else:
             stage.append(token)
     if stage:
-        stages.append((stage, len(command)))
+        stages.append((stage, len(command), piped_in))
     return stages
 
 
@@ -489,6 +495,7 @@ class Stage:
     refused: bool             # a wrapper the hook will not see through (GIT_DIR=..., ...)
     text: str                 # the stage as written, for spelled-path checks
     raw: list[str]            # the stage's words as split, redirects and wrappers included
+    piped: bool = False       # its standard input is the previous stage's output (`|`, `|&`)
 
 
 def command_stages(
@@ -516,14 +523,14 @@ def command_stages(
     if raw_stages_with_ends:
         for sub_off, sub in subs_with_offsets:
             idx = next(
-                (i for i, (_r, end_off) in enumerate(raw_stages_with_ends) if end_off > sub_off),
+                (i for i, (_r, end_off, _p) in enumerate(raw_stages_with_ends) if end_off > sub_off),
                 len(raw_stages_with_ends) - 1,
             )
             subs_by_stage.setdefault(idx, []).append(sub)
     stages: list[Stage] = []
     base_cwds = initial_cwds if initial_cwds is not None else (cwd,)
     current, known = cwd, initial_known
-    for stage_idx, (raw, _end_off) in enumerate(raw_stages_with_ends):
+    for stage_idx, (raw, _end_off, stage_piped) in enumerate(raw_stages_with_ends):
         words, refused = run_words(raw)
         words = without_redirects(words)
         program = os.path.basename(words[0]) if words else ""
@@ -583,7 +590,7 @@ def command_stages(
                 return None
             stages.extend([redirects_only, *inner])
             continue
-        stages.append(Stage(words, stage_cwds, known, refused, " ".join(raw), raw))
+        stages.append(Stage(words, stage_cwds, known, refused, " ".join(raw), raw, stage_piped))
         if program in CWD_CHANGERS:
             target = words[1] if len(words) > 1 else "~"
             if target == "-" or "$" in target or "`" in target:
@@ -873,20 +880,37 @@ def reads_a_file_list(words: list[str]) -> bool:
                     for word in words[1:]))
 
 
-def reads_the_index(words: list[str]) -> bool:
-    """True for `git diff --cached` or `--staged` (or a prefix of them), and for
-    `git show` and `git cat-file` of an index entry (`:path`): `git add .` stages an
-    un-ignored `.env.*`, which these then print."""
-    if not words or os.path.basename(words[0]) != "git":
+ENV_EXCLUDING_PATHSPEC = re.compile(r"^:(?:!|\^|\((?:[a-z,]*,)?exclude(?:,[a-z]*)?\))\*\.env\*$")
+
+
+def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path) -> bool:
+    """True for `git add` of `.`, a directory, a glob, `-A`/`--all`, `-u`/`--update` or a
+    pathspec file, which stages every un-ignored `.env.*` the work tree holds (and
+    `git diff --cached`, `git status -v` and others then print it), unless the command
+    carries an excluding pathspec such as `':!*.env*'`. Guarding the staging step holds
+    for every reader of the index."""
+    if not words or os.path.basename(words[0]) != "git" or "add" not in words[1:]:
         return False
-    rest = words[1:]
-    if "diff" in rest:
-        return any(
-            (word.startswith("--ca") and "--cached".startswith(word.partition("=")[0]))
-            or (word.startswith("--stag") and "--staged".startswith(word.partition("=")[0]))
-            for word in rest)
-    return any(command in rest for command in ("show", "cat-file")) and any(
-        word.startswith(":") and not word.startswith("::") for word in rest)
+    rest = words[words.index("add") + 1:]
+    operands = rest[rest.index("--") + 1:] if "--" in rest else []
+    options = rest[:rest.index("--")] if "--" in rest else rest
+    operands += [word for word in options if not word.startswith("-")]
+    options = [word for word in options if word.startswith("-")]
+    if any(ENV_EXCLUDING_PATHSPEC.match(word) for word in operands):
+        return False
+    if any(word in ("--all", "--update") or word.startswith("--pathspec-from-file")
+           or re.fullmatch(r"-[A-Za-z]*[Au][A-Za-z]*", word) for word in options):
+        return True
+    for operand in operands:
+        if operand.endswith("/") or set(operand) & set("*?[") or operand.startswith(":"):
+            return True
+        for cwd in cwds:
+            try:
+                if any(path.is_dir() for path in expand_word(operand, cwd, home)):
+                    return True
+            except (ValueError, OSError, RuntimeError):
+                return True
+    return False
 
 
 def git_add_forces(words: list[str]) -> bool:
@@ -968,6 +992,7 @@ class Search:
     filters: tuple[NameFilter, ...] = ()   # its --include, --exclude, -g and -x options, in order
     exclusion_words: frozenset[int] = frozenset()  # indexes in the stage's words of the filters
     program: str = "grep"       # "grep", "rg", "diff" or "git"
+    explicit_starts: bool = True    # the command names its start paths (else it reads `.` or stdin)
 
 
 def name_filtered_out(name: str, is_directory: bool, filters: tuple[NameFilter, ...]) -> bool | None:
@@ -980,7 +1005,10 @@ def name_filtered_out(name: str, is_directory: bool, filters: tuple[NameFilter, 
         pattern, candidate = entry.pattern, name
         if entry.ignore_case:
             pattern, candidate = pattern.lower(), name.lower()
-        if fnmatch.fnmatchcase(candidate, pattern):
+        # fnmatch reads no escapes and no braces, which grep and rg do: an include with
+        # either may name any name, so it counts as including this one.
+        if fnmatch.fnmatchcase(candidate, pattern) or (
+                not entry.exclude and set(pattern) & set("\\{")):
             decision = entry.exclude
     return decision
 
@@ -989,6 +1017,8 @@ def could_match_env_family(pattern: str, ignore_case: bool) -> bool:
     """Whether a glob may match a name that starts with `.env.`: its literal start
     agrees with `.env.` as far as it goes, and it has a wildcard or goes past it."""
     pattern = pattern.lower() if ignore_case else pattern
+    if set(pattern) & set("\\{"):
+        return True  # an escape or a brace may spell any name
     literal = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
     if literal.startswith(ENV_FAMILY_PREFIX):
         return True
@@ -1119,7 +1149,8 @@ def diff_search(words: list[str], cwd: Path | None = None, home: Path | None = N
         if not no_index and not (cwd is not None and home is not None
                                  and git_diff_reads_outside_the_work_tree(operands, cwd, home)):
             return None
-        return Search(operands or ["."], skips_hidden=False, program="git")
+        return Search(operands or ["."], skips_hidden=False, program="git",
+                      explicit_starts=bool(operands))
     recursive, filters, positions, operands, i = False, [], set(), [], 0
     while i < len(args):
         first, arg, i = i + 1, args[i], i + 1  # `first` indexes arg in `words`
@@ -1151,7 +1182,8 @@ def diff_search(words: list[str], cwd: Path | None = None, home: Path | None = N
     if not recursive:
         return None
     return Search(operands or ["."], skips_hidden=False, filters=tuple(filters),
-                  exclusion_words=frozenset(positions), program="diff")
+                  exclusion_words=frozenset(positions), program="diff",
+                  explicit_starts=bool(operands))
 
 
 def rg_glob_filter(value: str, ignore_case: bool) -> NameFilter | None:
@@ -1251,7 +1283,8 @@ def search_starts(words: list[str], cwd: Path | None = None,
     # A ripgrep config file can turn --hidden on for every search.
     configured = bool(os.environ.get("RIPGREP_CONFIG_PATH")) and "--no-config" not in args
     return Search(operands or ["."], rg and not hidden and unrestricted < 2 and not configured,
-                  tuple(filters), frozenset(positions), "rg" if rg else "grep")
+                  tuple(filters), frozenset(positions), "rg" if rg else "grep",
+                  explicit_starts=bool(operands))
 
 
 def secret_below(start: Path, home: Path, skips_hidden: bool,
@@ -1290,10 +1323,24 @@ def recursive_search_denial(stages: list[Stage], home: Path,
                 return (f"a recursive search from {start} starts inside a .git directory, "
                         "which holds .git/config and its remote URLs, and no exclusion "
                         "applies to a start path. Search the work tree and exclude .git")
+        if reads_only_stdin_or_files(stage, search, home):
+            continue
         missing = uncovered_secrets(search)
         if missing:
             return search_denial(search, missing)
     return None
+
+
+def reads_only_stdin_or_files(stage: Stage, search: Search, home: Path) -> bool:
+    """Whether a search names no tree to walk: rg with no path that reads a pipe or a
+    redirect (grep -r with no path walks the working directory instead), or only
+    existing regular files."""
+    reads_stdin = stage.piped or any(word in ("<", "<<<", HEREDOC_MARKER) for word in stage.raw)
+    if not search.explicit_starts:
+        return search.program == "rg" and reads_stdin
+    if search.program == "git":
+        return False
+    return all(start.is_file() for start in stage_paths(stage, home, search.starts))
 
 
 def search_denial(search: Search, missing: list[str]) -> str:

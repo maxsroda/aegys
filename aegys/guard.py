@@ -128,7 +128,7 @@ from .command_checks import (
     expand_word,
     gh_shows_token,
     reads_a_file_list,
-    reads_the_index,
+    git_add_stages_broadly,
     git_add_forces,
     git_settings_match,
     host_denial_reason,
@@ -639,9 +639,12 @@ def stage_matches_allow_patterns(
         return False
     if stage_touches_protected_path(stage, home):
         return False
-    # sort --files0-from and its kin print every file a list names; git diff --cached and
-    # its kin print what `git add .` staged: the classifier judges them.
-    if reads_a_file_list(stage.words) or reads_the_index(stage.words):
+    # sort --files0-from and its kin print every file a list names: the classifier judges them.
+    if reads_a_file_list(stage.words):
+        return False
+    # `git add` of a whole tree stages every un-ignored .env.*, which any reader of the index
+    # (git diff --cached, git status -v, ...) then prints: the classifier judges the staging.
+    if git_add_stages_broadly(stage.words, stage.cwds, home):
         return False
     # `git add -f` stages a file the repository ignores (a .env), and `git diff --cached`
     # then prints it: the classifier judges it.

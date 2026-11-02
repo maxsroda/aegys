@@ -1616,7 +1616,7 @@ class AegysTest(unittest.TestCase):
         self.assert_not_fast_allowed((
             "git add -f .", "git add --force .", "git add -fA", "git add -Af", "git -C . add -f x",
         ))
-        for cmd in ("git add .", "git add -A", "git add src/a.py"):
+        for cmd in ("git add src/a.py",):
             self.assertEqual(
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
@@ -1671,6 +1671,14 @@ class AegysTest(unittest.TestCase):
             f"rg --hidden {self.EXCLUDING_RG} --glob=.env.local K",
             f"rg --hidden {self.EXCLUDING_RG} --iglob '.ENV' K",
             f"rg --hidden {self.EXCLUDING_RG} -g 'src/.env' K",
+            # a backslash escape and braces name .env without spelling it
+            f"grep -r {self.EXCLUDING_GREP} --include='\\.env' K .",
+            f"grep -r {self.EXCLUDING_GREP} --include='\\.env.staging' K .",
+            f"grep -r {self.EXCLUDING_GREP} --include='.e\\nv' K .",
+            f"grep -r {self.EXCLUDING_GREP} --incl='\\.env' K .",
+            f"rg --hidden {self.EXCLUDING_RG} -g '\\.env' K",
+            f"rg --hidden {self.EXCLUDING_RG} -g '{{.env,.env.staging}}' K",
+            f"rg --hidden {self.EXCLUDING_RG} -g '.e\\nv.staging' K",
         ):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
@@ -1773,16 +1781,42 @@ class AegysTest(unittest.TestCase):
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
 
-    def test_reading_the_index_reaches_the_classifier(self) -> None:
-        # `git add .` stages an un-ignored .env.*, which these then print.
+    def test_staging_a_whole_tree_reaches_the_classifier_and_the_readers_are_left_alone(self) -> None:
+        (self.work / "src").mkdir()
+        (self.work / "src" / "a.py").write_text("x\n", encoding="utf-8")
         self.assert_not_fast_allowed((
-            "git diff --cached", "git diff --staged", "git diff --cac", "git diff --stag",
-            "git diff --cached HEAD", "git show :.env.staging", "git cat-file -p :.env.staging",
+            "git add .", "git add -A", "git add --all", "git add -u", "git add --update",
+            "git add -A -- .", "git add src", "git add src/", "git add 'src/*'", "git -C . add .",
+            "git add --pathspec-from-file=list.txt", "git add . ':!.env'",
         ))
-        for cmd in ("git diff HEAD", "git diff --stat", "git show HEAD", "git cat-file -p HEAD"):
+        for cmd in ("git add src/a.py", "git add -- src/a.py", "git add . ':!*.env*'",
+                    "git add -A ':!*.env*'", "git add -u ':(exclude)*.env*'", "git add . ':^*.env*'",
+                    # the readers of the index are not guarded one by one
+                    "git diff --cached", "git diff HEAD", "git status -v", "git diff-index -p HEAD",
+                    "git show :.env.staging"):
             self.assertEqual(
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
+
+    def test_a_search_that_reads_a_pipe_or_a_file_is_not_recursive(self) -> None:
+        (self.work / "a.txt").write_text("K\n", encoding="utf-8")
+        (self.work / "sub").mkdir()
+        (self.work / "sub" / "x.py").write_text("K\n", encoding="utf-8")
+        for cmd in ("ps aux | rg python", "git log --oneline | rg fix", "cat a.txt | rg K",
+                    "rg --files | rg py", "rg K a.txt", "rg -n K a.txt sub/x.py", "grep -r K a.txt",
+                    "ps aux | rg -n python | rg py"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+        # A redirect is no search of a tree; fast-allow takes no input redirect, as on main.
+        for cmd in ("rg K < a.txt", "rg K <<< x"):
+            res = self.evaluate(cmd, classifier_caller=soft_deny_caller)
+            self.assertNotIn("recursive", res.get("reason", ""), (cmd, res))
+        # grep -r with no file walks the working directory even when it is piped.
+        for cmd in ("echo x | grep -r x", "ls; rg K", "echo x | rg K sub", "echo x | rg K a.txt sub",
+                    "rg K missing.txt", "rg K .git/config", "rg K a.txt . "):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
 
     def test_the_denial_of_a_recursive_search_gives_the_flags_to_add(self) -> None:
         (self.work / "other").mkdir()
