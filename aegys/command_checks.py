@@ -39,7 +39,7 @@ from .config import Policy, harness_config_repository
 from .shell_words import (
     FIND_WRITE_FLAGS, PRINTERS, PUNCTUATION, READERS, SEARCHERS, SEPARATOR_CHARS,
     SHELLS, WRITERS, brace_expansions, git_config_writes, git_subcommand_index,
-    inside, split_stages, unwrap,
+    inside, unwrap,
 )
 
 
@@ -192,7 +192,7 @@ def expand_word(word: str, cwd: Path, home: Path) -> list[Path]:
 
 # Output and input redirect operators, as split_stages splits them off.
 ANY_REDIRECT = re.compile(r"^(?:&?>>?|>\||>&|<>|<|<&|<<<)$")
-# What heredoc_bodies leaves in place of each heredoc operator it cut a body for:
+# What _heredoc_bodies_with_quoting leaves in place of each heredoc operator it cut a body for:
 # one word the splitter keeps whole, which a stage counts and its words drop.
 HEREDOC_MARKER = "__heredoc_body__"
 
@@ -321,17 +321,6 @@ def _heredoc_bodies_with_quoting(command: str) -> tuple[str, list[tuple[str, boo
         out.append(c)
         i += 1
     return "".join(out), bodies
-
-
-def heredoc_bodies(command: str) -> tuple[str, list[str]]:
-    """The command without its heredoc bodies, and the bodies in order of their
-    `<<` operators; the splitter would read each body line as a command of its own.
-    Operators are found outside quotes, comments and `((...))`, across lines, so a
-    quoted `<<`, one in a comment or one inside a multi-line string is text; each
-    one found is replaced by HEREDOC_MARKER, and comments are cut, so the caller
-    splits with comments off and a mid-word `#` (`a#b`) stays in its word."""
-    stripped, pairs = _heredoc_bodies_with_quoting(command)
-    return stripped, [body for body, _unquoted in pairs]
 
 
 def _scan_substitutions(text: str) -> tuple[list[tuple[int, str]], str]:
@@ -524,9 +513,6 @@ def command_stages(
         stage_heredocs = [bodies.pop(0) for word in raw if word == HEREDOC_MARKER and bodies]
         stage_bodies = [body for body, _unquoted in stage_heredocs]
         unquoted_bodies = [body for body, unquoted in stage_heredocs if unquoted]
-        here_strings = [raw[k + 1] for k, word in enumerate(raw[:-1]) if word == "<<<"]
-        stage_bodies += here_strings
-        unquoted_bodies += here_strings
         cwds = [*base_cwds, current]
         for i, word in enumerate(words[:-1]):
             if word == "-C":
