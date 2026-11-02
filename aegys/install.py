@@ -1,4 +1,4 @@
-"""`aegys install`: wire aegys into agy.
+"""`aegys install`: wire aegys into agy. `aegys uninstall` removes exactly that again.
 
 It merges three things into the user's agy config, keeping everything else:
 
@@ -15,9 +15,13 @@ The hooks are written before the grants, since the grants alone let agy run
 anything. Each file is copied to ``<name>.aegys-backup`` before it changes and is
 replaced in one step. If ``~/.local/bin/aegys`` is missing or either file does not
 parse, nothing is written.
+
+Uninstall removes the grants first and the hooks second, and keeps a status line
+that is not aegys's. It does not need the launcher.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -128,13 +132,51 @@ def install(home: Path) -> list[str]:
     return notes
 
 
-def main() -> int:
+def uninstall(home: Path) -> list[str]:
+    """Remove what install added from agy's config under home, keeping the rest.
+    Returns one note per thing done or left."""
+    hooks_path = home / ".gemini" / "config" / "hooks.json"
+    settings_path = home / ".gemini" / "antigravity-cli" / "settings.json"
+    hooks = read_json_object(hooks_path)
+    settings = read_json_object(settings_path)
+    settings_before = copy.deepcopy(settings)
+    notes: list[str] = []
+
+    # Grants first: without them agy asks again, so a stop between the two writes
+    # leaves agy asking, not open.
+    permissions = settings.get("permissions")
+    allow = permissions.get("allow") if isinstance(permissions, dict) else None
+    if isinstance(allow, list):
+        permissions["allow"] = [grant for grant in allow if grant not in AEGYS_GRANTS]
+        if not permissions["allow"]:
+            del permissions["allow"]
+        if not permissions:
+            del settings["permissions"]
+    if settings.get("statusLine") == AEGYS_STATUS_LINE:
+        del settings["statusLine"]
+    if settings != settings_before and write_json_object(settings_path, settings):
+        notes.append(f"Removed the aegys grants and status line from {settings_path}.")
+
+    if "aegys" in hooks:
+        del hooks["aegys"]
+        write_json_object(hooks_path, hooks)
+        notes.append(f"Removed the aegys hooks from {hooks_path}.")
+
+    if not notes:
+        notes.append("aegys was not wired into agy; nothing changed.")
+    return notes
+
+
+def main(command: str = "install") -> int:
     try:
-        notes = install(Path.home())
+        notes = (install if command == "install" else uninstall)(Path.home())
     except InstallError as err:
         print(f"aegys install: {err}", file=sys.stderr)
         return 1
     for note in notes:
         print(note)
-    print("Set ANTHROPIC_API_KEY in the shell that starts agy.")
+    if command == "install":
+        print("Set ANTHROPIC_API_KEY in the shell that starts agy.")
+    else:
+        print("Now run: uv tool uninstall aegys")
     return 0

@@ -274,6 +274,7 @@ class AegysTest(unittest.TestCase):
             ("aegys install", "aegys install rewrites"),
             ("~/.local/bin/aegys install", "aegys install rewrites"),
             ("cd /tmp && aegys install", "aegys install rewrites"),
+            ("aegys uninstall", "aegys uninstall rewrites"),
         ):
             res = self.evaluate(cmd)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))

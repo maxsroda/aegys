@@ -51,7 +51,7 @@ export ANTHROPIC_API_KEY=...   # in the shell that starts agy
 - `~/.gemini/config/hooks.json` gets an `aegys` entry that runs the guard before every shell command, file tool and search, and reads `/aegys on` and `/aegys off`.
 - `~/.gemini/antigravity-cli/settings.json` gets the grants that let *agy* run what *aegys* allows (`command(regex:(?s).*)`, `read_file($HOME)`, `write_file($HOME)`) and the status line. A status line of your own stays; the install tells you how to switch it.
 
-After this, **_aegys_ is the only check between the agent and your shell and home folder**: the grants switch off *agy*'s own prompts. So `aegys install` stops without changing anything if `~/.local/bin/aegys` is missing or a config file does not parse, writes the hooks before the grants, and copies each file to `*.aegys-backup` first. Running it again changes nothing. The agent itself cannot run it: *aegys* blocks `aegys install` inside *agy*.
+After this, **_aegys_ is the only check between the agent and your shell and home folder**: the grants switch off *agy*'s own prompts. So `aegys install` stops without changing anything if `~/.local/bin/aegys` is missing or a config file does not parse, writes the hooks before the grants, and copies each file to `*.aegys-backup` first. Running it again changes nothing. The agent itself cannot run it: *aegys* blocks `aegys install` and `aegys uninstall` inside *agy*.
 
 To update, run `uv tool upgrade aegys`.
 
@@ -70,7 +70,7 @@ aegys ● a:12 d:2 ca:5 cd:1
 
 The chip turns amber with a `⚠` note when *agy*'s own auto mode or its sandbox is on, and red `aegys ✗` with the reason when the hook is missing or your config is broken. The chip and its counters follow [pi-automode](https://github.com/czottmann/pi-automode)'s `AM ● a:… d:… ca:… cd:…`.
 
-No chip means *aegys* isn't running. If its program is gone but its hooks stay, *agy* refuses every shell command with a `hook failed` error instead of running it unchecked. To uninstall, remove the `aegys` entry from `~/.gemini/config/hooks.json` and the three grants from `settings.json`, then run `uv tool uninstall aegys`.
+No chip means *aegys* isn't running. If its program is gone but its hooks stay, *agy* refuses every shell command with a `hook failed` error instead of running it unchecked. To uninstall, run `aegys uninstall`, which removes the hooks, the grants and the aegys status line and keeps the rest, then `uv tool uninstall aegys`.
 
 ## Trust, but verify
 
