@@ -1068,7 +1068,21 @@ def repository_settings(path: Path) -> list[Path]:
         git_dir = directory / ".git"
         if git_dir.is_dir():
             settings.append(git_dir / "config")
-            settings.extend((git_dir / "modules").glob("**/config"))
+            settings.extend(submodule_settings(git_dir / "modules"))
+    return settings
+
+
+def submodule_settings(modules: Path) -> list[Path]:
+    """The `config` of each submodule git directory under `modules`, nested submodules
+    included. Only the module directories are listed, never their objects."""
+    try:
+        entries = [entry for entry in modules.iterdir() if entry.is_dir()]
+    except OSError:
+        return []
+    settings: list[Path] = []
+    for module in entries:
+        settings.append(module / "config")
+        settings.extend(submodule_settings(module / "modules"))
     return settings
 
 

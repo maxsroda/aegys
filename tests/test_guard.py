@@ -363,9 +363,12 @@ class AegysTest(unittest.TestCase):
         (dotfiles / "gitconfig").write_text("", encoding="utf-8")
         (self.home / ".gitconfig").symlink_to(dotfiles / "gitconfig")
         (self.work / "link").symlink_to(self.home / ".gitconfig")
+        (self.work / ".git" / "config").write_text("", encoding="utf-8")
+        (self.work / "link2").symlink_to(self.work / ".git" / "config")
         for tool_name, path in (
             ("write_file", dotfiles / "gitconfig"),
             ("write_file", self.work / "link"),
+            ("write_file", self.work / "link2"),
         ):
             res = self.evaluate_file(
                 tool_name, str(path), classifier_caller=unexpected_caller
@@ -388,6 +391,17 @@ class AegysTest(unittest.TestCase):
         os.link(self.work / ".git" / "config", self.work / "hardlink")
         res = self.evaluate_file(
             "write_file", str(self.work / "hardlink"), classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_file_tools_deny_hard_link_to_submodule_git_config(self) -> None:
+        module = self.work / ".git" / "modules" / "a" / "modules" / "b"
+        module.mkdir(parents=True)
+        (module / "config").write_text("", encoding="utf-8")
+        os.link(module / "config", self.work / "submodule-hardlink")
+        res = self.evaluate_file(
+            "write_file", str(self.work / "submodule-hardlink"),
+            classifier_caller=unexpected_caller,
         )
         self.assertEqual(res.get("decision"), "deny", res)
 
