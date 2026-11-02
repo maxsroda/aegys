@@ -43,9 +43,9 @@ You choose the classifier model and give *aegys* its API key. The default model 
 
 On each call it judges, the classifier gets:
 
-- The action: the full text of a shell command, or a file tool's name and arguments as JSON, cut to 8000 characters.
+- The action: the full text of a shell command; for a file tool, its name and arguments as JSON, cut to 8000 characters.
 - Your messages and the agent's tool calls with their arguments, from this conversation. Tool outputs and the agent's own prose are not sent.
-- The instruction files `AGENTS.md`, `GEMINI.md` and `CLAUDE.md` from `~/.gemini/config` and from each workspace folder, each cut to 4000 characters.
+- The instruction files: `~/.gemini/config/AGENTS.md`, and `AGENTS.md`, `GEMINI.md` and `CLAUDE.md` from each workspace folder. Each is cut to 4000 characters.
 - The recent denials in this conversation, so it can spot a retry by another route.
 
 Your messages and the tool calls each get a budget of about 4000 tokens (four characters per token), and one entry is cut at about 1000 tokens. Only the 40 most recent tool calls are sent.
