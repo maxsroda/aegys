@@ -398,7 +398,7 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
                     if agy_control_path(path, home):
                         return (
                             f"this command redirects output to {path}, which controls "
-                            "agy or auto-mode permissions"
+                            "the coding agents' permissions"
                         )
         writes = stage.refused or program_writes(stage.words)
         if not writes:
@@ -411,22 +411,22 @@ def agy_bash_control_denial(command: str, cwd: Path, home: Path) -> str | None:
         for path in stage_paths(stage, home, operands):
             if agy_control_path(path, home):
                 return (
-                    f"this command can write {path}, which controls agy or auto-mode "
-                    "permissions"
+                    f"this command can write {path}, which controls the coding "
+                    "agents' permissions"
                 )
         for word in ancestor_operands(stage.words):
             for path in stage_paths(stage, home, [word]):
                 if agy_holds_control(path, home):
                     return (
-                        f"this command writes into {path}, which holds agy or "
-                        "auto-mode control files"
+                        f"this command writes into {path}, which holds files that "
+                        "control the coding agents' permissions"
                     )
         code_text = stage.text if stage.refused else " ".join(inline_code(stage.words))
         for spelling in spellings:
             if spelling in code_text:
                 return (
                     f"inline code references control path {spelling!r}, which controls "
-                    "agy or auto-mode permissions"
+                    "the coding agents' permissions"
                 )
     return None
 
