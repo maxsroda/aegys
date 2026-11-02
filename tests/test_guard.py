@@ -1514,7 +1514,8 @@ class AegysTest(unittest.TestCase):
             "git difftool --extcmd=./evil HEAD",
         ))
         for cmd in ("git diff", "git diff HEAD~1", "git diff --stat 2>&1", "git diff 2>&1",
-                    "git diff HEAD 2>/dev/null"):
+                    "git diff HEAD 2>/dev/null", "git diff-tree HEAD", "git diff-index HEAD",
+                    "git diff-files"):
             self.assertEqual(
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )

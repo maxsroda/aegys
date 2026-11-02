@@ -64,6 +64,12 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
             stages = command_stages(command, self.work, self.home)
             self.assertEqual(stages[0].words, words, command)
 
+    def test_an_ansi_c_string_with_an_escaped_quote_does_not_parse(self) -> None:
+        # The scanner and shlex both read $'...' as a plain single quote, so a \' ends
+        # it early and the rest fails to parse; the guard denies what it cannot parse.
+        self.assertIsNone(command_stages("echo $'a\\'b'", self.work, self.home))
+        self.assertIsNone(command_stages("echo $'x\\'#;rm -rf ~'", self.work, self.home))
+
     def test_a_hash_after_a_backslash_newline_is_not_a_comment(self) -> None:
         # The shell joins the lines, so `#;rm -rf ~` follows `ls` in the same word.
         stages = command_stages("ls\\\n#;rm -rf ~", self.work, self.home)
