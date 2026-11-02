@@ -18,10 +18,11 @@ anything. Each file is copied to ``<name>.aegys-backup`` before it changes and i
 replaced in one step. If ``~/.local/bin/aegys`` is missing or either file does not
 parse, nothing is written.
 
-Uninstall removes the grants install recorded (all three if there is no record),
-then the hooks, and any status line that runs aegys, and backs up to
-``<name>.aegys-uninstall-backup`` so the pre-install backup survives. It does not
-need the launcher.
+Uninstall removes the grants install recorded (all three if the record is missing
+or broken), and always the catch-all ``command(...)`` grant, which only defers to
+the hook. Then it removes the hooks and any status line that runs aegys. It backs
+up to ``<name>.aegys-uninstall-backup`` so the pre-install backup survives, and it
+does not need the launcher.
 """
 from __future__ import annotations
 
@@ -49,7 +50,8 @@ AEGYS_HOOKS = {
     ],
 }
 
-AEGYS_GRANTS = ("command(regex:(?s).*)", "read_file($HOME)", "write_file($HOME)")
+CATCH_ALL_GRANT = "command(regex:(?s).*)"
+AEGYS_GRANTS = (CATCH_ALL_GRANT, "read_file($HOME)", "write_file($HOME)")
 
 AEGYS_STATUS_LINE = {
     "type": "command",
@@ -76,13 +78,15 @@ def read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def write_json_object(path: Path, value: dict[str, Any], backup_suffix: str = ".aegys-backup") -> bool:
-    """Write value to path, backing up the old file first. False when nothing changed."""
+def write_json_object(path: Path, value: dict[str, Any], backup_suffix: str | None = ".aegys-backup") -> bool:
+    """Write value to path, backing up the old file first unless backup_suffix is None.
+    False when nothing changed."""
     text = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
     if path.exists():
         if path.read_text(encoding="utf-8") == text:
             return False
-        shutil.copy2(path, path.with_name(path.name + backup_suffix))
+        if backup_suffix is not None:
+            shutil.copy2(path, path.with_name(path.name + backup_suffix))
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(text, encoding="utf-8")
@@ -148,7 +152,7 @@ def install(home: Path) -> list[str]:
         "addedGrants": [g for g in AEGYS_GRANTS if g in previous_grants or g in added_grants],
         "createdAllowList": bool(record.get("createdAllowList")) or created_allow_list,
     }
-    write_json_object(record_path, record)
+    write_json_object(record_path, record, backup_suffix=None)
 
     hooks["aegys"] = AEGYS_HOOKS
     hooks_written = write_json_object(hooks_path, hooks)
@@ -168,13 +172,18 @@ def uninstall(home: Path) -> list[str]:
     hooks_path, settings_path, record_path = config_paths(home)
     hooks = read_json_object(hooks_path)
     settings = read_json_object(settings_path)
-    record = read_json_object(record_path)
+    try:
+        record = read_json_object(record_path)
+    except InstallError:
+        record = {}  # a broken record means no record: take back all aegys grants
     settings_before = copy.deepcopy(settings)
     notes: list[str] = []
 
     has_record = isinstance(record.get("addedGrants"), list)
     if has_record:
-        removed_grants = [g for g in AEGYS_GRANTS if g in record["addedGrants"]]
+        # The catch-all grant only defers to the hook, so it goes with the hook even
+        # when the user had it before install.
+        removed_grants = [g for g in AEGYS_GRANTS if g in record["addedGrants"] or g == CATCH_ALL_GRANT]
         created_allow_list = bool(record.get("createdAllowList"))
     else:
         # Wired by hand or by an older aegys: nothing says which grants were the user's.
@@ -191,6 +200,11 @@ def uninstall(home: Path) -> list[str]:
             notes.append(
                 "No record of what aegys install added, so all aegys grants were removed: "
                 + ", ".join(still_there) + ". Add back any you had before."
+            )
+        elif has_record and CATCH_ALL_GRANT in still_there and CATCH_ALL_GRANT not in record["addedGrants"]:
+            notes.append(
+                f"Removed {CATCH_ALL_GRANT} although you had it before: without the aegys "
+                "hook it lets agy run every command unasked."
             )
         if created_allow_list and not permissions["allow"]:
             del permissions["allow"]
@@ -220,7 +234,10 @@ def main(command: str = "install") -> int:
     try:
         notes = (install if command == "install" else uninstall)(Path.home())
     except InstallError as err:
-        print(f"aegys install: {err}", file=sys.stderr)
+        print(f"aegys {command}: {err}", file=sys.stderr)
+        return 1
+    except OSError as err:
+        print(f"aegys {command}: could not write {err.filename}: {err.strerror}", file=sys.stderr)
         return 1
     for note in notes:
         print(note)
