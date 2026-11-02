@@ -12,7 +12,11 @@ from aegys.command_checks import (
     command_substitutions,
     critical_removal,
     host_denial_reason,
+    NameFilter,
     matches_bash_deny_pattern,
+    name_filtered_out,
+    search_starts,
+    uncovered_secrets,
     urls_in,
 )
 from aegys.config import load_policy
@@ -195,3 +199,33 @@ class DenyPatternTest(unittest.TestCase):
         # Beyond five, the stars match only as written, one or more arguments.
         self.assertFalse(matches_bash_deny_pattern("a * b * c * d * e * f * g", "a b c d e f g"))
         self.assertTrue(matches_bash_deny_pattern("a * b * c * d * e * f * g", "a 1 b 2 c 3 d 4 e 5 f 6 g"))
+
+
+class SearchExclusionTest(unittest.TestCase):
+    def test_the_last_matching_filter_decides(self) -> None:
+        exclude, include = NameFilter(True, ".env"), NameFilter(False, ".env*")
+        self.assertTrue(name_filtered_out(".env", False, (include, exclude)))
+        self.assertFalse(name_filtered_out(".env", False, (exclude, include)))
+        self.assertIsNone(name_filtered_out("a.py", False, (exclude, include)))
+
+    def test_a_filter_for_directories_does_not_name_files(self) -> None:
+        directory_only = NameFilter(True, ".git", "directory")
+        self.assertTrue(name_filtered_out(".git", True, (directory_only,)))
+        self.assertIsNone(name_filtered_out(".git", False, (directory_only,)))
+
+    def test_an_ignore_case_filter_matches_in_any_letter_case(self) -> None:
+        self.assertFalse(name_filtered_out(".env", False, (NameFilter(True, ".env"), NameFilter(False, ".ENV", ignore_case=True))))
+
+    def test_uncovered_secrets_lists_what_no_filter_or_hidden_skip_covers(self) -> None:
+        search = search_starts(["grep", "-r", "--exclude=.env", "K", "."])
+        self.assertEqual(
+            uncovered_secrets(search),
+            [".env.local", ".env.production", ".env.test", ".env.example", ".git"],
+        )
+        self.assertEqual(uncovered_secrets(search_starts(["rg", "K"])), [])
+        self.assertEqual(uncovered_secrets(search_starts(["rg", "--no-ignore", "K"])),
+                         [".env", ".env.local", ".env.production", ".env.test", ".env.example", ".git"])
+
+    def test_a_glob_with_a_slash_never_counts_as_an_exclusion(self) -> None:
+        search = search_starts(["rg", "--hidden", "-g", "!src/.env", "K"])
+        self.assertEqual(search.filters, ())

@@ -66,12 +66,11 @@ For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
 4. **Classifier:** the verdict rules of 5, with the file action as input.
 
 For ``list_directory``, ``grep_search`` and ``find``: deny when a path argument
-is a credential path or, for the two recursive searches, lies above one, or, for
-``grep_search``, has a secret file (a project's ``.env``) or a repository's
-``.git/config`` below it; otherwise allow. A tree of more than 5,000 entries cannot
-be checked in full: ``grep_search`` of it goes to the classifier, and so does a
-shell command with a recursive search (``grep -r``, ``rg --hidden``, ``diff -r``,
-``git diff --no-index``) of it, which is not fast-allowed.
+is a credential path or, for the two recursive searches, lies above one; otherwise
+allow. ``grep_search`` of a directory goes to the classifier, because it cannot
+exclude ``.env`` or ``.git``. A shell command with a recursive search (``grep -r``,
+``rg``, ``diff -r``, ``git diff --no-index``) is denied unless it excludes ``.env``,
+``.env.*`` and ``.git`` by name; no tree is read to find out whether they exist.
 
 The lists in items 1 to 4 and the secret paths come from the shipped
 ``aegys/data/default-config.json``, merged with the user's
@@ -140,9 +139,7 @@ from .command_checks import (
     redirect_targets,
     resolve_word,
     secret,
-    Search,
-    recursive_search_reach,
-    secret_area_below,
+    recursive_search_denial,
     secret_below,
     sed_writes,
     stage_paths,
@@ -1843,28 +1840,25 @@ def evaluate_search_access(
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     conversation_id = extract_conversation_id(payload)
-    # The tool's search is read as a recursive one that follows links and skips nothing.
-    search = Search([], skips_hidden=False, follows_symlinks=True)
-    unchecked = False
+    searches_a_tree = False
     for path in path_arguments(args, cwd):
         area = path if secret(path, policy.secret_paths) else None
         if area is None and tool_name in RECURSIVE_SEARCH_TOOL_NAMES:
-            area = secret_area_below(path, home, False, policy.secret_paths)
-        if area is None and tool_name == "grep_search":  # `find` lists names, not contents
-            reach = secret_below(path, home, search, policy.secret_paths)
-            area = reach.secret
-            unchecked |= not reach.complete
+            area = secret_below(path, home, False, policy.secret_paths)
         if area is not None:
             return escalated_deny(
                 home, conversation_id, f"{tool_name} {path}",
                 f"Blocked by {GUARD_NAME}: {tool_name} of {path} reaches credentials in {area}.",
                 user_turn=user_turn_digest(payload),
             )
-    if unchecked:  # a tree too large to check in full: the classifier judges the search
+        searches_a_tree |= tool_name == "grep_search" and path.is_dir()
+    if searches_a_tree:
+        # grep_search has no way to exclude .env or .git (unverified: its arguments are
+        # not documented here), so the classifier judges a search of a directory.
         if not guard_enabled(home, conversation_id):
             return {
                 "decision": "force_ask",
-                "reason": f"aegys is off for this conversation; {tool_name} of a large tree "
+                "reason": f"aegys is off for this conversation; {tool_name} of a directory "
                           "requires confirmation.",
             }
         return classifier_decision(
@@ -2035,7 +2029,7 @@ def decide_pre_tool_use(
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home_path)}
 
-    search_denial, search_unchecked = recursive_search_reach(stages, home_path, policy.secret_paths)
+    search_denial = recursive_search_denial(stages, home_path, policy.secret_paths)
     if search_denial:
         return deny(f"Blocked by {GUARD_NAME}: {search_denial}.")
 
@@ -2077,9 +2071,7 @@ def decide_pre_tool_use(
     # added only while the status line last reported this conversation's sandbox on.
     sandbox_on = read_state_file(home_path, conv_id).get("sandbox_on") is True
     overwrite = {"overwrite": {"BypassSandbox": True}} if sandbox_on and not bypass_sandbox else {}
-    if not search_unchecked and command_fast_allowed(
-        command, stages, list(policy.shell_allow), home_path
-    ):
+    if command_fast_allowed(command, stages, list(policy.shell_allow), home_path):
         record_guard_decision(home_path, conv_id, allowed=True)
         return {"decision": "allow", **overwrite}
 

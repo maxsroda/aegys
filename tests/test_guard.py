@@ -941,7 +941,6 @@ class AegysTest(unittest.TestCase):
             self.assertEqual(res.get("decision"), "deny", (tool_name, args, res))
         for tool_name, args in (
             ("list_directory", {"DirectoryPath": str(self.home / "notes")}),
-            ("grep_search", {"SearchPath": str(self.work), "Query": "TODO"}),
             ("find", {"SearchDirectory": "/usr/share", "Pattern": "*.txt"}),
         ):
             res = evaluate_pre_tool_use(
@@ -1606,139 +1605,11 @@ class AegysTest(unittest.TestCase):
         res = self.evaluate("mytool --dry-run", classifier_caller=unexpected_caller)
         self.assertEqual(res.get("decision"), "force_ask", res)
 
-    def test_a_recursive_search_does_not_print_a_workspace_env_file(self) -> None:
-        (self.work / ".env").write_text("K=1\n", encoding="utf-8")
-        (self.work / "src").mkdir()
-        (self.work / "src" / "a.py").write_text("K = 1\n", encoding="utf-8")
-        for cmd in ("grep -r K .", "grep -r K", "rg --hidden K", "rg -uu K", "rg -. K",
-                    "grep -rn K ."):
-            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
-            self.assertEqual(res.get("decision"), "deny", (cmd, res))
-        for cmd in ("rg K", "grep -r K src", "rg --hidden K src"):
-            self.assertEqual(
-                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
-            )
-        for args in ({"SearchPath": str(self.work), "Query": "K"},):
-            res = evaluate_pre_tool_use(
-                {"conversationId": "conv-1234", "workspacePaths": [str(self.work)],
-                 "toolCall": {"name": "grep_search", "args": args}},
-                home=self.home, cwd=self.work, classifier_caller=unexpected_caller,
-            )
-            self.assertEqual(res.get("decision"), "deny", res)
-
     def search_tool(self, tool_name: str, path: Path, classifier_caller: Any) -> dict[str, Any]:
         return evaluate_pre_tool_use(
             {"conversationId": "conv-1234", "workspacePaths": [str(self.work)],
              "toolCall": {"name": tool_name, "args": {"SearchPath": str(path), "Query": "K"}}},
             home=self.home, cwd=self.work, classifier_caller=classifier_caller,
-        )
-
-    def test_other_recursive_readers_do_not_print_a_workspace_env_file(self) -> None:
-        (self.work / ".env").write_text("K=1\n", encoding="utf-8")
-        for name in ("src", "other"):
-            (self.work / name).mkdir()
-            (self.work / name / "a.py").write_text("K = 1\n", encoding="utf-8")
-        for cmd in ("diff -rN . /tmp", "diff -ruN . /var/empty", "diff --recursive . /tmp",
-                    "git diff --no-index . /tmp", "git diff --no-index --stat /tmp ."):
-            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
-            self.assertEqual(res.get("decision"), "deny", (cmd, res))
-        for cmd in ("diff -r src other", "diff -ru src other", "git diff --no-index src other",
-                    "diff src/a.py other/a.py"):
-            self.assertEqual(
-                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
-            )
-
-    def test_a_search_that_follows_symlinks_reads_a_secret_through_a_link(self) -> None:
-        other = self.work.parent / "other"
-        other.mkdir()
-        (other / ".env").write_text("K=1\n", encoding="utf-8")
-        (self.work / "link").symlink_to(other)
-        for cmd in ("grep -R K .", "grep --dereference-recursive K .", "rg -L --hidden K",
-                    "rg --follow -uu K"):
-            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
-            self.assertEqual(res.get("decision"), "deny", (cmd, res))
-        # grep -r and rg without -L do not follow a link met below the start.
-        for cmd in ("grep -r K .", "rg --hidden K"):
-            self.assertEqual(
-                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
-            )
-
-    def test_a_symlink_loop_does_not_hang_a_following_search(self) -> None:
-        (self.work / "loop").symlink_to(self.work)
-        self.assertEqual(
-            self.evaluate("grep -R K .", classifier_caller=unexpected_caller), {"decision": "allow"}
-        )
-
-    def test_a_tree_too_large_to_check_goes_to_the_classifier_not_the_allow_list(self) -> None:
-        calls: list[int] = []
-
-        def counting_allow(*args: Any) -> dict[str, Any]:
-            calls.append(1)
-            return allow_caller(*args)
-
-        big = self.work / "big"
-        big.mkdir()
-        for index in range(60):
-            (big / f"f{index}").write_text("", encoding="utf-8")
-        deep = self.work / "z" / "y"
-        deep.mkdir(parents=True)
-        (deep / ".env").write_text("K=1\n", encoding="utf-8")
-        with patch("aegys.command_checks.SECRET_SEARCH_ENTRY_LIMIT", 50):
-            res = self.evaluate("grep -r K .", classifier_caller=counting_allow)
-            self.assertEqual(res, {"decision": "allow"})
-            self.assertEqual(len(calls), 1)
-            calls.clear()
-            res = self.search_tool("grep_search", self.work, counting_allow)
-            self.assertEqual(res, {"decision": "allow"})
-            self.assertEqual(len(calls), 1)
-            # A secret the walk meets before the limit is still denied.
-            (self.work / ".env").write_text("K=1\n", encoding="utf-8")
-            res = self.evaluate("grep -r K .", classifier_caller=unexpected_caller)
-            self.assertEqual(res.get("decision"), "deny", res)
-
-    def test_a_recursive_search_does_not_print_a_repository_git_config(self) -> None:
-        (self.work / ".git" / "config").write_text(
-            '[remote "origin"]\n\turl = https://u:TOKEN@h/r\n', encoding="utf-8"
-        )
-        for cmd in ("grep -r url .", "rg url .git", "rg -uu url", "grep -rn url .git/",
-                    "rg --hidden url"):
-            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
-            self.assertEqual(res.get("decision"), "deny", (cmd, res))
-        self.assertEqual(
-            self.evaluate("rg url", classifier_caller=unexpected_caller), {"decision": "allow"}
-        )
-
-    def test_the_denial_of_a_recursive_search_says_how_to_exclude_the_secret(self) -> None:
-        (self.work / ".env").write_text("K=1\n", encoding="utf-8")
-        (self.work / ".git" / "config").write_text("[core]\n", encoding="utf-8")
-        reason = self.evaluate("grep -r K .", classifier_caller=unexpected_caller)["reason"]
-        for text in ("--exclude=.env", "-g '!.env'", "diff -x .env"):
-            self.assertIn(text, reason)
-        (self.work / ".env").unlink()
-        reason = self.evaluate("grep -r K .", classifier_caller=unexpected_caller)["reason"]
-        for text in ("--exclude-dir=.git", "-g '!.git'"):
-            self.assertIn(text, reason)
-
-    def test_excluding_the_secret_lets_a_recursive_search_through(self) -> None:
-        (self.work / ".env").write_text("K=1\n", encoding="utf-8")
-        (self.work / "src").mkdir()
-        (self.work / "src" / "a.py").write_text("K = 1\n", encoding="utf-8")
-        for cmd in ("grep -r --exclude=.env K .", "grep -r --exclude .env K .",
-                    "rg --hidden -g '!.env' K", "rg --hidden --glob=!.env K",
-                    "rg --hidden -g '!**/.env' K", "diff -rN -x .env . src"):
-            self.assertEqual(
-                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
-            )
-        # An exclusion that does not name the secret changes nothing.
-        for cmd in ("grep -r --exclude=*.py K .", "rg --hidden -g '!src' K",
-                    "grep -r --exclude-dir=.env K ."):
-            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
-            self.assertEqual(res.get("decision"), "deny", (cmd, res))
-        (self.work / ".git" / "config").write_text("[core]\n", encoding="utf-8")
-        self.assertEqual(
-            self.evaluate("grep -r --exclude=.env --exclude-dir=.git K .",
-                          classifier_caller=unexpected_caller),
-            {"decision": "allow"},
         )
 
     def test_git_add_with_force_reaches_the_classifier(self) -> None:
@@ -1750,8 +1621,69 @@ class AegysTest(unittest.TestCase):
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
 
-    def test_an_ignore_file_that_whitelists_a_hidden_file_makes_rg_search_it(self) -> None:
-        (self.work / ".env").write_text("K=1\n", encoding="utf-8")
+    EXCLUDING_GREP = "--exclude=.env --exclude='.env.*' --exclude-dir=.git"
+    EXCLUDING_RG = "-g '!.env' -g '!.env.*' -g '!.git'"
+
+    def test_a_recursive_search_is_denied_unless_it_excludes_env_files_and_git(self) -> None:
+        (self.work / "other").mkdir()
+        for cmd in (
+            "grep -r K .", "grep -r K", "grep -rn K .", "grep -R K .", "egrep -r K .",
+            "rg --hidden K", "rg -uu K", "rg -. K", "rg -u K", "rg --no-ignore K",
+            "grep -r --include='*.py' K .",
+            "grep -r --exclude=.env K .",            # not .env.* or .git
+            "grep -r --exclude='.env.*' --exclude-dir=.git K .",   # not .env
+            "grep -r --exclude=.env --exclude='.env.*' K .",       # not .git
+            "grep -r --exclude-dir=.env --exclude='.env.*' --exclude-dir=.git K .",  # .env is a file
+            "rg --hidden -g '!src' K",
+            "rg --hidden -g '!.env' -g '!.git' K",
+            "rg --hidden -g '!src/.env' -g '!.env.*' -g '!.git' K",
+            "diff -rN . other", "diff -ruN . other", "diff --recursive . other",
+            "diff -rN -x .env . other",
+            "git diff --no-index . other", "git diff --no-index --stat other .",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        (self.work / "src").mkdir()
+        for cmd in (
+            f"grep -r {self.EXCLUDING_GREP} K .", f"grep -rn K . {self.EXCLUDING_GREP}",
+            f"grep -R {self.EXCLUDING_GREP} K src", "grep -r --exclude .env --exclude '.env.*' "
+            "--exclude-dir .git K .", "grep -r --exclude='.env*' --exclude-dir='.g*' K .",
+            f"rg --hidden {self.EXCLUDING_RG} K", f"rg -uu {self.EXCLUDING_RG} K src",
+            "rg --hidden --glob=!.env --glob '!.env.*' --glob='!**/.git' K",
+            "rg -g '!.*' --hidden K", "rg -g '!.env*' -g '!.git/' --hidden K",
+            f"diff -rN -x .env -x '.env.*' -x .git . src",
+            "diff -r --exclude=.env --exclude='.env.*' --exclude=.git . src",
+            "rg K", "rg K src", "rg -n K src 2>&1",
+        ):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_a_later_option_that_includes_the_names_again_does_not_count_as_an_exclusion(self) -> None:
+        (self.work / "src").mkdir()
+        for cmd in (
+            f"grep -r {self.EXCLUDING_GREP} --include=.env K .",
+            f"grep -r {self.EXCLUDING_GREP} --include='.env*' K .",
+            f"grep -r {self.EXCLUDING_GREP} --include='*' K .",
+            f"rg --hidden {self.EXCLUDING_RG} -g '.env' K",
+            f"rg --hidden {self.EXCLUDING_RG} -g '*' K",
+            f"rg --hidden {self.EXCLUDING_RG} --glob=.env.local K",
+            f"rg --hidden {self.EXCLUDING_RG} --iglob '.ENV' K",
+            f"rg --hidden {self.EXCLUDING_RG} -g 'src/.env' K",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        # An include before the excludes, and a later exclude of the include, do not undo them.
+        for cmd in (
+            f"grep -r --include='*.py' {self.EXCLUDING_GREP} K .",
+            f"rg --hidden -g '*.py' {self.EXCLUDING_RG} K",
+            f"rg --hidden -g '.env' {self.EXCLUDING_RG} K",
+        ):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_rg_default_skip_of_hidden_files_is_voided_by_an_ignore_file_whitelist(self) -> None:
         (self.work / "src").mkdir()
         self.assertEqual(
             self.evaluate("rg K", classifier_caller=unexpected_caller), {"decision": "allow"}
@@ -1761,7 +1693,46 @@ class AegysTest(unittest.TestCase):
             (where / name).write_text("!.env\n", encoding="utf-8")
             res = self.evaluate("rg K", classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (name, where, res))
+            # An explicit exclusion beats the whitelist.
+            self.assertEqual(
+                self.evaluate(f"rg {self.EXCLUDING_RG} K", classifier_caller=unexpected_caller),
+                {"decision": "allow"},
+            )
             (where / name).unlink()
+
+    def test_the_denial_of_a_recursive_search_gives_the_flags_to_add(self) -> None:
+        (self.work / "other").mkdir()
+        for cmd, flags in (
+            ("grep -r K .", ("--exclude=.env", "--exclude='.env.*'", "--exclude-dir=.git")),
+            ("rg --hidden K", ("-g '!.env'", "-g '!.env.*'", "-g '!.git'")),
+            ("diff -r . other", ("-x .env", "-x '.env.*'", "-x .git")),
+            ("git diff --no-index . other", ("diff -r -x .env",)),
+        ):
+            reason = self.evaluate(cmd, classifier_caller=unexpected_caller)["reason"]
+            for flag in flags:
+                self.assertIn(flag, reason, (cmd, reason))
+
+    def test_grep_search_of_a_directory_goes_to_the_classifier(self) -> None:
+        calls: list[int] = []
+
+        def counting_allow(*args: Any) -> dict[str, Any]:
+            calls.append(1)
+            return allow_caller(*args)
+
+        (self.work / "a.py").write_text("K = 1\n", encoding="utf-8")
+        self.assertEqual(self.search_tool("grep_search", self.work, counting_allow), {"decision": "allow"})
+        self.assertEqual(len(calls), 1)
+        calls.clear()
+        res = self.search_tool("grep_search", self.work, soft_deny_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+        # A search of one file reads no tree.
+        self.assertEqual(
+            self.search_tool("grep_search", self.work / "a.py", unexpected_caller),
+            {"decision": "allow"},
+        )
+        self.slash("/aegys off")
+        res = self.search_tool("grep_search", self.work, unexpected_caller)
+        self.assertEqual(res.get("decision"), "force_ask", res)
 
     def test_reading_a_repository_git_config_reaches_the_classifier(self) -> None:
         # .git/config holds the remote URLs, which may embed a credential.
