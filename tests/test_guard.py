@@ -1346,6 +1346,19 @@ class AegysTest(unittest.TestCase):
         )
         self.assert_not_fast_allowed(("mytool-admin --wipe",))
 
+    def test_git_commands_that_print_a_remote_url_reach_the_classifier(self) -> None:
+        # A remote URL may embed a credential (https://user:TOKEN@host/...).
+        self.assert_not_fast_allowed((
+            "git config --list",
+            "git config --get remote.origin.url",
+            "git config --get-regexp remote",
+            "git remote show origin",
+        ))
+        for cmd in ("git config --get user.name", "git config --get user.email"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
     def test_credential_files_are_secret_paths_by_default(self) -> None:
         for cmd in (
             "cat .env",
