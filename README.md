@@ -4,7 +4,9 @@
 
 <h1 align="center">aegys</h1>
 
-**Tired of *agy* asking you for permission on every small thing? Longing for the smooth ride of Claude Code's auto mode? You've come to the right place.**
+<p align="center">
+  <strong>Tired of <em>agy</em> asking you for permission on every small thing? Longing for the smooth ride of Claude Code's auto mode? You've come to the right place.</strong>
+</p>
 
 ***aegys*** is a hook for the Antigravity CLI (*agy*). It **looks at each shell command, file read or write, and file search before it runs and decides: let it through, block it, or ask you**. Safe, boring commands run at once. Commands on the deny list never run. Everything in between goes to a small language model, which judges whether the action fits what you asked for.
 
