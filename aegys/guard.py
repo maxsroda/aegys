@@ -114,6 +114,7 @@ from .command_checks import (
     Stage,
     ancestor_operands,
     bash_path_denial,
+    canonicalize_case,
     command_stages,
     critical_removal,
     executed_file,
@@ -642,6 +643,12 @@ def stage_matches_allow_patterns(
                 pat_redir = suffix
                 pat_base = pattern[: -(len(suffix) + 1)]
                 break
+        # `ls*` means the program `ls` with any arguments, not every program whose
+        # name starts with `ls`: the stage's first word must be `ls` itself.
+        first_word = pat_base.split(" ", 1)[0]
+        if first_word.endswith("*") and "*" not in first_word[:-1]:
+            if canonicalize_case(stage.raw[0]) != canonicalize_case(first_word[:-1]):
+                continue
         if redirects:
             if pat_redir != redirects[0]:
                 continue

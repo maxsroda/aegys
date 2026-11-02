@@ -27,6 +27,7 @@ from __future__ import annotations
 import fnmatch
 import glob
 import ipaddress
+import itertools
 import os
 import re
 import shlex
@@ -95,12 +96,23 @@ def matches_wildcard_pattern(
 
 
 def matches_bash_deny_pattern(arg_pattern: str, candidate: str) -> bool:
-    if matches_wildcard_pattern(arg_pattern, candidate, overflow_match=True):
-        return True
-    if arg_pattern.endswith(" *"):
-        return matches_wildcard_pattern(
-            arg_pattern[:-2], candidate, overflow_match=True
-        )
+    """Whether a deny or ask pattern matches a command. A ` * ` between two words
+    matches any arguments between them, including none: `find * -fprint*` matches
+    `find -fprint out` as well as `find . -fprint out`. A trailing ` *` likewise
+    matches no arguments."""
+    parts = arg_pattern.split(" * ")
+    joints_choices = (
+        itertools.product((" * ", " "), repeat=len(parts) - 1) if len(parts) <= 5
+        else [(" * ",) * (len(parts) - 1)]
+    )
+    for joints in joints_choices:
+        pattern = parts[0] + "".join(joint + part for joint, part in zip(joints, parts[1:]))
+        if matches_wildcard_pattern(pattern, candidate, overflow_match=True):
+            return True
+        if pattern.endswith(" *") and matches_wildcard_pattern(
+            pattern[:-2], candidate, overflow_match=True
+        ):
+            return True
     return False
 
 
@@ -117,6 +129,19 @@ BASH_RULES: list[tuple[str, re.Pattern[str], str]] = [
         "rg --pre",
         re.compile(rf"{CMD_START}rg\b{STAGE}\s--pre(?:=|\s|$)"),
         "rg --pre runs an arbitrary command on every file; use rg without --pre.",
+    ),
+    (
+        "rg --hostname-bin",
+        re.compile(rf"{CMD_START}rg\b{STAGE}\s--hostname-bin(?:=|\s|$)"),
+        "rg --hostname-bin runs an arbitrary program; use rg without --hostname-bin.",
+    ),
+    (
+        "gh auth status --show-token",
+        # -t, or -t among combined short flags (-at); a capital -T is --template.
+        re.compile(rf"{CMD_START}gh\s+auth\s+status\b{STAGE}\s"
+                   r"(?:--show-token(?:=|\s|$)|-[a-zA-Z]*t[a-zA-Z]*(?:\s|$))"),
+        "gh auth status --show-token prints the GitHub token into the conversation; "
+        "use gh auth status without -t.",
     ),
     (
         "fd --exec",
