@@ -221,7 +221,7 @@ class AegysTest(unittest.TestCase):
             "git status",
             "git log -n 5",
             "git diff HEAD~1",
-            "rg TODO src/",
+            "rg -g '!.env' -g '!.env.*' -g '!.git' TODO src/",
             "ls -la",
             "python3 -m unittest hooks.test_aegys",
             "bash tests/install.sh",
@@ -244,7 +244,7 @@ class AegysTest(unittest.TestCase):
             "git status 2>&1 | grep -i main",
             "git diff | sed -n '1,20p' | awk '{print $1}'",
             "git status; git diff --stat && git branch --show-current",
-            "rg -n pattern src 2>/dev/null | sort | uniq -c | head -n 10",
+            "rg -g '!.env' -g '!.env.*' -g '!.git' -n pattern src 2>/dev/null | sort | uniq -c | head -n 10",
             "cd src && git status",
         ):
             res = self.evaluate(cmd, bypass_sandbox=False)
@@ -1628,6 +1628,7 @@ class AegysTest(unittest.TestCase):
         (self.work / "other").mkdir()
         for cmd in (
             "grep -r K .", "grep -r K", "grep -rn K .", "grep -R K .", "egrep -r K .",
+            "rg K", "rg K src", "rg -n K src 2>&1", "rg -g '*.py' K", "rg -g '!node_modules' K",
             "rg --hidden K", "rg -uu K", "rg -. K", "rg -u K", "rg --no-ignore K",
             "grep -r --include='*.py' K .",
             "grep -r --exclude=.env K .",            # not .env.* or .git
@@ -1653,7 +1654,7 @@ class AegysTest(unittest.TestCase):
             "rg -g '!.*' --hidden K", "rg -g '!.env*' -g '!.git/' --hidden K",
             f"diff -rN -x .env -x '.env.*' -x .git . src",
             "diff -r --exclude=.env --exclude='.env.*' --exclude=.git . src",
-            "rg K", "rg K src", "rg -n K src 2>&1",
+            f"rg {self.EXCLUDING_RG} -n K src 2>&1",
         ):
             self.assertEqual(
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
@@ -1683,22 +1684,105 @@ class AegysTest(unittest.TestCase):
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
 
-    def test_rg_default_skip_of_hidden_files_is_voided_by_an_ignore_file_whitelist(self) -> None:
-        (self.work / "src").mkdir()
+    def test_a_shortened_long_option_that_includes_the_names_again_does_not_pass(self) -> None:
+        for option in ("--incl='*'", "--inc='*'", "--inc=.env", "--includ=.env", "--include=.env"):
+            res = self.evaluate(f"grep -r {self.EXCLUDING_GREP} {option} K .",
+                                classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (option, res))
+        # An unambiguous prefix of an excluding option excludes, as grep reads it.
         self.assertEqual(
-            self.evaluate("rg K", classifier_caller=unexpected_caller), {"decision": "allow"}
+            self.evaluate("grep -r --exclude=.env --exclude='.env.*' --exclude-d=.git K .",
+                          classifier_caller=unexpected_caller),
+            {"decision": "allow"},
         )
-        for name, where in ((".rgignore", self.work), (".ignore", self.work),
-                            (".gitignore", self.work), (".rgignore", self.work.parent)):
-            (where / name).write_text("!.env\n", encoding="utf-8")
-            res = self.evaluate("rg K", classifier_caller=unexpected_caller)
-            self.assertEqual(res.get("decision"), "deny", (name, where, res))
-            # An explicit exclusion beats the whitelist.
+        # An ambiguous prefix is an error in grep and excludes nothing here.
+        res = self.evaluate("grep -r --excl=.env --exclude='.env.*' --exclude-dir=.git K .",
+                            classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_only_known_spellings_exclude_every_env_dot_name(self) -> None:
+        (self.work / "other").mkdir()
+        for pattern in ("'.env.[lpte]*'", "'.env.l*'", "'.env.*.bak'", ".env.local", "'.env?*'"):
+            for cmd in (
+                f"grep -r --exclude=.env --exclude={pattern} --exclude-dir=.git K .",
+                f"rg -g '!.env' -g '!{pattern.strip(chr(39))}' -g '!.git' K",
+                f"diff -r -x .env -x {pattern} -x .git . other",
+            ):
+                res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+                self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        for cmd in (
+            "grep -r --exclude='.env*' --exclude-dir=.git K .",
+            "grep -r --exclude='.*' --exclude-dir=.git K .",
+            "grep -r --exclude='.env*' --exclude='.env.*' --exclude-dir='.*' K .",
+            "rg -g '!.env*' -g '!.git' K", "rg -g '!.*' K",
+            "diff -r -x '.env*' -x .git . other", "diff -r -x '.*' . other",
+        ):
             self.assertEqual(
-                self.evaluate(f"rg {self.EXCLUDING_RG} K", classifier_caller=unexpected_caller),
-                {"decision": "allow"},
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
-            (where / name).unlink()
+
+    def test_a_trailing_slash_excludes_a_directory_not_a_file(self) -> None:
+        for cmd in (
+            "grep -r --exclude=.env/ --exclude='.env.*' --exclude-dir=.git K .",
+            "grep -r --exclude=.env --exclude='.env.*/' --exclude-dir=.git K .",
+            "rg -g '!.env/' -g '!.env.*' -g '!.git' K",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        self.assertEqual(
+            self.evaluate("grep -r --exclude=.env --exclude='.env.*' --exclude-dir=.git/ K .",
+                          classifier_caller=unexpected_caller),
+            {"decision": "allow"},
+        )
+
+    def test_a_search_that_starts_in_a_git_directory_is_denied_whatever_it_excludes(self) -> None:
+        (self.work / ".git" / "hooks").mkdir()
+        for cmd in (
+            f"rg url .git", f"rg {self.EXCLUDING_RG} TOKEN .git", f"rg {self.EXCLUDING_RG} TOKEN .git/",
+            f"grep -r {self.EXCLUDING_GREP} TOKEN .git", f"grep -r {self.EXCLUDING_GREP} TOKEN .git/",
+            f"grep -r {self.EXCLUDING_GREP} TOKEN .git/.", f"grep -r {self.EXCLUDING_GREP} TOKEN .git/hooks",
+            f"grep -r {self.EXCLUDING_GREP} TOKEN ./.git/../.git",
+            f"diff -r -x .env -x '.env.*' -x .git .git other",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+            self.assertIn(".git", res.get("reason", ""), (cmd, res))
+
+    def test_git_diff_of_a_path_outside_the_work_tree_is_a_no_index_diff(self) -> None:
+        (self.work.parent / "empty").mkdir()
+        (self.work / "src").mkdir()
+        (self.work / "other").mkdir()
+        for cmd in ("git diff . ../empty", "git diff --stat . /tmp", f"git diff {self.work.parent}/empty .",
+                    "git diff -- . ../empty"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        for cmd in ("git diff", "git diff HEAD~1 HEAD", "git diff HEAD -- src", "git diff src other",
+                    "git diff --stat"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_readers_of_a_file_list_are_not_fast_allowed(self) -> None:
+        self.assert_not_fast_allowed((
+            "find . -print0 | sort --files0-from=-", "sort --files0-from=names.lst",
+            "sort --files0-from names.lst", "sort --files0=names.lst", "wc --files0-from=-",
+            "du --files0-from=-", "wc --fil=-",
+        ))
+        for cmd in ("sort -n f.txt", "wc -l f.txt", "du -sh ."):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_reading_the_index_reaches_the_classifier(self) -> None:
+        # `git add .` stages an un-ignored .env.*, which these then print.
+        self.assert_not_fast_allowed((
+            "git diff --cached", "git diff --staged", "git diff --cac", "git diff --stag",
+            "git diff --cached HEAD", "git show :.env.staging", "git cat-file -p :.env.staging",
+        ))
+        for cmd in ("git diff HEAD", "git diff --stat", "git show HEAD", "git cat-file -p HEAD"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
 
     def test_the_denial_of_a_recursive_search_gives_the_flags_to_add(self) -> None:
         (self.work / "other").mkdir()

@@ -216,15 +216,11 @@ class SearchExclusionTest(unittest.TestCase):
     def test_an_ignore_case_filter_matches_in_any_letter_case(self) -> None:
         self.assertFalse(name_filtered_out(".env", False, (NameFilter(True, ".env"), NameFilter(False, ".ENV", ignore_case=True))))
 
-    def test_uncovered_secrets_lists_what_no_filter_or_hidden_skip_covers(self) -> None:
+    def test_uncovered_secrets_lists_what_no_filter_covers(self) -> None:
         search = search_starts(["grep", "-r", "--exclude=.env", "K", "."])
-        self.assertEqual(
-            uncovered_secrets(search),
-            [".env.local", ".env.production", ".env.test", ".env.example", ".git"],
-        )
-        self.assertEqual(uncovered_secrets(search_starts(["rg", "K"])), [])
-        self.assertEqual(uncovered_secrets(search_starts(["rg", "--no-ignore", "K"])),
-                         [".env", ".env.local", ".env.production", ".env.test", ".env.example", ".git"])
+        self.assertEqual(uncovered_secrets(search), [".env.*", ".git"])
+        self.assertEqual(uncovered_secrets(search_starts(["rg", "K"])), [".env", ".env.*", ".git"])
+        self.assertEqual(uncovered_secrets(search_starts(["rg", "-g", "!.env*", "-g", "!.git", "K"])), [])
 
     def test_a_glob_with_a_slash_never_counts_as_an_exclusion(self) -> None:
         search = search_starts(["rg", "--hidden", "-g", "!src/.env", "K"])

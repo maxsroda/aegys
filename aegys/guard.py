@@ -127,6 +127,8 @@ from .command_checks import (
     expand_home,
     expand_word,
     gh_shows_token,
+    reads_a_file_list,
+    reads_the_index,
     git_add_forces,
     git_settings_match,
     host_denial_reason,
@@ -636,6 +638,10 @@ def stage_matches_allow_patterns(
     if len(redirects) > 1:
         return False
     if stage_touches_protected_path(stage, home):
+        return False
+    # sort --files0-from and its kin print every file a list names; git diff --cached and
+    # its kin print what `git add .` staged: the classifier judges them.
+    if reads_a_file_list(stage.words) or reads_the_index(stage.words):
         return False
     # `git add -f` stages a file the repository ignores (a .env), and `git diff --cached`
     # then prints it: the classifier judges it.
@@ -2029,10 +2035,6 @@ def decide_pre_tool_use(
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home_path)}
 
-    search_denial = recursive_search_denial(stages, home_path, policy.secret_paths)
-    if search_denial:
-        return deny(f"Blocked by {GUARD_NAME}: {search_denial}.")
-
     stage_candidates = [command.strip()]
     for st in stages:
         if st.text.strip():
@@ -2043,6 +2045,10 @@ def decide_pre_tool_use(
     for pat in policy.shell_deny:
         if any(matches_bash_deny_pattern(pat, cand) for cand in stage_candidates):
             return deny(f"Blocked by {GUARD_NAME}: command matches deny rule {pat!r}.")
+
+    search_denial = recursive_search_denial(stages, home_path, policy.secret_paths)
+    if search_denial:
+        return deny(f"Blocked by {GUARD_NAME}: {search_denial}.")
 
     # 2. Privilege escalation (`sudo`, `doas`) and the ask rules always force a user prompt.
     if any(st.raw and os.path.basename(st.raw[0]) in PRIVILEGE_WRAPPERS for st in stages):
