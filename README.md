@@ -5,7 +5,11 @@
 <h1 align="center">aegys</h1>
 
 <p align="center">
-  <strong>Tired of <em>agy</em> asking you for permission on every small thing? Longing for the smooth ride of Claude Code's auto mode? You've come to the right place.</strong>
+  <strong>
+    Tired of <em>agy</em> asking you for permission on every small thing?<br>
+    Longing for the smooth ride of Claude Code's auto mode?<br>
+    You've come to the right place.
+  </strong>
 </p>
 
 ---
