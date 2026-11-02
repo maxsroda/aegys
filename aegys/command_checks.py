@@ -313,6 +313,104 @@ def heredoc_bodies(command: str) -> tuple[str, list[str]]:
     return "".join(out), bodies
 
 
+def command_substitutions(text: str) -> list[str]:
+    """Every `$(...)` and `` `...` `` command substitution in `text` (outside
+    single quotes and `$((...))` arithmetic), in order."""
+    subs: list[str] = []
+    quote = ""
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = ""
+            i += 1
+            continue
+        if quote == "$'":
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == "'":
+                quote = ""
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if not quote and c == "$" and i + 1 < n and text[i + 1] == "'":
+            quote = "$'"
+            i += 2
+            continue
+        if c == '"' and quote in ("", '"'):
+            quote = "" if quote == '"' else '"'
+            i += 1
+            continue
+        if not quote and c == "'":
+            quote = "'"
+            i += 1
+            continue
+        if text.startswith("$((", i):
+            depth_arith = 1
+            j = i + 3
+            while j < n and depth_arith > 0:
+                if text.startswith("((", j):
+                    depth_arith += 1
+                    j += 2
+                elif text.startswith("))", j):
+                    depth_arith -= 1
+                    j += 2
+                else:
+                    j += 1
+            i = j
+            continue
+        if text.startswith("$(", i):
+            depth_parens = 1
+            sub_quote = ""
+            j = i + 2
+            while j < n and depth_parens > 0:
+                ch = text[j]
+                if sub_quote == "'":
+                    if ch == "'":
+                        sub_quote = ""
+                elif ch == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                elif sub_quote == '"':
+                    if ch == '"':
+                        sub_quote = ""
+                else:
+                    if ch in ("'", '"'):
+                        sub_quote = ch
+                    elif ch == "(":
+                        depth_parens += 1
+                    elif ch == ")":
+                        depth_parens -= 1
+                        if depth_parens == 0:
+                            break
+                j += 1
+            if depth_parens == 0:
+                subs.append(text[i + 2 : j])
+                i = j + 1
+                continue
+        if c == "`":
+            j = i + 1
+            buf: list[str] = []
+            while j < n and text[j] != "`":
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in ("$", "`", "\\", '"'):
+                    buf.append(text[j + 1])
+                    j += 2
+                else:
+                    buf.append(text[j])
+                    j += 1
+            if j < n and text[j] == "`":
+                subs.append("".join(buf))
+                i = j + 1
+                continue
+        i += 1
+    return subs
+
+
 @dataclass
 class Stage:
     """One command of a pipeline or list, as it will run."""
@@ -389,6 +487,12 @@ def command_stages(command: str, cwd: Path, home: Path, depth: int = 0) -> list[
                     current = resolve_word(target, current, home)
                 except (ValueError, OSError, RuntimeError):
                     known = False
+    if depth < 3:
+        for sub in command_substitutions(command):
+            inner = command_stages(sub, current, home, depth + 1)
+            if inner is None:
+                return None
+            stages.extend(inner)
     return stages
 
 
@@ -763,7 +867,7 @@ READ_ONLY_PROGRAMS = READERS | {
     "jq", "sha1sum", "sha256sum", "shasum", "md5sum", "nl", "uniq", "cut", "tr",
     "column", "basename", "dirname", "pwd", "test", "[", "echo", "printf", "cd",
     "pushd", "sed", "sort", "find", "tree", "git", "export", "declare", "typeset", "unset",
-    "set", "alias", "local", "readonly",
+    "set", "alias", "local", "readonly", "for", "select", "case",
 }
 # git subcommands that leave the working tree's files as they are.
 GIT_FILE_KEEPING = {"diff", "log", "show", "status", "blame", "ls-files", "ls-tree",
