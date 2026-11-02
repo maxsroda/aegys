@@ -33,8 +33,9 @@ WRAPPERS = {
 }
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 ENV_DUMP_WHY = "printing the environment exposes API keys; not needed here"
-# Compound-command keywords: `{ git push; }` and `do git push` run the words after them.
-KEYWORDS = {"{", "!", "if", "then", "else", "elif", "while", "until", "do", "coproc"}
+# Compound-command keywords: `{ git push; }` and `do git push` run the words after them;
+# closing keywords (`done`, `fi`, `esac`, `}`) end a compound block.
+KEYWORDS = {"{", "}", "!", "if", "then", "else", "elif", "fi", "while", "until", "do", "done", "esac", "coproc"}
 
 # Programs whose words are search patterns and read-only operands: a `..` or `.git`
 # in them is a regex or an exclusion, not a path to leave the worktree by.
@@ -95,6 +96,15 @@ def unwrap(words: list[str]) -> tuple[list[str], str | None]:
         if words[0] == "coproc" and len(words) > 2 and words[2] == "{":   # coproc NAME { body; }
             del words[:2]
             continue
+        if words[0] in ("for", "select"):                    # for NAME [in WORDS...]; select NAME [in WORDS...]
+            if len(words) >= 3 and words[2] == "in":
+                return [words[0], *words[3:]], None
+            if len(words) >= 3 and words[2] == "do":         # for NAME do CMD; done
+                del words[:3]
+                continue
+            return [], None
+        if words[0] == "case":                               # case WORD in ...
+            return (["case", words[1]] if len(words) >= 2 else []), None
         if words[0] in KEYWORDS:
             words.pop(0)
             continue
