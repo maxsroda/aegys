@@ -57,6 +57,28 @@ class UnwrapTest(unittest.TestCase):
         self.assertEqual(
             words.unwrap(["function", "f", "{", "git", "push"]), (["git", "push"], None)
         )
+        self.assertEqual(words.unwrap(["done"]), ([], None))
+        self.assertEqual(words.unwrap(["fi"]), ([], None))
+        self.assertEqual(words.unwrap(["esac"]), ([], None))
+        self.assertEqual(words.unwrap(["}"]), ([], None))
+        self.assertEqual(
+            words.unwrap(["for", "f", "in", "a.json", "b.json"]),
+            (["for", "a.json", "b.json"], None),
+        )
+        self.assertEqual(words.unwrap(["for", "f"]), ([], None))
+        self.assertEqual(
+            words.unwrap(["for", "f", "do", "rm", "-rf", "~"]),
+            (["rm", "-rf", "~"], None),
+        )
+        self.assertEqual(
+            words.unwrap(["select", "opt", "in", "x", "y"]),
+            (["select", "x", "y"], None),
+        )
+        self.assertEqual(
+            words.unwrap(["select", "opt", "do", "rm", "-rf", "~"]),
+            (["rm", "-rf", "~"], None),
+        )
+        self.assertEqual(words.unwrap(["case", "$x", "in"]), (["case", "$x"], None))
 
     def test_a_timeout_duration_is_skipped(self) -> None:
         self.assertEqual(words.unwrap(["timeout", "5", "rm", "x"]), (["rm", "x"], None))

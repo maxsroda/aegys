@@ -22,6 +22,7 @@ from aegys.guard import (
     guard_enabled,
     pre_invocation_response,
     load_guard_state,
+    read_state_file,
 )
 
 # The checkout root: the tests run from here, so `python -m aegys.guard` imports this package.
@@ -1452,6 +1453,259 @@ class AegysTest(unittest.TestCase):
             )
         self.assertTrue(line.startswith(ALERT_RED), line)
         self.assertIn("aegys ✗ default-config.json unreadable", line)
+
+    def test_read_only_for_loop_over_state_files_is_not_judged_a_write(self) -> None:
+        cmd = (
+            'cd ~/.gemini/antigravity-cli/auto-guard-state && '
+            'for f in default.json conv-1234.json; do echo "$f: $(jq -c \'{enabled}\' $f 2>&1)"; done'
+        )
+        res = self.evaluate(cmd, classifier_caller=allow_caller)
+        self.assertEqual(res, {"decision": "allow"}, res)
+
+    def test_malformed_fast_classifier_response_is_retried_once_before_failing_closed(self) -> None:
+        attempts = 0
+
+        def flaky_fast_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            nonlocal attempts
+            self.assertIsNone(tools)
+            attempts += 1
+            if attempts == 1:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "allow"}]}
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "0"}]}
+
+        state_file = str(self.home / ".gemini" / "antigravity-cli" / "auto-guard-state" / "default.json")
+        res = self.evaluate_file("read_file", state_file, classifier_caller=flaky_fast_caller)
+        self.assertEqual(res, {"decision": "allow"}, res)
+        self.assertEqual(attempts, 2)
+
+        always_bad_attempts = 0
+
+        def always_bad_fast_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            nonlocal always_bad_attempts
+            always_bad_attempts += 1
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "not-a-digit"}]}
+
+        res_bad = self.evaluate_file("read_file", state_file, classifier_caller=always_bad_fast_caller)
+        self.assertEqual(res_bad.get("decision"), "deny", res_bad)
+        self.assertIn("not 0 or 1", res_bad.get("reason", ""))
+        self.assertEqual(always_bad_attempts, 2)
+
+    def test_evasion_rule_compares_risky_action_and_clears_on_post_deny_user_permission(self) -> None:
+        # 1. Pipeline with rm -rf "$d" is denied as critical-path rm.
+        denied_pipeline = (
+            'd=$(mktemp -d) && git clone . "$d/repo" && '
+            'git -C "$d/repo" filter-repo --subdirectory-filter sub && rm -rf "$d"'
+        )
+        res1 = self.evaluate(
+            denied_pipeline,
+            last_user_input="Split sub/ history into a new repo.",
+            classifier_caller=unexpected_caller,
+        )
+        self.assertEqual(res1.get("decision"), "deny", res1)
+        self.assertIn("critical path", res1.get("reason", ""))
+
+        # 2. Follow-up commands that remove the `rm` (mktemp pipeline, or lone git clone)
+        # go to the classifier, where the system prompt instructs that removing the risky
+        # sub-step is compliance, not evasion, and the denial metadata shows the reason.
+        captured_prompts: list[str] = []
+        captured_contexts: list[str] = []
+
+        def inspecting_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            captured_prompts.append(sys_prompt)
+            captured_contexts.extend(
+                part.get("text", "") for m in msgs for part in m["content"]
+            )
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "0"}]}
+
+        safe_pipeline = (
+            'd=$(mktemp -d) && git clone . "$d/repo" && '
+            'git -C "$d/repo" filter-repo --subdirectory-filter sub'
+        )
+        res2 = self.evaluate(
+            safe_pipeline,
+            last_user_input="Split sub/ history into a new repo.",
+            classifier_caller=inspecting_caller,
+        )
+        self.assertEqual(res2, {"decision": "allow"}, res2)
+        self.assertTrue(
+            any("removes or replaces the risky operation" in p for p in captured_prompts),
+            captured_prompts,
+        )
+
+        # 3. Soft-deny on an action, followed by explicit user permission ("I PERMIT THIS ACTION"):
+        # - `<recent-denied-actions>` marks the earlier deny as before the latest user message.
+        # - Even an exact repeat of the soft-denied command after the user's new message is sent
+        #   to the classifier without counting as an automatic repeat strike, and when allowed,
+        #   clears the block.
+        soft_cmd = 'd=$(mktemp -d) && git clone . "$d"'
+        res_soft = self.evaluate(
+            soft_cmd,
+            last_user_input="Split sub/ history into a new repo.",
+            classifier_caller=soft_deny_caller,
+        )
+        self.assertEqual(res_soft.get("decision"), "deny", res_soft)
+        self.assertIn("soft_deny", res_soft.get("reason", ""))
+
+        post_auth_contexts: list[str] = []
+
+        def explicit_intent_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            post_auth_contexts.extend(
+                part.get("text", "") for m in msgs for part in m["content"]
+            )
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": CLASSIFIER_DECISION_TOOL_NAME,
+                        "input": {
+                            "decision": "allow",
+                            "tier": "explicit_intent",
+                            "reason": "Direct user authorization after the deny permits this clone.",
+                        },
+                    }
+                ],
+            }
+
+        res_permitted = self.evaluate(
+            soft_cmd,
+            last_user_input="I PERMIT THIS ACTION: clone this repo into a fresh mktemp folder for the split task.",
+            classifier_caller=explicit_intent_caller,
+        )
+        self.assertEqual(res_permitted, {"decision": "allow"}, res_permitted)
+        self.assertTrue(
+            any("before latest user message" in c and "tier=soft_deny" in c for c in post_auth_contexts),
+            post_auth_contexts,
+        )
+        self.assertTrue(
+            any("Direct user authorization given after a deny" in p for p in captured_prompts),
+            captured_prompts,
+        )
+
+        # 4. If the user writes a message that does NOT authorize the soft-denied action
+        # (e.g., "try again" without naming scope/task) and the agent repeats the exact
+        # command, the classifier still blocks it, and the repeat after a new user message
+        # does not falsely say "attempt 1 at a goal aegys already denied" unless it was
+        # repeated in the same user turn or flagged as evasion.
+        unscoped_cmd = 'd=$(mktemp -d) && git clone . "$d/two"'
+        res_soft2 = self.evaluate(
+            unscoped_cmd,
+            last_user_input="Split sub/ history into a new repo.",
+            classifier_caller=soft_deny_caller,
+        )
+        self.assertEqual(res_soft2.get("decision"), "deny", res_soft2)
+        res_soft2_after_user = self.evaluate(
+            unscoped_cmd,
+            last_user_input="Try again please.",
+            classifier_caller=soft_deny_caller,
+        )
+        self.assertEqual(res_soft2_after_user.get("decision"), "deny", res_soft2_after_user)
+        self.assertNotIn("attempt 1 at a goal", res_soft2_after_user.get("reason", ""))
+
+    def test_explicit_user_intent_clears_strike_counter_and_timestamp(self) -> None:
+        cmd = 'd=$(mktemp -d) && git clone . "$d"'
+        res1 = self.evaluate(cmd, last_user_input="Task", classifier_caller=soft_deny_caller)
+        self.assertEqual(res1.get("decision"), "deny", res1)
+        res2 = self.evaluate(cmd, last_user_input="Task", classifier_caller=soft_deny_caller)
+        self.assertEqual(res2.get("decision"), "deny", res2)
+        self.assertIn("attempt 1 at a goal", res2.get("reason", ""))
+        state_before = read_state_file(self.home, "conv-1234")
+        self.assertEqual(state_before.get("strikes"), 1, state_before)
+        self.assertIn("strike_at", state_before)
+
+        def explicit_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": CLASSIFIER_DECISION_TOOL_NAME,
+                        "input": {
+                            "decision": "allow",
+                            "tier": "explicit_intent",
+                            "reason": "Direct user authorization after deny.",
+                        },
+                    }
+                ],
+            }
+
+        res3 = self.evaluate(
+            cmd,
+            last_user_input="I PERMIT THIS ACTION: clone repo into temp folder",
+            classifier_caller=explicit_caller,
+        )
+        self.assertEqual(res3, {"decision": "allow"}, res3)
+        state_after = read_state_file(self.home, "conv-1234")
+        self.assertEqual(state_after.get("strikes"), 0, state_after)
+        self.assertNotIn("strike_at", state_after)
+
+    def test_evasion_deny_repeated_after_new_user_message_is_not_auto_strike(self) -> None:
+        cmd = 'd=$(mktemp -d) && git clone . "$d/evasion-test"'
+
+        def evasion_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": CLASSIFIER_DECISION_TOOL_NAME,
+                        "input": {
+                            "decision": "block",
+                            "tier": "evasion",
+                            "reason": "Circumvents earlier deny.",
+                        },
+                    }
+                ],
+            }
+
+        res1 = self.evaluate(cmd, last_user_input="Task 1: do work", classifier_caller=evasion_caller)
+        self.assertEqual(res1.get("decision"), "deny", res1)
+        self.assertIn("attempt 1 at a goal", res1.get("reason", ""))
+
+        res2 = self.evaluate(
+            cmd,
+            last_user_input="Task 2: try again please",
+            classifier_caller=soft_deny_caller,
+        )
+        self.assertEqual(res2.get("decision"), "deny", res2)
+        self.assertNotIn("attempt 2 at a goal", res2.get("reason", ""))
+        self.assertNotIn("attempt 1 at a goal", res2.get("reason", ""))
 
 
 if __name__ == "__main__":
