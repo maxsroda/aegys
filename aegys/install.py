@@ -11,13 +11,17 @@ It merges three things into the user's agy config, keeping everything else:
 3. The same file's ``statusLine``: the aegys chip. A status line that is not aegys's
    is kept, and the install says so.
 
+What install added is recorded in ``~/.gemini/aegys/installed.json``.
+
 The hooks are written before the grants, since the grants alone let agy run
 anything. Each file is copied to ``<name>.aegys-backup`` before it changes and is
 replaced in one step. If ``~/.local/bin/aegys`` is missing or either file does not
 parse, nothing is written.
 
-Uninstall removes the grants first and the hooks second, and keeps a status line
-that is not aegys's. It does not need the launcher.
+Uninstall removes the grants install recorded (all three if there is no record),
+then the hooks, and any status line that runs aegys, and backs up to
+``<name>.aegys-uninstall-backup`` so the pre-install backup survives. It does not
+need the launcher.
 """
 from __future__ import annotations
 
@@ -72,13 +76,13 @@ def read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def write_json_object(path: Path, value: dict[str, Any]) -> bool:
+def write_json_object(path: Path, value: dict[str, Any], backup_suffix: str = ".aegys-backup") -> bool:
     """Write value to path, backing up the old file first. False when nothing changed."""
     text = json.dumps(value, indent=2, ensure_ascii=False) + "\n"
     if path.exists():
         if path.read_text(encoding="utf-8") == text:
             return False
-        shutil.copy2(path, path.with_name(path.name + ".aegys-backup"))
+        shutil.copy2(path, path.with_name(path.name + backup_suffix))
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(text, encoding="utf-8")
@@ -86,10 +90,24 @@ def write_json_object(path: Path, value: dict[str, Any]) -> bool:
     return True
 
 
+def is_aegys_status_line(status_line: object) -> bool:
+    """True for a status line that runs the aegys chip, however it was written."""
+    command = str(status_line.get("command", "")) if isinstance(status_line, dict) else ""
+    return ".local/bin/aegys" in command and "--statusline" in command
+
+
+def config_paths(home: Path) -> tuple[Path, Path, Path]:
+    """agy's hooks file, agy's settings file, and the record of what install added."""
+    return (
+        home / ".gemini" / "config" / "hooks.json",
+        home / ".gemini" / "antigravity-cli" / "settings.json",
+        home / ".gemini" / "aegys" / "installed.json",
+    )
+
+
 def install(home: Path) -> list[str]:
     """Wire aegys into agy's config under home. Returns one note per thing done or left."""
-    hooks_path = home / ".gemini" / "config" / "hooks.json"
-    settings_path = home / ".gemini" / "antigravity-cli" / "settings.json"
+    hooks_path, settings_path, record_path = config_paths(home)
     launcher = home / ".local" / "bin" / "aegys"
     if not os.access(launcher, os.X_OK):
         # agy refuses every guarded tool call whose hook program is missing, so
@@ -101,29 +119,41 @@ def install(home: Path) -> list[str]:
         )
     hooks = read_json_object(hooks_path)
     settings = read_json_object(settings_path)
+    record = read_json_object(record_path)
     notes: list[str] = []
-
-    hooks["aegys"] = AEGYS_HOOKS
-    hooks_written = write_json_object(hooks_path, hooks)
-    if hooks_written:
-        notes.append(f"Wrote the aegys hooks to {hooks_path}.")
 
     permissions = settings.get("permissions")
     if not isinstance(permissions, dict):
         permissions = settings["permissions"] = {}
     allow = permissions.get("allow")
-    if not isinstance(allow, list):
+    created_allow_list = not isinstance(allow, list)
+    if created_allow_list:
         allow = permissions["allow"] = []
-    allow.extend(grant for grant in AEGYS_GRANTS if grant not in allow)
+    added_grants = [grant for grant in AEGYS_GRANTS if grant not in allow]
+    allow.extend(added_grants)
 
     status_line = settings.get("statusLine")
-    if status_line is None or status_line == AEGYS_STATUS_LINE:
+    if status_line is None:
         settings["statusLine"] = AEGYS_STATUS_LINE
-    else:
+    elif not is_aegys_status_line(status_line):
         notes.append(
             f"Kept your statusLine in {settings_path}; to see the aegys chip, set its "
             f"command to {AEGYS_STATUS_LINE['command']}."
         )
+
+    # The record goes first, so uninstall knows what to take back even if a later
+    # write fails. A reinstall adds to it.
+    previous_grants = record.get("addedGrants") if isinstance(record.get("addedGrants"), list) else []
+    record = {
+        "addedGrants": [g for g in AEGYS_GRANTS if g in previous_grants or g in added_grants],
+        "createdAllowList": bool(record.get("createdAllowList")) or created_allow_list,
+    }
+    write_json_object(record_path, record)
+
+    hooks["aegys"] = AEGYS_HOOKS
+    hooks_written = write_json_object(hooks_path, hooks)
+    if hooks_written:
+        notes.append(f"Wrote the aegys hooks to {hooks_path}.")
     settings_written = write_json_object(settings_path, settings)
     if settings_written:
         notes.append(f"Wrote the grants and the status line to {settings_path}.")
@@ -135,35 +165,54 @@ def install(home: Path) -> list[str]:
 def uninstall(home: Path) -> list[str]:
     """Remove what install added from agy's config under home, keeping the rest.
     Returns one note per thing done or left."""
-    hooks_path = home / ".gemini" / "config" / "hooks.json"
-    settings_path = home / ".gemini" / "antigravity-cli" / "settings.json"
+    hooks_path, settings_path, record_path = config_paths(home)
     hooks = read_json_object(hooks_path)
     settings = read_json_object(settings_path)
+    record = read_json_object(record_path)
     settings_before = copy.deepcopy(settings)
     notes: list[str] = []
 
-    # Grants first: without them agy asks again, so a stop between the two writes
+    has_record = isinstance(record.get("addedGrants"), list)
+    if has_record:
+        removed_grants = [g for g in AEGYS_GRANTS if g in record["addedGrants"]]
+        created_allow_list = bool(record.get("createdAllowList"))
+    else:
+        # Wired by hand or by an older aegys: nothing says which grants were the user's.
+        removed_grants = list(AEGYS_GRANTS)
+        created_allow_list = True
+    # Grants first: without them agy asks again, so a stop between the writes
     # leaves agy asking, not open.
     permissions = settings.get("permissions")
     allow = permissions.get("allow") if isinstance(permissions, dict) else None
     if isinstance(allow, list):
-        permissions["allow"] = [grant for grant in allow if grant not in AEGYS_GRANTS]
-        if not permissions["allow"]:
+        still_there = [g for g in removed_grants if g in allow]
+        permissions["allow"] = [grant for grant in allow if grant not in removed_grants]
+        if not has_record and still_there:
+            notes.append(
+                "No record of what aegys install added, so all aegys grants were removed: "
+                + ", ".join(still_there) + ". Add back any you had before."
+            )
+        if created_allow_list and not permissions["allow"]:
             del permissions["allow"]
-        if not permissions:
-            del settings["permissions"]
-    if settings.get("statusLine") == AEGYS_STATUS_LINE:
+            if not permissions:
+                del settings["permissions"]
+    if is_aegys_status_line(settings.get("statusLine")):
         del settings["statusLine"]
-    if settings != settings_before and write_json_object(settings_path, settings):
-        notes.append(f"Removed the aegys grants and status line from {settings_path}.")
+    if settings != settings_before:
+        write_json_object(settings_path, settings, ".aegys-uninstall-backup")
+        notes.insert(0, f"Removed the aegys grants and status line from {settings_path}.")
 
     if "aegys" in hooks:
         del hooks["aegys"]
-        write_json_object(hooks_path, hooks)
+        write_json_object(hooks_path, hooks, ".aegys-uninstall-backup")
         notes.append(f"Removed the aegys hooks from {hooks_path}.")
+    if record_path.exists():
+        record_path.unlink()
 
     if not notes:
         notes.append("aegys was not wired into agy; nothing changed.")
+    else:
+        notes.append(f"Left your aegys config in {record_path.parent} alone.")
     return notes
 
 
