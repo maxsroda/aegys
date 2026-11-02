@@ -30,6 +30,7 @@
 - Asks you before `sudo`, `doas`, and commands on your own ask list.
 - Sends the rest to a classifier model of your choice, which allows or denies. When the agent retries a denied risky operation by another route without your authorization, *aegys* denies again and tells it to change course.
 - Allows file reads and writes inside your workspace, except config files such as `.git` or `.bashrc`; checks the rest the same way as commands.
+- Lets `list_directory`, `grep_search` and `find` search outside the workspace, and keeps them allowed with `/aegys off`. It denies them only for credential paths, and for `grep_search` and `find` a folder above one; the classifier never sees them.
 - `/aegys off` hands decisions back to you for one conversation: hard blocks stay, and most commands ask first. `/aegys on` switches the guard back.
 - Reads your own allow/ask/deny lists and settings from `~/.gemini/aegys/config.json` on top of the shipped defaults.
 - Asks you instead of guessing when its config is broken or the classifier is unreachable.
@@ -37,6 +38,17 @@
 You choose the classifier model and give *aegys* its API key. The default model is Claude Haiku 5.5 Low.
 
 > **Note:** for now *aegys* speaks only Anthropic's API, so the model must be a Claude model or sit behind an Anthropic-compatible endpoint, and the key goes in `ANTHROPIC_API_KEY`. Support for other providers is tracked in [#13](https://github.com/maxsroda/aegys/issues/13).
+
+## What the classifier sees
+
+On each call it judges, the classifier gets:
+
+- The action: the full text of a shell command; for a file tool, its name and arguments as JSON, cut to 8000 characters.
+- Your messages and the agent's tool calls with their arguments, from this conversation. Tool outputs and the agent's own prose are not sent.
+- The instruction files: `~/.gemini/config/AGENTS.md`, and `AGENTS.md`, `GEMINI.md` and `CLAUDE.md` from each workspace folder. Each is cut to 4000 characters.
+- The recent denials in this conversation, so it can spot a retry by another route.
+
+Your messages and the tool calls each get a budget of about 4000 tokens (four characters per token), and one entry is cut at about 1000 tokens. Only the 40 most recent tool calls are sent.
 
 ## Install
 
