@@ -164,6 +164,26 @@ class UninstallTest(AgyHome):
         backup = self.settings.with_name("settings.json.aegys-backup")
         self.assertEqual(self.read(backup), {"theme": "light"})
 
+    def test_the_catch_all_grant_never_outlives_the_hook(self) -> None:
+        self.write(self.settings, {"permissions": {"allow": ["command(regex:(?s).*)"]}})
+        install(self.home)
+        notes = uninstall(self.home)
+        self.assertEqual(self.read(self.settings), {"permissions": {"allow": []}})
+        self.assertTrue(any("command(regex:(?s).*)" in note for note in notes))
+
+    def test_a_broken_install_record_falls_back_to_removing_all_grants(self) -> None:
+        install(self.home)
+        self.write(self.home / ".gemini" / "aegys" / "installed.json", "{broken")
+        uninstall(self.home)
+        self.assertEqual(self.read(self.settings), {})
+        self.assertNotIn("aegys", self.read(self.hooks))
+
+    def test_uninstall_leaves_no_record_files_behind(self) -> None:
+        install(self.home)
+        install(self.home)
+        uninstall(self.home)
+        self.assertEqual(list((self.home / ".gemini" / "aegys").iterdir()), [])
+
     def test_uninstall_removes_the_install_record(self) -> None:
         install(self.home)
         uninstall(self.home)
