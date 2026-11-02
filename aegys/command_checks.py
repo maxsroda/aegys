@@ -1202,8 +1202,10 @@ def search_denial(start: Path, reached: Path) -> str:
     excluded = ".git" if reached.parts[-2:] == (".git", "config") else reached.name
     grep_flag = f"--exclude-dir={excluded}" if excluded == ".git" or reached.is_dir() \
         else f"--exclude={excluded}"
-    return (f"a recursive search from {start} would read {reached}, which holds keys, "
-            "credentials or session transcripts. Rerun it without that: "
+    holds = ("remote URLs that may embed a credential" if excluded == ".git"
+             else "keys, credentials or session transcripts")
+    return (f"a recursive search from {start} would read {reached}, which holds {holds}. "
+            "Rerun it without that: "
             f"grep {grep_flag}, rg -g '!{excluded}', diff -x {excluded}; or search a "
             "directory that does not contain it")
 

@@ -1757,7 +1757,7 @@ class AegysTest(unittest.TestCase):
             self.evaluate("rg K", classifier_caller=unexpected_caller), {"decision": "allow"}
         )
         for name, where in ((".rgignore", self.work), (".ignore", self.work),
-                            (".rgignore", self.work.parent)):
+                            (".gitignore", self.work), (".rgignore", self.work.parent)):
             (where / name).write_text("!.env\n", encoding="utf-8")
             res = self.evaluate("rg K", classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (name, where, res))
