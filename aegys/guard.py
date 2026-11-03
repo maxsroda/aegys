@@ -113,12 +113,15 @@ from .config import (
     shipped_problem,
 )
 from .command_checks import (
+    AWK_PROGRAMS,
     BASH_RULES,
     PACKAGE_DIR,
     PRIVILEGE_WRAPPERS,
+    READ_ONLY_PROGRAMS,
     SYSTEM_TEMP_ROOTS,
     Stage,
     ancestor_operands,
+    awk_reads_only,
     bash_path_denial,
     canonicalize_case,
     command_stages,
@@ -136,16 +139,20 @@ from .command_checks import (
     host_denial_reason,
     inline_code,
     input_targets,
+    jq_reads_only,
     inside,
     matches_bash_deny_pattern,
     matches_wildcard_pattern,
     program_writes,
+    pager_reads_only,
+    prints_environment,
+    ps_reads_only,
     redirect_targets,
     resolve_word,
     secret,
     recursive_search_denial,
     secret_below,
-    sed_writes,
+    sed_reads_only,
     stage_paths,
     urls_in,
     written_operands,
@@ -586,31 +593,6 @@ def normalize_stage_for_allow(stage: Stage) -> tuple[str, tuple[str, ...]] | Non
     return " ".join(kept), tuple(redirects)
 
 
-def awk_writes(args: list[str]) -> bool:
-    """True when awk uses `-i inplace`, `-f`, or `print/printf ... >` in its script."""
-    scripts: list[str] = []
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg in ("-f", "--file", "-i", "--include") or arg.startswith(
-            ("--file=", "--include=", "-i")
-        ):
-            return True
-        if arg in ("-F", "-v", "-W") and i + 1 < len(args):
-            i += 2
-            continue
-        if arg.startswith("-"):
-            i += 1
-            continue
-        if not scripts:
-            scripts.append(arg)
-        i += 1
-    for script in scripts:
-        if re.search(r"\b(?:system|getline)\b|>>?|\|", script):
-            return True
-    return False
-
-
 def stage_touches_protected_path(stage: Stage, home: Path) -> bool:
     """True when a writing stage targets one of DEFAULT_PROTECTED_PATHS."""
     if not program_writes(stage.words):
@@ -626,6 +608,10 @@ def stage_touches_protected_path(stage: Stage, home: Path) -> bool:
             elif protected in parts or path.name == protected:
                 return True
     return False
+
+
+# Readers that print a file's name, size, times and mode, never its content.
+METADATA_READERS = {"ls", "stat"}
 
 
 def stage_matches_allow_patterns(
@@ -652,22 +638,42 @@ def stage_matches_allow_patterns(
     # then prints it: the classifier judges it.
     if git_add_forces(stage.words):
         return False
+    program, args = os.path.basename(stage.words[0]), stage.words[1:]
     # A git settings file holds remote URLs, which may embed a credential: a repository's
     # .git/config (also a submodule's, a worktree's, in any letter case, or a link to one)
     # and ~/.gitconfig. Reading one takes a classifier check; writing one already does.
-    if any(git_settings_match(path, home) or path.name.lower() == "config.worktree"
-           and ".git" in (part.lower() for part in path.parts[:-1])
-           for path in stage_paths(stage, home)):
+    # ls and stat print only a file's metadata.
+    if program not in METADATA_READERS and any(
+            git_settings_match(path, home) or path.name.lower() == "config.worktree"
+            and ".git" in (part.lower() for part in path.parts[:-1])
+            for path in stage_paths(stage, home)):
         return False
     # `git show HEAD:.env` and `git show :.npmrc` print a secret out of an object, by a
     # name the path checks do not read as a path.
     if git_object_reads_secret(stage.words, secret_paths):
         return False
-    program = os.path.basename(stage.words[0])
-    if program == "sed" and not sed_writes(stage.words[1:]):
+    # sed and awk are judged by their words alone, so only when nothing comes before
+    # them: xargs appends operands chosen at run time (`ls -a | xargs sed -n 1p` prints
+    # .env), `env -C DIR` moves to a directory the paths are not checked against, and
+    # an assignment (LD_PRELOAD=...) changes what runs.
+    bare = stage.raw[:1] == stage.words[:1]
+    if program == "sed" and sed_reads_only(args) and bare:
         return True
-    if program in ("awk", "gawk", "mawk", "nawk") and not awk_writes(stage.words[1:]):
+    if program in AWK_PROGRAMS and awk_reads_only(args) and bare:
         return True
+    # A reader whose options or operands make it write (sort -ro FILE, uniq IN OUT)
+    # takes a classifier check; git's subcommands are judged by the allow list.
+    if program in READ_ONLY_PROGRAMS and program != "git" and program_writes(stage.words):
+        return False
+    if program == "jq" and not jq_reads_only(args):
+        return False
+    # Every git subcommand with --output writes that file (git diff-tree --output=F).
+    if program == "git" and any(arg.startswith("--output") for arg in args):
+        return False
+    if program == "ps" and not ps_reads_only(args):
+        return False
+    if program in ("less", "more") and not pager_reads_only(args):
+        return False
     candidate_with_redir = (
         f"{base_cmd} {redirects[0]}" if redirects else base_cmd
     )
@@ -2026,6 +2032,10 @@ def decide_pre_tool_use(
     agy_ctrl_deny = agy_bash_control_denial(command, cwd_path, home_path)
     if agy_ctrl_deny:
         return deny(f"Blocked by {GUARD_NAME}: {agy_ctrl_deny}.")
+
+    if any(prints_environment(st.words) for st in stages):
+        return deny(f"Blocked by {GUARD_NAME}: ps with the `e` option prints the environment, "
+                    "which holds API keys; drop the `e`.")
 
     if any(rg_runs_a_program(st.words) for st in stages):
         return deny(
