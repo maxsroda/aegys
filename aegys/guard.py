@@ -66,8 +66,11 @@ For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
 4. **Classifier:** the verdict rules of 5, with the file action as input.
 
 For ``list_directory``, ``grep_search`` and ``find``: deny when a path argument
-is a credential path or, for the two recursive searches, lies above one;
-otherwise allow.
+is a credential path or, for the two recursive searches, lies above one; otherwise
+allow. ``grep_search`` of a directory goes to the classifier, because it cannot
+exclude ``.env`` or ``.git``. A shell command with a recursive search (``grep -r``,
+``rg``, ``diff -r``, ``git diff --no-index``) is denied unless it excludes ``.env``,
+``.env.*`` and ``.git`` by name; no tree is read to find out whether they exist.
 
 The lists in items 1 to 4 and the secret paths come from the shipped
 ``aegys/data/default-config.json``, merged with the user's
@@ -117,11 +120,18 @@ from .command_checks import (
     Stage,
     ancestor_operands,
     bash_path_denial,
+    canonicalize_case,
     command_stages,
     critical_removal,
     executed_file,
     expand_home,
     expand_word,
+    gh_shows_token,
+    reads_a_file_list,
+    git_add_stages_broadly,
+    git_object_reads_secret,
+    rg_runs_a_program,
+    git_add_forces,
     git_settings_match,
     host_denial_reason,
     inline_code,
@@ -133,6 +143,7 @@ from .command_checks import (
     redirect_targets,
     resolve_word,
     secret,
+    recursive_search_denial,
     secret_below,
     sed_writes,
     stage_paths,
@@ -618,7 +629,7 @@ def stage_touches_protected_path(stage: Stage, home: Path) -> bool:
 
 
 def stage_matches_allow_patterns(
-    stage: Stage, allow_patterns: list[str], home: Path
+    stage: Stage, allow_patterns: list[str], home: Path, secret_paths: tuple[str, ...] = ()
 ) -> bool:
     """True when a single pipeline/chain stage is deterministically safe and
     covered by `allow_patterns` (or is a read-only `sed`/`awk` filter)."""
@@ -629,6 +640,28 @@ def stage_matches_allow_patterns(
     if len(redirects) > 1:
         return False
     if stage_touches_protected_path(stage, home):
+        return False
+    # sort --files0-from and its kin print every file a list names: the classifier judges them.
+    if reads_a_file_list(stage.words):
+        return False
+    # `git add` of a whole tree stages every un-ignored .env.*, which any reader of the index
+    # (git diff --cached, git status -v, ...) then prints: the classifier judges the staging.
+    if git_add_stages_broadly(stage.words, stage.cwds, home):
+        return False
+    # `git add -f` stages a file the repository ignores (a .env), and `git diff --cached`
+    # then prints it: the classifier judges it.
+    if git_add_forces(stage.words):
+        return False
+    # A git settings file holds remote URLs, which may embed a credential: a repository's
+    # .git/config (also a submodule's, a worktree's, in any letter case, or a link to one)
+    # and ~/.gitconfig. Reading one takes a classifier check; writing one already does.
+    if any(git_settings_match(path, home) or path.name.lower() == "config.worktree"
+           and ".git" in (part.lower() for part in path.parts[:-1])
+           for path in stage_paths(stage, home)):
+        return False
+    # `git show HEAD:.env` and `git show :.npmrc` print a secret out of an object, by a
+    # name the path checks do not read as a path.
+    if git_object_reads_secret(stage.words, secret_paths):
         return False
     program = os.path.basename(stage.words[0])
     if program == "sed" and not sed_writes(stage.words[1:]):
@@ -646,6 +679,17 @@ def stage_matches_allow_patterns(
                 pat_redir = suffix
                 pat_base = pattern[: -(len(suffix) + 1)]
                 break
+        # `ls*` means the program `ls` with any arguments, not every program whose
+        # name starts with `ls`: the first word of the command text, and the program
+        # that runs after wrappers are removed, must both be `ls` itself. A first word
+        # with a `/` (`./scripts/*`) or a bare `*` is an ordinary glob.
+        first_word = pat_base.split(" ", 1)[0]
+        if len(first_word) > 1 and first_word.endswith("*") and "*" not in first_word[:-1] \
+                and "/" not in first_word:
+            program_name = canonicalize_case(first_word[:-1])
+            if program_name != canonicalize_case(base_cmd.split(" ", 1)[0]) \
+                    or program_name != canonicalize_case(stage.words[0]):
+                continue
         if redirects:
             if pat_redir != redirects[0]:
                 continue
@@ -662,7 +706,8 @@ def stage_matches_allow_patterns(
 
 
 def command_fast_allowed(
-    command: str, stages: list[Stage], allow_patterns: list[str], home: Path
+    command: str, stages: list[Stage], allow_patterns: list[str], home: Path,
+    secret_paths: tuple[str, ...] = (),
 ) -> bool:
     """True when the whole command (single command, pipeline, or chain) is
     deterministically allowed without calling the LLM classifier."""
@@ -671,7 +716,7 @@ def command_fast_allowed(
     if has_unquoted_expansion_or_glob(command):
         return False
     return all(
-        stage_matches_allow_patterns(stage, allow_patterns, home) for stage in stages
+        stage_matches_allow_patterns(stage, allow_patterns, home, secret_paths) for stage in stages
     )
 
 
@@ -1809,21 +1854,36 @@ def path_arguments(args: dict[str, Any], cwd: Path) -> list[Path]:
 
 def evaluate_search_access(
     tool_name: str, args: dict[str, Any], payload: dict[str, Any], cwd: Path, home: Path,
-    policy: Policy | None,
+    policy: Policy | None, classifier_caller: ClassifierCaller | None = None,
 ) -> dict[str, Any]:
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     conversation_id = extract_conversation_id(payload)
+    searches_a_tree = False
     for path in path_arguments(args, cwd):
         area = path if secret(path, policy.secret_paths) else None
         if area is None and tool_name in RECURSIVE_SEARCH_TOOL_NAMES:
-            area = secret_below(path, home, skips_hidden=False, secret_paths=policy.secret_paths)
+            area = secret_below(path, home, False, policy.secret_paths)
         if area is not None:
             return escalated_deny(
                 home, conversation_id, f"{tool_name} {path}",
                 f"Blocked by {GUARD_NAME}: {tool_name} of {path} reaches credentials in {area}.",
                 user_turn=user_turn_digest(payload),
             )
+        searches_a_tree |= tool_name == "grep_search" and path.is_dir()
+    if searches_a_tree:
+        # grep_search has no way to exclude .env or .git (unverified: its arguments are
+        # not documented here), so the classifier judges a search of a directory.
+        if not guard_enabled(home, conversation_id):
+            return {
+                "decision": "force_ask",
+                "reason": f"aegys is off for this conversation; {tool_name} of a directory "
+                          "requires confirmation.",
+            }
+        return classifier_decision(
+            safe_json({"toolName": tool_name, "input": args}), payload, home, conversation_id,
+            [str(p) for p in payload.get("workspacePaths") or []], classifier_caller,
+        )
     record_guard_decision(home, conversation_id, allowed=True)
     return {"decision": "allow"}
 
@@ -1928,7 +1988,9 @@ def decide_pre_tool_use(
             tool_name, tool_args, payload, cwd_path, home_path, classifier_caller, policy
         )
     if tool_name in SEARCH_TOOL_NAMES:
-        return evaluate_search_access(tool_name, tool_args, payload, cwd_path, home_path, policy)
+        return evaluate_search_access(
+            tool_name, tool_args, payload, cwd_path, home_path, policy, classifier_caller
+        )
     if tool_name != "run_command":
         return {"decision": "allow"}
 
@@ -1965,6 +2027,18 @@ def decide_pre_tool_use(
     if agy_ctrl_deny:
         return deny(f"Blocked by {GUARD_NAME}: {agy_ctrl_deny}.")
 
+    if any(rg_runs_a_program(st.words) for st in stages):
+        return deny(
+            f"Blocked by {GUARD_NAME}: rg --hostname-bin runs an arbitrary program; use rg "
+            "without --hostname-bin."
+        )
+
+    if any(gh_shows_token(st.words) for st in stages):
+        return deny(
+            f"Blocked by {GUARD_NAME}: gh auth status -t / --show-token prints the GitHub "
+            "token into the conversation; use gh auth status without it."
+        )
+
     for url in urls_in({"command": command}):
         try:
             host = urlsplit(url).hostname or ""
@@ -1990,6 +2064,10 @@ def decide_pre_tool_use(
     for pat in policy.shell_deny:
         if any(matches_bash_deny_pattern(pat, cand) for cand in stage_candidates):
             return deny(f"Blocked by {GUARD_NAME}: command matches deny rule {pat!r}.")
+
+    search_denial = recursive_search_denial(stages, home_path, policy.secret_paths)
+    if search_denial:
+        return deny(f"Blocked by {GUARD_NAME}: {search_denial}.")
 
     # 2. Privilege escalation (`sudo`, `doas`) and the ask rules always force a user prompt.
     if any(st.raw and os.path.basename(st.raw[0]) in PRIVILEGE_WRAPPERS for st in stages):
@@ -2018,7 +2096,9 @@ def decide_pre_tool_use(
     # added only while the status line last reported this conversation's sandbox on.
     sandbox_on = read_state_file(home_path, conv_id).get("sandbox_on") is True
     overwrite = {"overwrite": {"BypassSandbox": True}} if sandbox_on and not bypass_sandbox else {}
-    if command_fast_allowed(command, stages, list(policy.shell_allow), home_path):
+    if command_fast_allowed(
+        command, stages, list(policy.shell_allow), home_path, policy.secret_paths
+    ):
         record_guard_decision(home_path, conv_id, allowed=True)
         return {"decision": "allow", **overwrite}
 

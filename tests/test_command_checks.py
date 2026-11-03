@@ -12,6 +12,11 @@ from aegys.command_checks import (
     command_substitutions,
     critical_removal,
     host_denial_reason,
+    NameFilter,
+    matches_bash_deny_pattern,
+    name_filtered_out,
+    search_starts,
+    uncovered_secrets,
     urls_in,
 )
 from aegys.config import load_policy
@@ -50,6 +55,34 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_a_backslash_newline_joins_the_lines_as_the_shell_does(self) -> None:
+        for command, words in (
+            ("gh auth status \\\n-t", ["gh", "auth", "status", "-t"]),
+            ("rg --pre x \\\nfoo", ["rg", "--pre", "x", "foo"]),
+            ('echo "a\\\nb"', ["echo", "ab"]),
+            ("echo 'a\\\nb'", ["echo", "a\\\nb"]),
+            ('echo "it\'s \\\nme"', ["echo", "it's me"]),
+            ("echo a\\\\\nb", ["echo", "a\\"]),
+        ):
+            stages = command_stages(command, self.work, self.home)
+            self.assertEqual(stages[0].words, words, command)
+
+    def test_an_ansi_c_string_with_an_escaped_quote_does_not_parse(self) -> None:
+        # The scanner and shlex both read $'...' as a plain single quote, so a \' ends
+        # it early and the rest fails to parse; the guard denies what it cannot parse.
+        self.assertIsNone(command_stages("echo $'a\\'b'", self.work, self.home))
+        self.assertIsNone(command_stages("echo $'x\\'#;rm -rf ~'", self.work, self.home))
+
+    def test_a_hash_after_a_backslash_newline_is_not_a_comment(self) -> None:
+        # The shell joins the lines, so `#;rm -rf ~` follows `ls` in the same word.
+        stages = command_stages("ls\\\n#;rm -rf ~", self.work, self.home)
+        self.assertEqual([stage.words for stage in stages], [["ls#"], ["rm", "-rf", "~"]])
+        # A comment ends at its newline, backslash or not: `rm` runs.
+        stages = command_stages("ls # \\\nrm -rf ~", self.work, self.home)
+        self.assertEqual([stage.words for stage in stages], [["ls"], ["rm", "-rf", "~"]])
+        stages = command_stages("echo '#\\\n#x'", self.work, self.home)
+        self.assertEqual([stage.words for stage in stages], [["echo", "#\\\n#x"]])
 
     def test_read_only_for_loop_with_command_substitution_and_stderr_redirect_is_not_a_write(self) -> None:
         cmd = (
@@ -142,6 +175,52 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
         # Closing paren inside backticks inside $(...) does not truncate the substitution.
         backtick_paren_rm = 'echo "$(rm `echo )` -rf ~)"'
         self.assertIsNotNone(critical_removal(backtick_paren_rm, self.work, self.home))
+
+
+class DenyPatternTest(unittest.TestCase):
+    def test_the_shipped_find_patterns_match_a_find_without_a_path(self) -> None:
+        for flag in ("-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprint0",
+                     "-fprintf", "-ok", "-okdir"):
+            for command in (f"find {flag} x", f"find . {flag} x"):
+                self.assertTrue(
+                    any(matches_bash_deny_pattern(pattern, command)
+                        for pattern in load_policy(Path(tempfile.mkdtemp())).shell_deny),
+                    command,
+                )
+
+    def test_a_star_between_words_matches_no_arguments_up_to_five_times(self) -> None:
+        self.assertTrue(matches_bash_deny_pattern("a * b * c", "a b c"))
+        self.assertTrue(matches_bash_deny_pattern("a * b * c", "a x b c"))
+        self.assertTrue(matches_bash_deny_pattern("a * b * c * d * e * f", "a b c d e f"))
+        # Beyond five, the stars match only as written, one or more arguments.
+        self.assertFalse(matches_bash_deny_pattern("a * b * c * d * e * f * g", "a b c d e f g"))
+        self.assertTrue(matches_bash_deny_pattern("a * b * c * d * e * f * g", "a 1 b 2 c 3 d 4 e 5 f 6 g"))
+
+
+class SearchExclusionTest(unittest.TestCase):
+    def test_the_last_matching_filter_decides(self) -> None:
+        exclude, include = NameFilter(True, ".env"), NameFilter(False, ".env*")
+        self.assertTrue(name_filtered_out(".env", False, (include, exclude)))
+        self.assertFalse(name_filtered_out(".env", False, (exclude, include)))
+        self.assertIsNone(name_filtered_out("a.py", False, (exclude, include)))
+
+    def test_a_filter_for_directories_does_not_name_files(self) -> None:
+        directory_only = NameFilter(True, ".git", "directory")
+        self.assertTrue(name_filtered_out(".git", True, (directory_only,)))
+        self.assertIsNone(name_filtered_out(".git", False, (directory_only,)))
+
+    def test_an_ignore_case_filter_matches_in_any_letter_case(self) -> None:
+        self.assertFalse(name_filtered_out(".env", False, (NameFilter(True, ".env"), NameFilter(False, ".ENV", ignore_case=True))))
+
+    def test_uncovered_secrets_lists_what_no_filter_covers(self) -> None:
+        search = search_starts(["grep", "-r", "--exclude=.env", "K", "."])
+        self.assertEqual(uncovered_secrets(search), [".env.*", ".git"])
+        self.assertEqual(uncovered_secrets(search_starts(["rg", "K"])), [".env", ".env.*", ".git"])
+        self.assertEqual(uncovered_secrets(search_starts(["rg", "-g", "!.env*", "-g", "!.git", "K"])), [])
+
+    def test_a_glob_with_a_slash_never_counts_as_an_exclusion(self) -> None:
+        search = search_starts(["rg", "--hidden", "-g", "!src/.env", "K"])
+        self.assertEqual(search.filters, ())
 
 
 if __name__ == "__main__":

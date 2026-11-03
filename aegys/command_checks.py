@@ -27,6 +27,7 @@ from __future__ import annotations
 import fnmatch
 import glob
 import ipaddress
+import itertools
 import os
 import re
 import shlex
@@ -95,12 +96,24 @@ def matches_wildcard_pattern(
 
 
 def matches_bash_deny_pattern(arg_pattern: str, candidate: str) -> bool:
-    if matches_wildcard_pattern(arg_pattern, candidate, overflow_match=True):
-        return True
-    if arg_pattern.endswith(" *"):
-        return matches_wildcard_pattern(
-            arg_pattern[:-2], candidate, overflow_match=True
-        )
+    """Whether a deny or ask pattern matches a command. A ` * ` between two words
+    matches any arguments between them, including none: `find * -fprint*` matches
+    `find -fprint out` as well as `find . -fprint out`. A trailing ` *` likewise
+    matches no arguments. A pattern with more than five ` * ` matches them only as
+    written, one or more arguments each."""
+    parts = arg_pattern.split(" * ")
+    joints_choices = (
+        itertools.product((" * ", " "), repeat=len(parts) - 1) if len(parts) <= 6
+        else [(" * ",) * (len(parts) - 1)]
+    )
+    for joints in joints_choices:
+        pattern = parts[0] + "".join(joint + part for joint, part in zip(joints, parts[1:]))
+        if matches_wildcard_pattern(pattern, candidate, overflow_match=True):
+            return True
+        if pattern.endswith(" *") and matches_wildcard_pattern(
+            pattern[:-2], candidate, overflow_match=True
+        ):
+            return True
     return False
 
 
@@ -264,18 +277,22 @@ HEREDOC_OPERATOR = re.compile(r"<<(-?)[ \t]*(\\?)(['\"]?)([^\s'\"<>|;&()\\]+)\3"
 
 
 def _heredoc_bodies_with_quoting(command: str) -> tuple[str, list[tuple[str, bool]]]:
-    """Return `(stripped_command, [(body, is_unquoted), ...])` in order of `<<`."""
+    """Return `(stripped_command, [(body, is_unquoted), ...])` in order of `<<`.
+    The stripped command has its comments cut, its heredoc bodies taken out, and each
+    backslash-newline outside single quotes removed, as the shell joins the lines."""
     out, bodies, pending, quote, arithmetic, i, n = [], [], [], "", 0, 0, len(command)
     while i < n:
         c = command[i]
         if quote:
             if c == "\\" and quote == '"' and i + 1 < n:
-                out.append(command[i:i + 2])
+                if command[i + 1] != "\n":  # inside double quotes a backslash-newline joins lines
+                    out.append(command[i:i + 2])
                 i += 2
                 continue
             quote = "" if c == quote else quote
         elif c == "\\" and i + 1 < n:
-            out.append(command[i:i + 2])
+            if command[i + 1] != "\n":  # a backslash-newline joins the lines, before any `#` is read
+                out.append(command[i:i + 2])
             i += 2
             continue
         elif c in "'\"":
@@ -299,7 +316,7 @@ def _heredoc_bodies_with_quoting(command: str) -> tuple[str, list[tuple[str, boo
                 out.append(f" {HEREDOC_MARKER} ")
                 i = match.end()
                 continue
-        elif c == "#" and (i == 0 or command[i - 1] in " \t\n;|&()"):
+        elif c == "#" and (not out or out[-1][-1] in " \t\n;|&()"):
             end = command.find("\n", i)  # a comment runs to the end of its line, and goes
             i = n if end < 0 else end
             continue
@@ -437,14 +454,16 @@ def command_substitutions(text: str) -> list[str]:
     return [sub for _off, sub in subs]
 
 
-def _split_stages_with_ends(command: str) -> list[tuple[list[str], int]]:
-    """Split `command` (comments already cut) into `(raw_stage, end_offset)` pairs."""
+def _split_stages_with_ends(command: str) -> list[tuple[list[str], int, bool]]:
+    """Split `command` (comments already cut) into `(raw_stage, end_offset, piped)`
+    triples; `piped` is whether a pipe (`|`, `|&`) leads into the stage."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=PUNCTUATION)
     lexer.commenters = ""
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
-    stages: list[tuple[list[str], int]] = []
+    stages: list[tuple[list[str], int, bool]] = []
     stage: list[str] = []
+    piped_in = piped_next = False
     for token in lexer:
         if token and (set(token) <= SEPARATOR_CHARS or re.fullmatch(r"[<>]+\(+", token)):
             if stage:
@@ -453,12 +472,16 @@ def _split_stages_with_ends(command: str) -> list[tuple[list[str], int]]:
                     - len(getattr(lexer, "_pushback_chars", ()))
                     - len(lexer.pushback)
                 )
-                stages.append((stage, pos))
+                stages.append((stage, pos, piped_in))
                 stage = []
+                piped_in = False
+            # a newline after a pipe continues the pipeline
+            piped_next = token.rstrip("\n") in ("|", "|&") or (piped_next and token == "\n")
+            piped_in = piped_next
         else:
             stage.append(token)
     if stage:
-        stages.append((stage, len(command)))
+        stages.append((stage, len(command), piped_in))
     return stages
 
 
@@ -472,6 +495,7 @@ class Stage:
     refused: bool             # a wrapper the hook will not see through (GIT_DIR=..., ...)
     text: str                 # the stage as written, for spelled-path checks
     raw: list[str]            # the stage's words as split, redirects and wrappers included
+    piped: bool = False       # its standard input is the previous stage's output (`|`, `|&`)
 
 
 def command_stages(
@@ -499,14 +523,14 @@ def command_stages(
     if raw_stages_with_ends:
         for sub_off, sub in subs_with_offsets:
             idx = next(
-                (i for i, (_r, end_off) in enumerate(raw_stages_with_ends) if end_off > sub_off),
+                (i for i, (_r, end_off, _p) in enumerate(raw_stages_with_ends) if end_off > sub_off),
                 len(raw_stages_with_ends) - 1,
             )
             subs_by_stage.setdefault(idx, []).append(sub)
     stages: list[Stage] = []
     base_cwds = initial_cwds if initial_cwds is not None else (cwd,)
     current, known = cwd, initial_known
-    for stage_idx, (raw, _end_off) in enumerate(raw_stages_with_ends):
+    for stage_idx, (raw, _end_off, stage_piped) in enumerate(raw_stages_with_ends):
         words, refused = run_words(raw)
         words = without_redirects(words)
         program = os.path.basename(words[0]) if words else ""
@@ -566,7 +590,7 @@ def command_stages(
                 return None
             stages.extend([redirects_only, *inner])
             continue
-        stages.append(Stage(words, stage_cwds, known, refused, " ".join(raw), raw))
+        stages.append(Stage(words, stage_cwds, known, refused, " ".join(raw), raw, stage_piped))
         if program in CWD_CHANGERS:
             target = words[1] if len(words) > 1 else "~"
             if target == "-" or "$" in target or "`" in target:
@@ -848,6 +872,128 @@ def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
                for pattern in secret_paths for name in names)
 
 
+def reads_a_file_list(words: list[str]) -> bool:
+    """True for sort, wc and du with `--files0-from` (or a prefix of it), which read
+    every file a list names."""
+    return (bool(words) and os.path.basename(words[0]) in ("sort", "wc", "du")
+            and any(word.startswith("--fi") and "--files0-from".startswith(word.partition("=")[0])
+                    for word in words[1:]))
+
+
+ENV_PATHSPEC = re.compile(r"^:(?:[!^]|\((?P<magic>[^)]*)\))\*\.env\*$")
+
+
+def excludes_env_pathspec(word: str) -> bool:
+    """Whether a pathspec excludes `*.env*` from the root down: `:!`, `:^` or `:(exclude)`,
+    with at most `icase` and `top` beside it. `literal` reads the `*` literally and `glob`
+    stops it at a `/`, so neither excludes a nested or any `.env.*` file."""
+    match = ENV_PATHSPEC.match(word)
+    if match is None:
+        return False
+    if match.group("magic") is None:
+        return True
+    magic = match.group("magic").split(",")
+    return "exclude" in magic and set(magic) <= {"exclude", "icase", "top"}
+
+
+# The long options of git add (the hidden --unified and --inter-hunk-context included, which
+# make --u and --inter ambiguous), and those that stage a whole tree or a list.
+GIT_ADD_LONG_OPTIONS = (
+    "--all", "--chmod", "--dry-run", "--edit", "--force", "--ignore-errors", "--ignore-missing",
+    "--ignore-removal", "--intent-to-add", "--inter-hunk-context", "--interactive", "--no-all",
+    "--no-ignore-removal", "--patch", "--pathspec-file-nul", "--pathspec-from-file", "--refresh",
+    "--renormalize", "--sparse", "--unified", "--update", "--verbose",
+)
+GIT_ADD_BROAD_OPTIONS = {"--all", "--update", "--interactive", "--pathspec-from-file"}
+
+
+def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path) -> bool:
+    """True for `git add` of `.`, a directory, a glob, `-A`/`--all`, `-u`/`--update`,
+    `-i`/`--interactive` or a pathspec file, which stages every un-ignored `.env.*` the
+    work tree holds (and `git diff --cached`, `git status -v` and others then print it),
+    unless the command carries an excluding pathspec such as `':!*.env*'`. Guarding the
+    staging step covers the readers that print whole trees, and only for `.env.*`: a
+    reader that names an index entry (`git show :.npmrc`) is guarded by
+    `git_object_reads_secret`, and a bare reader of history (`git log -p`) is not guarded."""
+    if not words or os.path.basename(words[0]) != "git" or "add" not in words[1:]:
+        return False
+    rest = words[words.index("add") + 1:]
+    operands = rest[rest.index("--") + 1:] if "--" in rest else []
+    options = rest[:rest.index("--")] if "--" in rest else rest
+    operands += [word for word in options if not word.startswith("-")]
+    options = [word for word in options if word.startswith("-")]
+    if any(excludes_env_pathspec(word) for word in operands):
+        return False
+    # -i stages untracked files from its piped answers; -p and -e touch tracked files only.
+    # git reads an unambiguous prefix of a long option as the full name (`--al` is `--all`).
+    if any(resolve_long_option(word.partition("=")[0], GIT_ADD_LONG_OPTIONS) in GIT_ADD_BROAD_OPTIONS
+           or re.fullmatch(r"-[A-Za-z]*[Aui][A-Za-z]*", word) for word in options):
+        return True
+    for operand in operands:
+        if operand.endswith("/") or set(operand) & set("*?[") or operand.startswith(":"):
+            return True
+        for cwd in cwds:
+            try:
+                if any(path.is_dir() for path in expand_word(operand, cwd, home)):
+                    return True
+            except (ValueError, OSError, RuntimeError):
+                return True
+    return False
+
+
+GIT_OBJECT_READERS = {"show", "cat-file", "diff", "log"}
+
+
+def git_object_reads_secret(words: list[str], secret_paths: tuple[str, ...]) -> bool:
+    """True for a git reader (`show`, `cat-file`, `diff`, `log`) with an operand that
+    names a secret path inside an object: `REV:path`, `:path` (the index) or `:N:path`.
+    `expand_word` reads `HEAD:.env` as a file named `HEAD:.env`, so the path checks never
+    see it. The path is read from the repository root, written with a leading `/` for
+    the secret globs."""
+    if not words or os.path.basename(words[0]) != "git":
+        return False
+    rest = words[1:]
+    if not GIT_OBJECT_READERS & set(rest):
+        return False
+    for word in rest:
+        if word.startswith("-") or ":" not in word:
+            continue
+        revision, _, path = word.partition(":")
+        if re.fullmatch(r"[0-3]", path.partition(":")[0]) and revision == "":
+            path = path.partition(":")[2]  # `:N:path`, an index entry at stage N
+        path = os.path.normpath("/" + path)
+        if secret(Path(path), secret_paths):
+            return True
+    return False
+
+
+def rg_runs_a_program(words: list[str]) -> bool:
+    """True for rg with `--hostname-bin`, which runs a program to learn the host name."""
+    return (bool(words) and os.path.basename(words[0]) == "rg"
+            and any(word == "--hostname-bin" or word.startswith("--hostname-bin=")
+                    for word in words[1:]))
+
+
+def git_add_forces(words: list[str]) -> bool:
+    """True for `git add` with -f or --force (also among combined short flags)."""
+    if not words or os.path.basename(words[0]) != "git" or "add" not in words[1:]:
+        return False
+    return any(word == "--force" or re.fullmatch(r"-[A-Za-z]*f[A-Za-z]*", word)
+               for word in words[words.index("add") + 1:])
+
+
+GH_TOKEN_FLAG = re.compile(r"^(?:--show-token(?:=.*)?|-[A-Za-z]*t[A-Za-z]*(?:=.*)?)$")
+
+
+def gh_shows_token(words: list[str]) -> bool:
+    """True for `gh auth status` with `-t` or `--show-token`, which prints the GitHub
+    token: `-t` alone, among combined short flags (`-at`), or with a value (`-t=true`).
+    Read from the stage's words, so quoting and escaping do not hide the flag. The
+    match is case-sensitive, as gh's flags are."""
+    return (len(words) >= 3 and os.path.basename(words[0]) == "gh" and words[1:3] == ["auth", "status"]
+            and any(GH_TOKEN_FLAG.match(word) for word in words[3:]))
+
+
 def secret_areas(secret_paths: tuple[str, ...]) -> tuple[str, ...]:
     """The directories and files of the secret paths, as `.ssh` for `*/.ssh/*`,
     read relative to $HOME, or `/home/u/.key` for `/home/u/.key/*` (an entry
@@ -878,25 +1024,280 @@ GREP_VALUE_OPTIONS = {
 }
 
 
-def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
+# The names a recursive search must not read: .env files and a repository's .git
+# directory, which holds .git/config and its remote URLs.
+SEARCH_SECRET_FILE = ".env"
+SEARCH_SECRET_DIRECTORY = ".git"
+# `.env.staging` and kin have no fixed set of names, so an exclusion of them is
+# accepted only in these spellings, each of which covers all of them.
+ENV_FAMILY_EXCLUSIONS = {".env*", ".env.*", ".*", "*"}
+ENV_FAMILY_PREFIX = ".env."
+
+
+@dataclass(frozen=True)
+class NameFilter:
+    """One option of a search that includes or excludes names, in command-line order."""
+
+    exclude: bool
+    pattern: str
+    applies_to: str = "both"        # "file", "directory" or "both"
+    ignore_case: bool = False
+
+
+@dataclass(frozen=True)
+class Search:
+    """A stage that reads every file below the paths it names."""
+
+    starts: list[str]           # the paths it starts from (default `.`)
+    skips_hidden: bool          # skips hidden files and directories, as rg does without --hidden
+    filters: tuple[NameFilter, ...] = ()   # its --include, --exclude, -g and -x options, in order
+    exclusion_words: frozenset[int] = frozenset()  # indexes in the stage's words of the filters
+    program: str = "grep"       # "grep", "rg", "diff" or "git"
+    explicit_starts: bool = True    # the command names its start paths (else it reads `.` or stdin)
+
+
+def name_filtered_out(name: str, is_directory: bool, filters: tuple[NameFilter, ...]) -> bool | None:
+    """Whether the filters exclude `name` (True), include it (False), or say nothing
+    (None): the last filter that matches decides, as in rg and, by its manual, GNU grep."""
+    decision = None
+    for entry in filters:
+        if entry.applies_to != "both" and (entry.applies_to == "directory") != is_directory:
+            continue
+        pattern, candidate = entry.pattern, name
+        if entry.ignore_case:
+            pattern, candidate = pattern.lower(), name.lower()
+        # fnmatch reads no escapes and no braces, which grep and rg do: an include with
+        # either may name any name, so it counts as including this one.
+        if fnmatch.fnmatchcase(candidate, pattern) or (
+                not entry.exclude and set(pattern) & set("\\{")):
+            decision = entry.exclude
+    return decision
+
+
+def could_match_env_family(pattern: str, ignore_case: bool) -> bool:
+    """Whether a glob may match a name that starts with `.env.`: its literal start
+    agrees with `.env.` as far as it goes, and it has a wildcard or goes past it."""
+    pattern = pattern.lower() if ignore_case else pattern
+    if set(pattern) & set("\\{"):
+        return True  # an escape or a brace may spell any name
+    literal = re.split(r"[*?\[]", pattern, maxsplit=1)[0]
+    if literal.startswith(ENV_FAMILY_PREFIX):
+        return True
+    return ENV_FAMILY_PREFIX.startswith(literal) and len(literal) < len(pattern)
+
+
+def env_family_covered(filters: tuple[NameFilter, ...]) -> bool:
+    """Whether the filters exclude `.env.*`: one of them excludes it in a known spelling
+    and no later filter may include a `.env.*` name again."""
+    last = None
+    for index, entry in enumerate(filters):
+        pattern = entry.pattern.lower() if entry.ignore_case else entry.pattern
+        if entry.exclude and entry.applies_to != "directory" and pattern in ENV_FAMILY_EXCLUSIONS:
+            last = index
+    return last is not None and not any(
+        not entry.exclude and entry.applies_to != "directory"
+        and could_match_env_family(entry.pattern, entry.ignore_case)
+        for entry in filters[last + 1:])
+
+
+def uncovered_secrets(search: Search) -> list[str]:
+    """The secret names the search does not clearly exclude: `.env`, `.env.*` and `.git`.
+    A name is covered by an excluding option that no later including option undoes."""
+    uncovered = []
+    if not name_filtered_out(SEARCH_SECRET_FILE, False, search.filters):
+        uncovered.append(SEARCH_SECRET_FILE)
+    if not env_family_covered(search.filters):
+        uncovered.append(ENV_FAMILY_PREFIX + "*")
+    if not name_filtered_out(SEARCH_SECRET_DIRECTORY, True, search.filters):
+        uncovered.append(SEARCH_SECRET_DIRECTORY)
+    return uncovered
+
+
+# The long options of GNU grep and diff, which read an unambiguous prefix as the full name.
+GREP_LONG_OPTIONS = (
+    "--after-context", "--basic-regexp", "--before-context", "--binary", "--binary-files",
+    "--byte-offset", "--color", "--colour", "--context", "--count", "--dereference-recursive",
+    "--devices", "--directories", "--exclude", "--exclude-dir", "--exclude-from",
+    "--extended-regexp", "--file", "--files-with-matches", "--files-without-match",
+    "--fixed-strings", "--group-separator", "--help", "--ignore-case", "--include",
+    "--initial-tab", "--invert-match", "--label", "--line-buffered", "--line-number",
+    "--line-regexp", "--max-count", "--no-filename", "--no-group-separator",
+    "--no-ignore-case", "--no-messages", "--null", "--null-data", "--only-matching",
+    "--perl-regexp", "--quiet", "--recursive", "--regexp", "--silent", "--text", "--version",
+    "--with-filename", "--word-regexp",
+)
+DIFF_LONG_OPTIONS = (
+    "--brief", "--color", "--context", "--ed", "--exclude", "--exclude-from", "--expand-tabs",
+    "--from-file", "--help", "--horizon-lines", "--ifdef", "--ignore-all-space",
+    "--ignore-blank-lines", "--ignore-case", "--ignore-file-name-case",
+    "--ignore-matching-lines", "--ignore-space-change", "--ignore-tab-expansion",
+    "--ignore-trailing-space", "--initial-tab", "--label", "--left-column", "--line-format",
+    "--minimal", "--new-file", "--no-dereference", "--no-ignore-file-name-case", "--normal",
+    "--paginate", "--palette", "--rcs", "--recursive", "--report-identical-files",
+    "--show-c-function", "--show-function-line", "--side-by-side", "--speed-large-files",
+    "--starting-file", "--strip-trailing-cr", "--suppress-blank-empty",
+    "--suppress-common-lines", "--tabsize", "--text", "--to-file", "--unidirectional-new-file",
+    "--unified", "--version", "--width",
+)
+
+
+def resolve_long_option(name: str, options: tuple[str, ...]) -> str | None:
+    """The long option `name` stands for: itself, or the one option it is a prefix of.
+    None when it is ambiguous (the program refuses the command) or unknown."""
+    if name in options:
+        return name
+    candidates = [option for option in options if option.startswith(name)]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+# Options of diff that take a separate value, then neither an operand nor a path.
+DIFF_VALUE_LETTERS = "xXIFLUCSWD"
+DIFF_VALUE_LONG_OPTIONS = {"--exclude", "--exclude-from", "--ignore-matching-lines", "--label",
+                           "--starting-file", "--width", "--ifdef", "--show-function-line"}
+
+
+def inside_a_git_directory(path: Path) -> bool:
+    return SEARCH_SECRET_DIRECTORY in path.parts
+
+
+def repository_root(cwd: Path) -> Path | None:
+    """The nearest directory at or above cwd that holds a `.git`, or None."""
+    return next((d for d in (cwd, *cwd.parents) if (d / ".git").exists()), None)
+
+
+def git_diff_reads_outside_the_work_tree(operands: list[str], cwd: Path, home: Path) -> bool:
+    """Whether `git diff A B` runs as `--no-index` without the flag: two operands, one of
+    which names an existing path outside the repository's work tree, or no repository."""
+    if len(operands) < 2:
+        return False
+    root = repository_root(cwd)
+    for operand in operands:
+        try:
+            paths = expand_word(operand, cwd, home)
+        except (ValueError, OSError, RuntimeError):
+            continue
+        if any(path.exists() and (root is None or not inside(path, root)) for path in paths):
+            return True
+    return False
+
+
+def diff_search(words: list[str], cwd: Path | None = None, home: Path | None = None) -> Search | None:
+    """`diff -r A B` and `diff --recursive A B` read every file below A and B, and so
+    does `git diff --no-index A B`, which cannot exclude a name, and `git diff A B`
+    with a path outside the work tree, which runs as `--no-index`. None for any other
+    diff."""
+    program = os.path.basename(words[0])
+    args = words[1:]
+    if program == "git":
+        subcommand = None
+        skip = False
+        for index, arg in enumerate(args):
+            if skip:
+                skip = False
+            elif arg in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+                skip = True
+            elif not arg.startswith("-"):
+                subcommand = index
+                break
+        if subcommand is None or args[subcommand] != "diff":
+            return None
+        rest = args[subcommand + 1:]
+        operands = [arg for arg in rest if not arg.startswith("-") or arg == "-"]
+        if "--" in rest:
+            operands = [arg for arg in rest[:rest.index("--")] if not arg.startswith("-")] \
+                + rest[rest.index("--") + 1:]
+        no_index = any(arg.startswith("--no-i") and "--no-index".startswith(arg) for arg in rest)
+        if not no_index and not (cwd is not None and home is not None
+                                 and git_diff_reads_outside_the_work_tree(operands, cwd, home)):
+            return None
+        return Search(operands or ["."], skips_hidden=False, program="git",
+                      explicit_starts=bool(operands))
+    recursive, filters, positions, operands, i = False, [], set(), [], 0
+    while i < len(args):
+        first, arg, i = i + 1, args[i], i + 1  # `first` indexes arg in `words`
+        if arg == "--":
+            operands += args[i:]
+            break
+        if arg.startswith("--"):
+            name, separator, value = arg.partition("=")
+            name = resolve_long_option(name, DIFF_LONG_OPTIONS) or name
+            if name in DIFF_VALUE_LONG_OPTIONS and not separator:
+                value, i = (args[i] if i < len(args) else ""), i + 1
+            recursive |= name == "--recursive"
+            if name == "--exclude":
+                filters.append(NameFilter(True, value))
+                positions.update(range(first, i + 1))
+        elif arg.startswith("-") and len(arg) > 1:
+            for j, letter in enumerate(arg[1:]):
+                recursive |= letter in "rR"
+                if letter in DIFF_VALUE_LETTERS:
+                    value = arg[j + 2:]
+                    if not value:
+                        value, i = (args[i] if i < len(args) else ""), i + 1
+                    if letter == "x":
+                        filters.append(NameFilter(True, value))
+                        positions.update(range(first, i + 1))
+                    break
+        else:
+            operands.append(arg)
+    if not recursive:
+        return None
+    return Search(operands or ["."], skips_hidden=False, filters=tuple(filters),
+                  exclusion_words=frozenset(positions), program="diff",
+                  explicit_starts=bool(operands))
+
+
+def rg_glob_filter(value: str, ignore_case: bool) -> NameFilter | None:
+    """An rg glob as a filter on names. `!NAME`, `!**/NAME` and `!NAME/` exclude a
+    name wherever it occurs; a glob with another `/` is read by its last part and can
+    only include, so that it never counts as an exclusion it may not be."""
+    exclude = value.startswith("!")
+    pattern = value[1:] if exclude else value
+    while pattern.startswith("**/"):
+        pattern = pattern[3:]
+    applies_to = "both"
+    if pattern.endswith("/"):
+        pattern, applies_to = pattern.rstrip("/"), "directory"
+    if "/" in pattern:
+        if exclude:
+            return None
+        pattern = pattern.rsplit("/", 1)[1]
+    return NameFilter(exclude, pattern, applies_to, ignore_case) if pattern else None
+
+
+def search_starts(words: list[str], cwd: Path | None = None,
+                  home: Path | None = None) -> Search | None:
     """Where a recursive search starts (rg, or grep with -r, -R, --recursive or
-    -d recurse; default `.`), and whether it skips hidden files and directories,
-    as rg does without --hidden or -uu. None for any other stage."""
-    if not words or os.path.basename(words[0]) not in RECURSIVE_SEARCHERS:
+    -d recurse, or a recursive diff; default `.`), whether it skips hidden files and
+    directories, as rg does without --hidden or -uu, and the filters on names it
+    carries. None for any other stage. With the stage's directory and the home
+    directory, `git diff` of a path outside the work tree counts too."""
+    if not words:
+        return None
+    if os.path.basename(words[0]) in ("diff", "git"):
+        return diff_search(words, cwd, home)
+    if os.path.basename(words[0]) not in RECURSIVE_SEARCHERS:
         return None
     rg = os.path.basename(words[0]) == "rg"
     if rg and "--files" in words:
         return None  # lists file names, reads no contents
     values = RG_VALUE_OPTIONS if rg else GREP_VALUE_OPTIONS
     recursive, hidden, unrestricted, pattern_given = rg, False, 0, False
+    filters: list[NameFilter] = []
+    positions: set[int] = set()
     operands, args, i = [], words[1:], 0
     while i < len(args):
-        arg, i = args[i], i + 1
+        first, arg, i = i + 1, args[i], i + 1  # `first` indexes arg in `words`
         if arg == "--":
             operands += args[i:]
             break
         if arg.startswith("--"):
             name, separator, value = arg.partition("=")
+            if not rg:  # grep reads an unambiguous prefix as the full option
+                resolved = resolve_long_option(name, GREP_LONG_OPTIONS)
+                if resolved is None and "include".startswith(name[2:]) and len(name) > 2:
+                    resolved = "--include"
+                name = resolved or name
             if name in values and not separator:
                 value, i = (args[i] if i < len(args) else ""), i + 1
             pattern_given |= name in ("--regexp", "--file")
@@ -904,6 +1305,16 @@ def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
             unrestricted += name == "--unrestricted"
             recursive |= name in ("--recursive", "--dereference-recursive") or (
                 name == "--directories" and value == "recurse")
+            entry = None
+            if not rg and name in ("--include", "--exclude", "--exclude-dir"):
+                directory = name == "--exclude-dir"
+                entry = NameFilter(name != "--include", value.rstrip("/") if directory else value,
+                                   "directory" if directory else "file")
+            elif rg and name in ("--glob", "--iglob"):
+                entry = rg_glob_filter(value, ignore_case=name == "--iglob")
+            if entry is not None:
+                filters.append(entry)
+                positions.update(range(first, i + 1))
             continue
         if arg.startswith("-") and len(arg) > 1:
             for j, letter in enumerate(arg[1:]):
@@ -918,6 +1329,11 @@ def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
                         value, i = (args[i] if i < len(args) else ""), i + 1
                     pattern_given |= letter in "ef"
                     recursive |= not rg and letter == "d" and value == "recurse"
+                    if rg and letter == "g":
+                        entry = rg_glob_filter(value, ignore_case=False)
+                        if entry is not None:
+                            filters.append(entry)
+                            positions.update(range(first, i + 1))
                     break
             continue
         operands.append(arg)
@@ -927,7 +1343,9 @@ def search_starts(words: list[str]) -> tuple[list[str], bool] | None:
         operands = operands[1:]
     # A ripgrep config file can turn --hidden on for every search.
     configured = bool(os.environ.get("RIPGREP_CONFIG_PATH")) and "--no-config" not in args
-    return operands or ["."], rg and not hidden and unrestricted < 2 and not configured
+    return Search(operands or ["."], rg and not hidden and unrestricted < 2 and not configured,
+                  tuple(filters), frozenset(positions), "rg" if rg else "grep",
+                  explicit_starts=bool(operands))
 
 
 def secret_below(start: Path, home: Path, skips_hidden: bool,
@@ -944,6 +1362,62 @@ def secret_below(start: Path, home: Path, skips_hidden: bool,
             if not (skips_hidden and any(part.startswith(".") for part in below)):
                 return area
     return None
+
+
+def recursive_search_denial(stages: list[Stage], home: Path,
+                            secret_paths: tuple[str, ...]) -> str | None:
+    """Why a recursive search or recursive reader is denied, or None. It is denied when
+    it would read a secret area (`~/.ssh`), when it starts at or inside a `.git`
+    directory, and when it does not clearly exclude `.env`, `.env.*` and `.git`, which
+    hold credentials and remote URLs. No tree is read to find out whether they exist."""
+    for stage in stages:
+        search = search_starts(stage.words, stage.cwds[-1], home)
+        if search is None:
+            continue
+        for start in stage_paths(stage, home, search.starts):
+            reached = secret_below(start, home, search.skips_hidden, secret_paths)
+            if reached is not None:
+                return (f"a recursive search from {start} would read {reached}, which holds "
+                        "keys, credentials or session transcripts. Search a directory that "
+                        "does not contain it")
+            if inside_a_git_directory(start):
+                return (f"a recursive search from {start} starts inside a .git directory, "
+                        "which holds .git/config and its remote URLs, and no exclusion "
+                        "applies to a start path. Search the work tree and exclude .git")
+        if reads_only_stdin_or_files(stage, search, home):
+            continue
+        missing = uncovered_secrets(search)
+        if missing:
+            return search_denial(search, missing)
+    return None
+
+
+def reads_only_stdin_or_files(stage: Stage, search: Search, home: Path) -> bool:
+    """Whether a search names no tree to walk: rg with no path that reads a pipe or a
+    redirect (grep -r with no path walks the working directory instead), or only
+    existing regular files."""
+    reads_stdin = stage.piped or any(word in ("<", "<<<", HEREDOC_MARKER) for word in stage.raw)
+    if not search.explicit_starts:
+        return search.program == "rg" and reads_stdin
+    if search.program == "git":
+        return False
+    return all(start.is_file() for start in stage_paths(stage, home, search.starts))
+
+
+def search_denial(search: Search, missing: list[str]) -> str:
+    """Why a recursive search is denied, and the flags that let it through."""
+    if search.program == "git":
+        return ("`git diff --no-index`, and `git diff` of a path outside the work tree, reads "
+                "every file below its paths, including .env files and .git/config, which hold "
+                "credentials, and cannot exclude any. Use `diff -r -x .env -x '.env.*' -x .git` "
+                "instead")
+    flags = {
+        "rg": "-g '!.env' -g '!.env.*' -g '!.git' (after any -g that matches them)",
+        "diff": "-x .env -x '.env.*' -x .git",
+    }.get(search.program, "--exclude=.env --exclude='.env.*' --exclude-dir=.git (after any "
+                          "--include that matches them; spell the options in full)")
+    return (f"a recursive {search.program} would read {', '.join(missing)}, which hold "
+            f"credentials or remote URLs. Rerun it with {flags}")
 
 
 # Programs that only read the files they name. A stage whose program is not here
@@ -1702,18 +2176,13 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
     # before the command, so nothing here is allowed on that account.
     secret_paths = policy.secret_paths if policy is not None else None
     for index, stage in enumerate(stages):
-        for path in stage_paths(stage, home):
+        searched = search_starts(stage.words)
+        # The names a search excludes (`--exclude=.env`) are patterns, not paths it reads.
+        named = [word for position, word in enumerate(stage.words)
+                 if searched is None or position not in searched.exclusion_words]
+        for path in stage_paths(stage, home, named):
             if secret_paths is not None and secret(path, secret_paths):
                 return f"{path} holds keys or credentials, which no tool may read or write"
-        searched = search_starts(stage.words)
-        if searched is not None and secret_paths is not None:
-            starts, skips_hidden = searched
-            for start in stage_paths(stage, home, starts):
-                reached = secret_below(start, home, skips_hidden, secret_paths)
-                if reached is not None:
-                    return (f"a recursive search from {start} would read {reached}, which holds "
-                            "keys, credentials or session transcripts. Search a directory that "
-                            "does not contain it")
         outputs = redirect_targets(stage.raw)
         for target in [*outputs, *input_targets(stage.raw)]:
             for directory in stage.cwds:
