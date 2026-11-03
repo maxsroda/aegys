@@ -25,8 +25,8 @@
 ## What it does
 
 - Runs commands on a shipped allow list (`git status`, `cat`, `ls`, …) without asking.
-- Blocks recursive deletes of critical paths, reads of credential files, environment dumps (`env`, `printenv`, `/proc/*/environ`, `ps e`), and writes to *agy*'s and git's control files and to *aegys* itself.
-- Blocks a recursive search (`grep -r`, `rg`, `diff -r`) unless it excludes `.env`, `.env.*` and `.git` by name. `git diff --no-index` of two folders cannot exclude them, so it is always blocked.
+- Blocks recursive deletes of critical paths, reads of credential files, environment dumps (`env`, `printenv`, `/proc/*/environ`, `ps` with the BSD `e` option), and writes to *agy*'s and git's control files and to *aegys* itself.
+- Blocks a search that walks a folder (`grep -r`, `rg`, `diff -r`) unless it excludes `.env`, `.env.*` and `.git` by name. `git diff --no-index` of two folders cannot exclude them, so it is always blocked.
 - Blocks URLs on a deny list and private or cloud-metadata addresses.
 - Asks you before `sudo`, `doas`, and commands on your own ask list.
 - Sends the rest to a classifier model of your choice, which allows or denies. When the agent retries a denied risky operation by another route without your authorization, *aegys* denies again and tells it to change course.
