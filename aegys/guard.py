@@ -1831,8 +1831,11 @@ def evaluate_file_access(
         root = None
     # A write into a git directory recognised by content, under a name other than .git, is
     # guarded like one under .git: git runs programs its files name, so the classifier
-    # judges it rather than the fast path allowing it. (A `config` there is already denied
-    # above, as a git settings file.)
+    # judges it rather than the fast path allowing it. This recognises the directory only
+    # once it is complete (see is_git_directory), so a `config` planted before the rest of
+    # the layout exists still passes here; its execution is caught at the command check,
+    # which sees the finished directory. A `config` written into an already-complete git
+    # directory is denied above, as a git settings file.
     if tool_name in WRITE_TOOL_NAMES and root is not None:
         ancestor = root
         for part in (None, *path.relative_to(root).parts[:-1]):
