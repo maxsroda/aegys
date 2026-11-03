@@ -1640,6 +1640,59 @@ class AegysTest(unittest.TestCase):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res, {"decision": "allow"}, cmd)
 
+    def test_sed_with_the_delimiter_inside_a_bracket_expression_is_read_as_gnu_sed_reads_it(self) -> None:
+        """GNU sed takes a `/` inside `[...]` as a literal: `s/[/]/;/e` is `s` with
+        regex `[/]`, replacement `;` and the e flag, which runs the pattern space."""
+        (self.work / "a.txt").write_text("true/id\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "sed 's/[/]/;/e;a /' a.txt",
+            "sed 's/[/]/;/e;a /\np' a.txt",
+            "sed 's/[]/]/;/e;a /' a.txt",
+            "sed 's/[^]/]/;/e;a /' a.txt",
+            "sed 's/[[:alpha:]/]/;/e;a /' a.txt",
+            "sed 's,[,],;,e;a ,' a.txt",
+            "sed '/[/]/e id' a.txt",
+            "sed '\\%[%]%e id' a.txt",
+            "sed 'b x e id' a.txt",
+        ))
+        for cmd in ("sed -n '/[/]/p' a.txt", "sed 's/[/]/x/g' a.txt", "sed 's/[^]/]/x/' a.txt",
+                    "sed -n '\\%/%p' a.txt", "sed 's/[[:space:]]*$//' a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_sed_writing_a_control_file_past_a_bracket_expression_is_denied(self) -> None:
+        """The write detector reads command boundaries as GNU sed does, so the `w`
+        file after a bracket that holds the delimiter is still a control file."""
+        for cmd in (
+            "sed 's/x/y/w ~/.gemini/config/hooks.json' a.txt",
+            "sed 's/[/]/x/w ~/.gemini/config/hooks.json' a.txt",
+            "sed '/[/]/w ~/.gemini/config/hooks.json' a.txt",
+            "sed 's,[,],x,w ~/.gemini/config/hooks.json' a.txt",
+            "sed ':a w ~/.gemini/config/hooks.json' a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_sed_reading_a_secret_with_r_or_R_is_denied_like_cat(self) -> None:
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        (self.work / ".env").write_text("K=env\n", encoding="utf-8")
+        for cmd in ("sed -n '1r .env' a.txt", "sed 'R .env' a.txt", "sed -e '$r ~/.ssh/id_rsa' a.txt",
+                    "sed --expression='/x/{r .env\n}' a.txt", "sed -n '1r /proc/self/environ' a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+            self.assertIn("holds keys or credentials", res.get("reason", ""), (cmd, res))
+
+    def test_file_compiling_a_magic_file_is_not_fast_allowed(self) -> None:
+        """`file -C -m X` writes X.mgc; -f reads every file a list names; -p resets times."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "file -C -m magic a.txt", "file --compile -m magic", "file -Cm magic", "file --comp -m magic",
+            "file -f list.txt", "file -p a.txt",
+        ))
+        for cmd in ("file a.txt", "file -b --mime-type a.txt", "file -L -m magic a.txt", "file -i a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
     def test_awk_given_a_program_file_or_source_as_one_word_is_not_fast_allowed(self) -> None:
         """`-fFILE` and `--source=CODE` run code just as `-f FILE` and `-e CODE` do."""
         (self.work / "a.txt").write_text("x\n", encoding="utf-8")

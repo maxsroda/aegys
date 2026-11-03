@@ -1682,52 +1682,183 @@ def operand_words(words: list[str]) -> list[str]:
     return rest if index is None else rest[:index - 1] + rest[index:]
 
 
-# A sed command's optional address range and `!`, its `s/re/text/` body, and the
-# characters that end a command.
-SED_ADDRESS = r"(?:\d+(?:~\d+)?|\$|/(?:\\.|[^/\\])*/[IM]*)"
-SED_COMMAND_START = re.compile(
-    rf"[\s;]*(?:{SED_ADDRESS}(?:\s*,\s*(?:[+~]?\d+|{SED_ADDRESS}))?)?\s*!*\s*")
-SED_SUBSTITUTE = re.compile(r"s(.)((?:\\.|(?!\1).)*)\1((?:\\.|(?!\1).)*)\1")
-SED_SEPARATOR = re.compile(r"[;\n{}]")
+# How GNU sed reads a script, for sed_commands: the blanks and `;` between
+# commands, a line or step address (`3`, `$`, `1~2`), the `+N`/`~N` end of a range,
+# an `s` flag list, and the characters that may follow a command.
+SED_GAP = re.compile(r"[\s;]*")
+SED_BLANKS = re.compile(r"[ \t]*")
+SED_LINE_ADDRESS = re.compile(r"\d+(?:~\d+)?|\$")
+SED_RANGE_OFFSET = re.compile(r"[+~]?\d+")
+SED_FLAGS = re.compile(r"[0-9gpiImMe]*")
+SED_COMMAND_END = ";\n}#"
 
 
-def sed_script_targets(script: str) -> list[str]:
-    """The files a sed script writes: the rest of the line after a `w`/`W` command
-    or an `s///` command's `w` flag. Commands are read left to right, so a `w` in
-    a regex, a replacement or a file name is not taken for one."""
-    targets, i = [], 0
+def sed_bracket_end(script: str, i: int) -> int | None:
+    """The index after the bracket expression that opens at script[i] (`[`), read as
+    GNU sed reads it: a `]` right after `[` or `[^` is a member, `[:class:]`, `[=c=]`
+    and `[.c.]` are members, and a backslash is an ordinary member. None when no `]`
+    closes it."""
+    j = i + 1
+    if script.startswith("^", j):
+        j += 1
+    if script.startswith("]", j):
+        j += 1
+    while j < len(script):
+        if script[j] == "[" and script[j + 1:j + 2] in (":", "=", "."):
+            close = script.find(script[j + 1] + "]", j + 2)
+            if close < 0:
+                return None
+            j = close + 2
+        elif script[j] == "]":
+            return j + 1
+        else:
+            j += 1
+    return None
+
+
+def sed_delimited_end(script: str, i: int, delimiter: str, brackets: bool) -> int | None:
+    """The index of the delimiter that ends the regex (brackets=True) or replacement
+    text starting at script[i]: a backslash escapes the next character, and in a
+    regex a bracket expression may hold the delimiter. None when an unescaped newline
+    or the end of the script comes first."""
     while i < len(script):
-        i = SED_COMMAND_START.match(script, i).end()
+        character = script[i]
+        if character == "\\":
+            i += 2
+        elif character == delimiter:
+            return i
+        elif character == "\n":
+            return None
+        elif character == "[" and brackets:
+            end = sed_bracket_end(script, i)
+            if end is None:
+                return None
+            i = end
+        else:
+            i += 1
+    return None
+
+
+def sed_address_end(script: str, i: int) -> int | None:
+    """The index after the address at script[i] (`3`, `$`, `1~2`, `/re/`, `\\%re%`,
+    a regex followed by I or M), or i itself when none starts there. None when a
+    regex address is not closed."""
+    line = SED_LINE_ADDRESS.match(script, i)
+    if line:
+        return line.end()
+    if script.startswith("/", i):
+        delimiter, start = "/", i + 1
+    elif script.startswith("\\", i) and i + 1 < len(script) and script[i + 1] != "\n":
+        delimiter, start = script[i + 1], i + 2
+    else:
+        return i
+    end = sed_delimited_end(script, start, delimiter, brackets=True)
+    return None if end is None else re.compile(r"[IM]*").match(script, end + 1).end()
+
+
+def sed_line_end(script: str, i: int) -> int:
+    end = script.find("\n", i)
+    return len(script) if end < 0 else end
+
+
+def sed_commands(script: str) -> list[tuple[str, str]] | None:
+    """The commands of a sed script, read left to right as GNU sed reads them, each
+    as `(letter, argument)`: the file of r, R, w and W, the command of e, the flags
+    of s (an `s///w FILE` adds a `("w", FILE)`), the text of a, i and c, and "" for
+    the rest. None when the script does not parse, which GNU sed refuses to run."""
+    commands: list[tuple[str, str]] = []
+    i = 0
+    while True:
+        i = SED_GAP.match(script, i).end()
         if i >= len(script):
-            break
+            return commands
+        end = sed_address_end(script, i)
+        if end is None:
+            return None
+        if end > i:
+            i = SED_BLANKS.match(script, end).end()
+            if script.startswith(",", i):
+                i = SED_BLANKS.match(script, i + 1).end()
+                offset = SED_RANGE_OFFSET.match(script, i)
+                end = offset.end() if offset else sed_address_end(script, i)
+                if end is None or end == i:
+                    return None
+                i = end
+        i = re.compile(r"[\s!]*").match(script, i).end()
+        if i >= len(script):
+            return None
         command = script[i]
         if command in "{}":
+            commands.append((command, ""))
             i += 1
             continue
-        if command == "s":
-            match = SED_SUBSTITUTE.match(script, i)
-            if match:
-                i = match.end() + len(re.match(r"[0-9gpiImMe]*", script[match.end():]).group(0))
-                if i >= len(script) or script[i] not in "wW":
-                    continue
-                command = script[i]
-        if command in "wW":
-            end = script.find("\n", i)
-            end = len(script) if end < 0 else end
-            if script[i + 1:end].strip():
-                targets.append(script[i + 1:end].strip())
+        if command in "#rRwWe":   # a comment, a file name or a command: the rest of the line,
+            # past its leading blanks
+            end = sed_line_end(script, i)
+            commands.append((command, script[i + 1:end].lstrip(" \t")))
             i = end
             continue
-        separator = SED_SEPARATOR.search(script, i + 1)
-        i = separator.start() if separator else len(script)
-    return targets
+        if command in "aic":   # text up to a newline no odd run of backslashes escapes
+            end = sed_line_end(script, i)
+            while end < len(script) and (len(script[:end]) - len(script[:end].rstrip("\\"))) % 2:
+                end = sed_line_end(script, end + 1)
+            commands.append((command, script[i + 1:end]))
+            i = end
+            continue
+        if command in ":btT":   # a label ends at a blank or `;`, and a command may follow it
+            commands.append((command, ""))
+            i = re.compile(r"[ \t]*[^\s;]*").match(script, i + 1).end()
+            continue
+        if command in "sy":
+            delimiter = script[i + 1:i + 2]
+            if delimiter in ("", "\n", "\\"):
+                return None
+            middle = sed_delimited_end(script, i + 2, delimiter, brackets=command == "s")
+            last = None if middle is None else sed_delimited_end(script, middle + 1, delimiter,
+                                                                  brackets=False)
+            if last is None:
+                return None
+            i = last + 1
+            if command == "s":
+                flags_end = SED_FLAGS.match(script, i).end()
+                commands.append(("s", script[i:flags_end]))
+                i = flags_end
+                if script.startswith("w", i):
+                    end = sed_line_end(script, i)
+                    commands.append(("w", script[i + 1:end].lstrip(" \t")))
+                    i = end
+                    continue
+            else:
+                commands.append(("y", ""))
+        elif command in SED_PRINTING_COMMANDS:
+            commands.append((command, ""))
+            i += 1
+            if command in "lqQ":
+                i = re.compile(r"[ \t]*\d*").match(script, i).end()
+        elif command == "v":
+            commands.append((command, ""))
+            i = re.compile(r"[ \t]*[\d.]*").match(script, i + 1).end()
+        else:
+            return None
+        i = SED_BLANKS.match(script, i).end()
+        if i < len(script) and script[i] not in SED_COMMAND_END:
+            return None
+
+
+def sed_script_targets(script: str) -> list[str] | None:
+    """The files a sed script writes: the file of each `w`/`W` command and `s///w`
+    flag. None when the script does not parse as sed_commands reads it."""
+    commands = sed_commands(script)
+    return None if commands is None else [file for letter, file in commands
+                                          if letter in "wW" and file]
 
 
 def sed_targets(args: list[str]) -> list[str] | None:
     """The files sed writes besides standard output: the `w` targets of its
     expressions (-e X, -eX, --expression=X, or the first operand when no -e is
-    given). None when it rewrites its input files (-i) or runs a script file the
-    hook cannot see (-f), so that every operand may be written. Short options are
+    given). None when it rewrites its input files (-i), runs a script file the
+    hook cannot see (-f) or has a script that does not parse, so that every
+    operand may be written. Short options are
     read letter by letter: -ni and -nf count."""
     expressions, operands, take_next = [], [], False
     for arg in args:
@@ -1754,8 +1885,10 @@ def sed_targets(args: list[str]) -> list[str] | None:
                     break
         elif not arg.startswith("-"):
             operands.append(arg)
-    return [target for script in (expressions or operands[:1])
-            for target in sed_script_targets(script)]
+    targets = [sed_script_targets(script) for script in (expressions or operands[:1])]
+    if any(found is None for found in targets):
+        return None
+    return [target for found in targets for target in found or []]
 
 
 def sed_files(args: list[str]) -> list[str]:
@@ -1872,67 +2005,71 @@ SED_EDITS_FILES = {"-i", "--in-place", "-f", "--file"}
 # an optional number. Not here: e (runs a command), r and R (read a file), w and W
 # (write one).
 SED_PRINTING_COMMANDS = set("dDFgGhHlnNpPqQxz=")
-SED_TRANSLITERATE = re.compile(r"y(.)((?:\\.|(?!\1).)*)\1((?:\\.|(?!\1).)*)\1")
-# The flags of a read-only `s///`: no e (runs the pattern space) and no w (writes).
-SED_PRINTING_FLAGS = re.compile(r"[0-9gpiImM]*")
+# Commands that print or edit too, and the flags of a read-only `s///`: no e (runs
+# the pattern space) and no w (writes).
+SED_EDITING_COMMANDS = set("{}#aic:btTyv")
+SED_PRINTING_FLAGS = set("0123456789gpiImM")
 
 
 def sed_script_reads_only(script: str) -> bool:
-    """True when every command of the sed script is one that only prints or edits
-    its input (SED_PRINTING_COMMANDS, `s` with SED_PRINTING_FLAGS, `y`, the text
-    commands a, i, c, labels, branches, `{}` and comments). Commands are read left
-    to right, so an `e` in a regex, a replacement or a text is not taken for one."""
-    i = 0
-    while True:
-        i = SED_COMMAND_START.match(script, i).end()
-        if i >= len(script):
-            return True
-        command = script[i]
-        if command in "{}":
-            i += 1
-            continue
-        if command in "#aic":   # a comment, or text up to the end of the line
-            end = script.find("\n", i)
-            i = len(script) if end < 0 else end
-            continue
-        if command in ":btT":   # a label, which ends at a blank or `;`
-            i = re.compile(r"[ \t]*[^\s;}]*").match(script, i + 1).end()
-        elif command == "s":
-            match = SED_SUBSTITUTE.match(script, i)
-            if not match:
-                return False
-            i = SED_PRINTING_FLAGS.match(script, match.end()).end()
-        elif command == "y":
-            match = SED_TRANSLITERATE.match(script, i)
-            if not match:
-                return False
-            i = match.end()
-        elif command in SED_PRINTING_COMMANDS:
-            i += 1
-            if command in "lqQ":
-                i = re.compile(r"[ \t]*\d*").match(script, i).end()
-        elif command == "v":
-            i = re.compile(r"[ \t]*[\d.]*").match(script, i + 1).end()
-        else:
-            return False
-        i = re.compile(r"[ \t]*").match(script, i).end()
-        if i < len(script) and script[i] not in ";\n}#":
-            return False
+    """True when every command of the sed script, as sed_commands reads it, only
+    prints or edits its input: one of SED_PRINTING_COMMANDS or SED_EDITING_COMMANDS,
+    or `s` with flags of SED_PRINTING_FLAGS."""
+    commands = sed_commands(script)
+    return commands is not None and all(
+        letter in SED_PRINTING_COMMANDS or letter in SED_EDITING_COMMANDS
+        or letter == "s" and set(argument) <= SED_PRINTING_FLAGS
+        for letter, argument in commands)
+
+
+def sed_scripts(args: list[str]) -> list[str] | None:
+    """sed's scripts: its -e and --expression values, or else its first operand.
+    None when an option is not in SED_OPTIONS or a script file (-f) gives it."""
+    parsed = read_options(args, SED_OPTIONS)
+    if parsed is None:
+        return None
+    options, operands = parsed
+    if any(name in ("-f", "--file") for name, _ in options):
+        return None
+    return [value or "" for name, value in options if name in ("-e", "--expression")] \
+        or operands[:1]
+
+
+def sed_read_files(args: list[str]) -> list[str]:
+    """The files sed's `r` and `R` commands read, which its operands do not name."""
+    return [file for script in sed_scripts(args) or []
+            for letter, file in sed_commands(script) or [] if letter in "rR" and file]
 
 
 def sed_reads_only(args: list[str]) -> bool:
     """True when sed only prints: every option is in SED_OPTIONS but -i and -f,
-    and every command of its script (the -e values, or else its first operand)
-    passes sed_script_reads_only."""
+    and every command of its scripts (sed_scripts) passes sed_script_reads_only."""
     parsed = read_options(args, SED_OPTIONS)
-    if parsed is None:
+    if parsed is None or any(name in SED_EDITS_FILES for name, _ in parsed[0]):
         return False
-    options, operands = parsed
-    if any(name in SED_EDITS_FILES for name, _ in options):
-        return False
-    scripts = [value or "" for name, value in options if name in ("-e", "--expression")]
-    scripts = scripts or operands[:1]
+    scripts = sed_scripts(args)
     return bool(scripts) and all(sed_script_reads_only(script) for script in scripts)
+
+
+# file's options. -C and --compile write X.mgc for each magic file X, -p and
+# --preserve-date reset the files' access times, and -f and --files-from read
+# every file a list names.
+FILE_OPTIONS = OptionSpec(
+    short_flags="vzZbcCikLlhnN0prsSd", short_valued="meFPf",
+    long={"--help": 0, "--version": 0, "--magic-file": 1, "--uncompress": 0,
+          "--uncompress-noreport": 0, "--brief": 0, "--checking-printout": 0, "--exclude": 1,
+          "--exclude-quiet": 1, "--files-from": 1, "--separator": 1, "--mime": 0, "--apple": 0,
+          "--extension": 0, "--mime-type": 0, "--mime-encoding": 0, "--keep-going": 0,
+          "--list": 0, "--dereference": 0, "--no-dereference": 0, "--no-buffer": 0,
+          "--no-pad": 0, "--print0": 0, "--preserve-date": 0, "--parameter": 1, "--raw": 0,
+          "--special-files": 0, "--no-sandbox": 0, "--compile": 0, "--debug": 0})
+FILE_WRITES_OR_LISTS = {"-C", "--compile", "-p", "--preserve-date", "-f", "--files-from"}
+
+
+def file_reads_only(args: list[str]) -> bool:
+    """True when every option of file is in FILE_OPTIONS and none is in FILE_WRITES_OR_LISTS."""
+    parsed = read_options(args, FILE_OPTIONS)
+    return parsed is not None and not any(name in FILE_WRITES_OR_LISTS for name, _ in parsed[0])
 
 
 # The options of POSIX awk and gawk's long spellings of them: a field separator and
@@ -2098,6 +2235,8 @@ def program_writes(words: list[str]) -> bool:
         return not sort_reads_only(args)
     if program == "uniq":
         return uniq_outputs(args) != []
+    if program == "file":
+        return not file_reads_only(args)
     if program == "find":
         return find_writes(args)
     if program == "tree":
@@ -2489,6 +2628,8 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
         # The names a search excludes (`--exclude=.env`) are patterns, not paths it reads.
         named = [word for position, word in enumerate(stage.words)
                  if searched is None or position not in searched.exclusion_words]
+        if stage.words and os.path.basename(stage.words[0]) == "sed":
+            named += sed_read_files(stage.words[1:])   # `r FILE` names FILE inside the script
         for path in stage_paths(stage, home, named):
             if secret_paths is not None and secret(path, secret_paths):
                 return f"{path} holds keys or credentials, which no tool may read or write"
