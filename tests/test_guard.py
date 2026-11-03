@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import patch
 
 from aegys import config as config_module
+from aegys.command_checks import tree_outputs
 from aegys.guard import (
     CLASSIFIER_DECISION_TOOL_NAME,
     anthropic_messages_call,
@@ -1596,6 +1597,365 @@ class AegysTest(unittest.TestCase):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
             self.assertIn("hostname-bin", res.get("reason", ""), (cmd, res))
+
+    def test_sed_that_runs_a_command_or_reads_another_file_is_not_fast_allowed(self) -> None:
+        """GNU sed's `e` command, the `s///e` flag and `r`/`R` run programs or read files."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        (self.work / ".env").write_text("K=env\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "sed '1e id' a.txt",
+            "sed -n '1e echo X' a.txt",
+            "sed 'e id' a.txt",
+            "sed -n 's/.*/id/e' a.txt",
+            "sed -n 's/x/y/e' a.txt",
+            "sed --expression='1e id' a.txt",
+            "sed --expr='1e id' a.txt",
+            "sed -ne '1e id' a.txt",
+            "sed -n '1r .env' a.txt",
+            "sed 'R .env' a.txt",
+            "sed -n '1r .git/config' a.txt",
+            "sed -n '/x/{r .env\n}' a.txt",
+            "sed '1!e id' a.txt",
+            "sed -n 'p;e id' a.txt",
+            "sed -f script.sed a.txt",
+            "sed -i 's/x/y/' a.txt",
+            "sed --in-place 's/x/y/' a.txt",
+        ))
+
+    def test_sed_with_only_printing_and_editing_commands_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        for cmd in (
+            "sed -n '1,5p' a.txt",
+            "sed 's/a/b/g' a.txt",
+            "sed -E 's/(x)/[\\1]/2;p' a.txt",
+            "sed '/x/d' a.txt",
+            "sed -n '$=' a.txt",
+            "sed 'y/ab/cd/' a.txt",
+            "sed '1i hello' a.txt",
+            "sed ':a;N;$!ba;s/\\n/ /g' a.txt",
+            "sed -n -e '1p' -e '$p' a.txt",
+            "sed -n '/start/,/end/{/end/!p}' a.txt",
+            "sed 's/e/E/I' a.txt",
+            "sed '5q' a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_sed_with_the_delimiter_inside_a_bracket_expression_is_read_as_gnu_sed_reads_it(self) -> None:
+        """GNU sed takes a `/` inside `[...]` as a literal: `s/[/]/;/e` is `s` with
+        regex `[/]`, replacement `;` and the e flag, which runs the pattern space."""
+        (self.work / "a.txt").write_text("true/id\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "sed 's/[/]/;/e;a /' a.txt",
+            "sed 's/[/]/;/e;a /\np' a.txt",
+            "sed 's/[]/]/;/e;a /' a.txt",
+            "sed 's/[^]/]/;/e;a /' a.txt",
+            "sed 's/[[:alpha:]/]/;/e;a /' a.txt",
+            "sed 's,[,],;,e;a ,' a.txt",
+            "sed '/[/]/e id' a.txt",
+            "sed '\\%[%]%e id' a.txt",
+            "sed 'b x e id' a.txt",
+        ))
+        for cmd in ("sed -n '/[/]/p' a.txt", "sed 's/[/]/x/g' a.txt", "sed 's/[^]/]/x/' a.txt",
+                    "sed -n '\\%/%p' a.txt", "sed 's/[[:space:]]*$//' a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_sed_writing_a_control_file_past_a_bracket_expression_is_denied(self) -> None:
+        """The write detector reads command boundaries as GNU sed does, so the `w`
+        file after a bracket that holds the delimiter is still a control file."""
+        for cmd in (
+            "sed 's/x/y/w ~/.gemini/config/hooks.json' a.txt",
+            "sed 's/[/]/x/w ~/.gemini/config/hooks.json' a.txt",
+            "sed '/[/]/w ~/.gemini/config/hooks.json' a.txt",
+            "sed 's,[,],x,w ~/.gemini/config/hooks.json' a.txt",
+            "sed ':a w ~/.gemini/config/hooks.json' a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_sed_writing_a_control_file_through_an_abbreviated_long_option_is_denied(self) -> None:
+        """GNU sed reads `--expr` as `--expression` and `--in-pl` as `--in-place`."""
+        for cmd in (
+            "sed --expr='w ~/.gemini/config/hooks.json' a.txt",
+            "sed -n --expr 'w ~/.gemini/config/hooks.json' a.txt",
+            "sed -i --expr='s/a/b/' ~/.gemini/config/hooks.json",
+            "sed --in-pl 's/a/b/' ~/.gemini/config/hooks.json",
+            "sed --in-place=.bak --expr 's/a/b/' ~/.gemini/config/hooks.json",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_sed_reading_a_secret_with_r_or_R_is_denied_like_cat(self) -> None:
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        (self.work / ".env").write_text("K=env\n", encoding="utf-8")
+        for cmd in ("sed -n '1r .env' a.txt", "sed 'R .env' a.txt", "sed -e '$r ~/.ssh/id_rsa' a.txt",
+                    "sed --expression='/x/{r .env\n}' a.txt", "sed -n '1r /proc/self/environ' a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+            self.assertIn("holds keys or credentials", res.get("reason", ""), (cmd, res))
+
+    def test_file_compiling_a_magic_file_is_not_fast_allowed(self) -> None:
+        """`file -C -m X` writes X.mgc; -f reads every file a list names; -p resets times."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "file -C -m magic a.txt", "file --compile -m magic", "file -Cm magic", "file --comp -m magic",
+            "file -f list.txt", "file -p a.txt",
+        ))
+        for cmd in ("file a.txt", "file -b --mime-type a.txt", "file -L -m magic a.txt", "file -i a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_awk_given_a_program_file_or_source_as_one_word_is_not_fast_allowed(self) -> None:
+        """`-fFILE` and `--source=CODE` run code just as `-f FILE` and `-e CODE` do."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        (self.work / "p.awk").write_text('BEGIN { system("id") }\n', encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "awk -fp.awk a.txt",
+            "gawk -fp.awk a.txt",
+            "awk --source='BEGIN{system(\"id\")}' a.txt",
+            "gawk --source='BEGIN{system(\"id\")}' a.txt",
+            "awk -W source='BEGIN{system(\"id\")}' a.txt",
+            "awk -e 'BEGIN{system(\"id\")}' a.txt",
+            "awk -f p.awk a.txt",
+            "gawk -lfilefuncs 'BEGIN{}'",
+            "gawk '@load \"filefuncs\"; BEGIN{}'",
+            "gawk 'BEGIN{f=\"system\"; @f(\"id\")}'",
+        ))
+
+    def test_awk_that_reads_the_environment_or_other_files_is_not_fast_allowed(self) -> None:
+        """ENVIRON holds the API keys; ARGV and SYMTAB reach files and variables no word names."""
+        self.assert_not_fast_allowed((
+            "awk 'BEGIN{print ENVIRON[\"ANTHROPIC_API_KEY\"]}'",
+            "gawk 'BEGIN{print SYMTAB[\"ENVIRON\"][\"HOME\"]}'",
+            "awk 'BEGIN{ARGV[1]=\".env\"; ARGC=2} {print}'",
+        ))
+
+    def test_awk_with_field_and_variable_options_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        for cmd in (
+            "awk '{print $1}' a.txt",
+            "awk -F: '{print $1}' a.txt",
+            "awk -F , -v n=2 'NR==n' a.txt",
+            "awk -- '{print NF}' a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_sort_that_writes_through_a_cluster_or_runs_a_compressor_is_not_fast_allowed(self) -> None:
+        """`-o` inside a short-option cluster still writes; `--compress-program` runs a program."""
+        (self.work / "a.txt").write_text("b\na\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "sort -ro out.txt a.txt",
+            "sort -uo out.txt a.txt",
+            "sort -roout.txt a.txt",
+            "sort -ro ~/.gemini/config/hooks.json a.txt",
+            "sort -S 1K --compress-program=./z.sh a.txt",
+            "sort --compress-program sh a.txt",
+            "sort --compress-prog=sh a.txt",
+            "sort --outp=out.txt a.txt",
+            "sort -T /tmp a.txt",
+            "sort -o out.txt a.txt",
+        ))
+
+    def test_sort_writing_a_control_file_through_a_cluster_is_denied(self) -> None:
+        res = self.evaluate("sort -ro ~/.gemini/config/hooks.json a.txt",
+                            classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_sort_with_ordering_options_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("b\na\n", encoding="utf-8")
+        for cmd in (
+            "sort a.txt",
+            "sort -rn a.txt",
+            "sort -k2,2 -t, a.txt",
+            "sort -t , -k 1 a.txt",
+            "sort -u -S1K a.txt",
+            "sort --reverse --numeric-sort a.txt",
+            "sort --key=2 --field-separator=: a.txt",
+            "sort -ko a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_uniq_and_tree_writing_an_output_file_are_not_fast_allowed(self) -> None:
+        """uniq writes its second operand; tree writes -o's file, also inside a cluster."""
+        (self.work / "a.txt").write_text("a\na\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "uniq a.txt out.txt",
+            "uniq -c a.txt out.txt",
+            "uniq -f 1 a.txt out.txt",
+            "tree -ao out.txt .",
+            "tree -o out.txt .",
+        ))
+        for cmd in ("uniq a.txt", "uniq -c -f 1 a.txt", "uniq --skip-chars 2 a.txt", "tree -a ."):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_jq_that_reads_the_environment_is_not_fast_allowed(self) -> None:
+        self.assert_not_fast_allowed((
+            "jq -n env",
+            "jq -n '$ENV.ANTHROPIC_API_KEY'",
+            "jq -n 'env | keys'",
+            "jq --indent 2 -n env",
+            "jq -f prog.jq a.json",
+            "jq -L . -n 'import \"m\" as m; m::f'",
+        ))
+        (self.work / "a.json").write_text('{"env": 1}\n', encoding="utf-8")
+        for cmd in ("jq .a.env a.json", "jq -r '.name' a.json", "jq --arg env x -n '$env'",
+                    "jq -c '.[] | select(.env)' a.json"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_environment_dumps_are_denied_like_env_and_printenv(self) -> None:
+        """`ps` with the environment flags and `/proc/*/environ` print the same secrets `env` does."""
+        for cmd in (
+            "ps axeww",
+            "ps auxe",
+            "ps -ef e",
+            "ps -p 1 eww",
+            "ps e",
+            "cat /proc/self/environ",
+            "cat /proc/1/environ",
+            "strings /proc/self/environ",
+            "tr '\\0' '\\n' < /proc/self/environ",
+            "env",
+            "printenv",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        for cmd in ("ps aux", "ps -ef", "ps -p 1 -o pid,etime", "ps axo pid,etime", "ps -C sleep",
+                    "ps o etime"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_ps_env_flag_in_every_procps_spelling_is_not_fast_allowed(self) -> None:
+        """BSD `e` glued to a pid, and dash clusters procps rereads as BSD letters after
+        any parse error, print that process's (or every process's) environment."""
+        self.assert_not_fast_allowed((
+            "ps ae12345", "ps ex12345", "ps e12345,1", "ps ewww1", "ps ae1",
+            "ps -efx", "ps -auxe", "ps -xe", "ps -axe", "ps -ue", "ps -ve",
+            "ps -eo pid,args -x", "ps -ueve", "ps -u -e", "ps -eo environ",
+            "ps --info", "ps -ef --bogus",
+        ))
+
+    def test_ps_env_letters_before_a_pid_list_are_not_fast_allowed(self) -> None:
+        """A pid list ends ps's words; the `e` letters before it still count."""
+        self.assert_not_fast_allowed(("ps -u -e 12345", "ps -auxe 12345", "ps -ueve 1"))
+
+    def test_ps_environment_format_with_a_width_is_not_fast_allowed(self) -> None:
+        self.assert_not_fast_allowed(("ps -o environ:50 -p 1", "ps -o pid,environ:50"))
+
+    def test_ps_selection_values_spelled_with_e_stay_fast_allowed(self) -> None:
+        """A value in the word after -u, -g, -s, -C or --user stays a value when ps rereads
+        the words as BSD letters (it then fails on the bare word), so it prints no
+        environment."""
+        for cmd in ("ps -u e", "ps -u eve", "ps -g e", "ps -s e", "ps -C eve", "ps --user eve"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_ps_in_unix_and_bsd_spellings_without_the_environment_stays_fast_allowed(self) -> None:
+        for cmd in ("ps aux", "ps -ef", "ps -eF", "ps -elf", "ps -eo pid,args",
+                    "ps -eo pid,etime", "ps -p 1 -o pid,etime", "ps -ef --forest", "ps -A",
+                    "ps axo pid,etime", "ps -C sleep", "ps o etime", "ps -u root",
+                    "ps --pid 1 -o pid,ppid,etime,args", "ps -eo pid,comm --sort=-etime",
+                    "ps -p 1,2", "ps -fp 1", "ps -o pid= -p 1", "ps 1"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_pstree_is_fast_allowed(self) -> None:
+        for cmd in ("pstree -p 1", "pstree -ap 1", "pstree"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_less_and_more_options_that_run_or_write_are_not_fast_allowed(self) -> None:
+        """A lesskey file or text can set LESSOPEN, which less runs; -o/-O write a log;
+        a `+` initial command can run `!CMD`."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "less '--lesskey-content=#env;LESSOPEN=|touch pwned %s' a.txt",
+            "less --lesskey-src=keys a.txt", "less -k keys a.txt", "less -kkeys a.txt",
+            "less -o log a.txt", "less -Olog a.txt", "less --log-file=log a.txt",
+            "less --LOG-FILE log a.txt", "less --lesskey-c=x a.txt", "less '+!id' a.txt",
+            "less -N -k keys a.txt", "less -Nk keys a.txt",
+            "more '--lesskey-content=#env;LESSOPEN=|id %s' a.txt", "more -k keys a.txt",
+        ))
+        for cmd in ("less a.txt", "less -R a.txt", "less -N -S a.txt", "less -RS a.txt",
+                    "less +G a.txt", "less +10 a.txt", "less -x4 a.txt", "less --no-lessopen a.txt",
+                    "more a.txt", "more -10 a.txt", "more +5 a.txt", "more +/x a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_sed_and_awk_given_files_by_xargs_are_not_fast_allowed(self) -> None:
+        """xargs appends operands chosen at run time, such as .env, which no word names."""
+        self.assert_not_fast_allowed((
+            "ls -a | xargs sed -n 1p", "ls -a | xargs awk '{print}'",
+            "find . | xargs -n1 sed -n p", "printf '.env' | xargs -0 gawk 1",
+            "xargs -a list.txt sed -n p",
+        ))
+
+    def test_sed_and_awk_after_a_wrapper_or_assignment_are_not_fast_allowed(self) -> None:
+        """env -C moves to a directory the path checks never see; an assignment such as
+        LD_PRELOAD changes what runs."""
+        self.assert_not_fast_allowed((
+            "env -C /proc/self sed -n p environ", "env --chdir=/proc/self awk 1 environ",
+            "env -C ~/.ssh sed -n p id_ed25519", "env -C .git awk 1 config",
+            "LD_PRELOAD=./x.so sed -n 1p a.txt", "nice sed -n 1p a.txt",
+            "timeout 5 awk 1 a.txt", "stdbuf -o0 sed -n p a.txt", "command sed -n p a.txt",
+            "nohup awk 1 a.txt",
+        ))
+
+    def test_git_output_option_and_checksum_lists_are_not_fast_allowed(self) -> None:
+        """--output writes a file for every git subcommand; `sha256sum -c LIST` reads every
+        file LIST names."""
+        self.assert_not_fast_allowed((
+            "git diff-tree --output=out.txt HEAD", "git diff-index --output out.txt HEAD",
+            "git diff-files --output=out.txt", "git rev-list --output=out.txt HEAD",
+            "git shortlog --output=out.txt HEAD",
+            "sha256sum -c sums.txt", "md5sum --check sums.txt", "sha1sum -bc sums.txt",
+            "shasum --ch sums.txt",
+        ))
+        (self.work / "a.txt").write_text("a\n", encoding="utf-8")
+        res = self.evaluate("sha256sum a.txt", classifier_caller=unexpected_caller)
+        self.assertEqual(res, {"decision": "allow"})
+
+    def test_tree_rerunning_at_the_depth_limit_is_not_fast_allowed(self) -> None:
+        """-R writes 00Tree.html into every directory at the -L limit."""
+        self.assert_not_fast_allowed(("tree -R -H . -L 1 .", "tree -aR -L 1 .", "tree -LR 1 ."))
+
+    def test_tree_attached_output_takes_no_next_word(self) -> None:
+        self.assertEqual(tree_outputs(["-aoOUT", "x"]), ["OUT"])
+
+    def test_tree_attached_output_into_a_control_file_is_denied(self) -> None:
+        res = self.evaluate("tree -ao~/.gemini/config/hooks.json .", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_metadata_readers_of_git_config_stay_fast_allowed(self) -> None:
+        """ls and stat print no file content, so naming .git/config reads no remote URL."""
+        (self.work / ".git").mkdir(exist_ok=True)
+        (self.work / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        for cmd in ("ls -la .git/config", "ls -ld .git .git/config", "stat .git/config"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+        self.assert_not_fast_allowed(("cat .git/config", "head .git/config"))
+
+    def test_git_diff_no_index_of_two_regular_files_is_allowed(self) -> None:
+        (self.work / "a.txt").write_text("a\n", encoding="utf-8")
+        (self.work / "b.txt").write_text("b\n", encoding="utf-8")
+        res = self.evaluate("git diff --no-index a.txt b.txt", classifier_caller=unexpected_caller)
+        self.assertEqual(res, {"decision": "allow"})
+        (self.work / "d").mkdir()
+        res = self.evaluate("git diff --no-index a.txt d", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_awk_comparison_without_print_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("3\n", encoding="utf-8")
+        for cmd in ("awk '$1 > 2' a.txt", "awk 'NF>1 && $2>=0' a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+        self.assert_not_fast_allowed(("awk '{print > \"out\"}' a.txt",
+                                      "awk '$1 > 2 {print $1 > \"out\"}' a.txt",
+                                      "awk '{printf \"%s\", $1 > \"out\"}' a.txt"))
 
     def test_a_star_between_two_words_of_a_deny_or_ask_entry_matches_no_arguments_too(self) -> None:
         self.configure(shellCommandRules={"deny": ["mytool * --publish*"], "ask": ["mytool * --dry-run"]})

@@ -872,12 +872,24 @@ def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
                for pattern in secret_paths for name in names)
 
 
+CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
+                     "sha512sum", "shasum", "b2sum", "cksum"}
+
+
 def reads_a_file_list(words: list[str]) -> bool:
-    """True for sort, wc and du with `--files0-from` (or a prefix of it), which read
-    every file a list names."""
-    return (bool(words) and os.path.basename(words[0]) in ("sort", "wc", "du")
-            and any(word.startswith("--fi") and "--files0-from".startswith(word.partition("=")[0])
-                    for word in words[1:]))
+    """True for sort, wc and du with `--files0-from` (or a prefix of it), and for a
+    checksum program with -c or --check, which read every file a list names."""
+    if not words:
+        return False
+    program, args = os.path.basename(words[0]), words[1:]
+    if program in ("sort", "wc", "du"):
+        return any(word.startswith("--fi") and "--files0-from".startswith(word.partition("=")[0])
+                   for word in args)
+    if program in CHECKSUM_PROGRAMS:
+        return any(word.startswith("--c") and "--check".startswith(word)
+                   or word.startswith("-") and not word.startswith("--") and "c" in word
+                   for word in args)
+    return False
 
 
 ENV_PATHSPEC = re.compile(r"^:(?:[!^]|\((?P<magic>[^)]*)\))\*\.env\*$")
@@ -1399,8 +1411,6 @@ def reads_only_stdin_or_files(stage: Stage, search: Search, home: Path) -> bool:
     reads_stdin = stage.piped or any(word in ("<", "<<<", HEREDOC_MARKER) for word in stage.raw)
     if not search.explicit_starts:
         return search.program == "rg" and reads_stdin
-    if search.program == "git":
-        return False
     return all(start.is_file() for start in stage_paths(stage, home, search.starts))
 
 
@@ -1682,105 +1692,676 @@ def operand_words(words: list[str]) -> list[str]:
     return rest if index is None else rest[:index - 1] + rest[index:]
 
 
-# A sed command's optional address range and `!`, its `s/re/text/` body, and the
-# characters that end a command.
-SED_ADDRESS = r"(?:\d+(?:~\d+)?|\$|/(?:\\.|[^/\\])*/[IM]*)"
-SED_COMMAND_START = re.compile(
-    rf"[\s;]*(?:{SED_ADDRESS}(?:\s*,\s*(?:[+~]?\d+|{SED_ADDRESS}))?)?\s*!*\s*")
-SED_SUBSTITUTE = re.compile(r"s(.)((?:\\.|(?!\1).)*)\1((?:\\.|(?!\1).)*)\1")
-SED_SEPARATOR = re.compile(r"[;\n{}]")
+# How GNU sed reads a script, for sed_commands: the blanks and `;` between
+# commands, a line or step address (`3`, `$`, `1~2`), the `+N`/`~N` end of a range,
+# an `s` flag list, and the characters that may follow a command.
+SED_GAP = re.compile(r"[\s;]*")
+SED_BLANKS = re.compile(r"[ \t]*")
+SED_LINE_ADDRESS = re.compile(r"\d+(?:~\d+)?|\$")
+SED_RANGE_OFFSET = re.compile(r"[+~]?\d+")
+SED_FLAGS = re.compile(r"[0-9gpiImMe]*")
+SED_COMMAND_END = ";\n}#"
 
 
-def sed_script_targets(script: str) -> list[str]:
-    """The files a sed script writes: the rest of the line after a `w`/`W` command
-    or an `s///` command's `w` flag. Commands are read left to right, so a `w` in
-    a regex, a replacement or a file name is not taken for one."""
-    targets, i = [], 0
+def sed_bracket_end(script: str, i: int) -> int | None:
+    """The index after the bracket expression that opens at script[i] (`[`), read as
+    GNU sed reads it: a `]` right after `[` or `[^` is a member, `[:class:]`, `[=c=]`
+    and `[.c.]` are members, and a backslash is an ordinary member. None when no `]`
+    closes it."""
+    j = i + 1
+    if script.startswith("^", j):
+        j += 1
+    if script.startswith("]", j):
+        j += 1
+    while j < len(script):
+        if script[j] == "[" and script[j + 1:j + 2] in (":", "=", "."):
+            close = script.find(script[j + 1] + "]", j + 2)
+            if close < 0:
+                return None
+            j = close + 2
+        elif script[j] == "]":
+            return j + 1
+        else:
+            j += 1
+    return None
+
+
+def sed_delimited_end(script: str, i: int, delimiter: str, brackets: bool) -> int | None:
+    """The index of the delimiter that ends the regex (brackets=True) or replacement
+    text starting at script[i]: a backslash escapes the next character, and in a
+    regex a bracket expression may hold the delimiter. None when an unescaped newline
+    or the end of the script comes first."""
     while i < len(script):
-        i = SED_COMMAND_START.match(script, i).end()
+        character = script[i]
+        if character == "\\":
+            i += 2
+        elif character == delimiter:
+            return i
+        elif character == "\n":
+            return None
+        elif character == "[" and brackets:
+            end = sed_bracket_end(script, i)
+            if end is None:
+                return None
+            i = end
+        else:
+            i += 1
+    return None
+
+
+def sed_address_end(script: str, i: int) -> int | None:
+    """The index after the address at script[i] (`3`, `$`, `1~2`, `/re/`, `\\%re%`,
+    a regex followed by I or M), or i itself when none starts there. None when a
+    regex address is not closed."""
+    line = SED_LINE_ADDRESS.match(script, i)
+    if line:
+        return line.end()
+    if script.startswith("/", i):
+        delimiter, start = "/", i + 1
+    elif script.startswith("\\", i) and i + 1 < len(script) and script[i + 1] != "\n":
+        delimiter, start = script[i + 1], i + 2
+    else:
+        return i
+    end = sed_delimited_end(script, start, delimiter, brackets=True)
+    return None if end is None else re.compile(r"[IM]*").match(script, end + 1).end()
+
+
+def sed_line_end(script: str, i: int) -> int:
+    end = script.find("\n", i)
+    return len(script) if end < 0 else end
+
+
+def sed_commands(script: str) -> list[tuple[str, str]] | None:
+    """The commands of a sed script, read left to right as GNU sed reads them, each
+    as `(letter, argument)`: the file of r, R, w and W, the command of e, the flags
+    of s (an `s///w FILE` adds a `("w", FILE)`), the text of a, i and c, and "" for
+    the rest. None when the script does not parse, which GNU sed refuses to run."""
+    commands: list[tuple[str, str]] = []
+    i = 0
+    while True:
+        i = SED_GAP.match(script, i).end()
         if i >= len(script):
-            break
+            return commands
+        end = sed_address_end(script, i)
+        if end is None:
+            return None
+        if end > i:
+            i = SED_BLANKS.match(script, end).end()
+            if script.startswith(",", i):
+                i = SED_BLANKS.match(script, i + 1).end()
+                offset = SED_RANGE_OFFSET.match(script, i)
+                end = offset.end() if offset else sed_address_end(script, i)
+                if end is None or end == i:
+                    return None
+                i = end
+        i = re.compile(r"[\s!]*").match(script, i).end()
+        if i >= len(script):
+            return None
         command = script[i]
         if command in "{}":
+            commands.append((command, ""))
             i += 1
             continue
-        if command == "s":
-            match = SED_SUBSTITUTE.match(script, i)
-            if match:
-                i = match.end() + len(re.match(r"[0-9gpiImMe]*", script[match.end():]).group(0))
-                if i >= len(script) or script[i] not in "wW":
-                    continue
-                command = script[i]
-        if command in "wW":
-            end = script.find("\n", i)
-            end = len(script) if end < 0 else end
-            if script[i + 1:end].strip():
-                targets.append(script[i + 1:end].strip())
+        if command in "#rRwWe":   # a comment, a file name or a command: the rest of the line,
+            # past its leading blanks
+            end = sed_line_end(script, i)
+            commands.append((command, script[i + 1:end].lstrip(" \t")))
             i = end
             continue
-        separator = SED_SEPARATOR.search(script, i + 1)
-        i = separator.start() if separator else len(script)
-    return targets
+        if command in "aic":   # text up to a newline no odd run of backslashes escapes
+            end = sed_line_end(script, i)
+            while end < len(script) and (len(script[:end]) - len(script[:end].rstrip("\\"))) % 2:
+                end = sed_line_end(script, end + 1)
+            commands.append((command, script[i + 1:end]))
+            i = end
+            continue
+        if command in ":btT":   # a label ends at a blank or `;`, and a command may follow it
+            commands.append((command, ""))
+            i = re.compile(r"[ \t]*[^\s;]*").match(script, i + 1).end()
+            continue
+        if command in "sy":
+            delimiter = script[i + 1:i + 2]
+            if delimiter in ("", "\n", "\\"):
+                return None
+            middle = sed_delimited_end(script, i + 2, delimiter, brackets=command == "s")
+            last = None if middle is None else sed_delimited_end(script, middle + 1, delimiter,
+                                                                  brackets=False)
+            if last is None:
+                return None
+            i = last + 1
+            if command == "s":
+                flags_end = SED_FLAGS.match(script, i).end()
+                commands.append(("s", script[i:flags_end]))
+                i = flags_end
+                if script.startswith("w", i):
+                    end = sed_line_end(script, i)
+                    commands.append(("w", script[i + 1:end].lstrip(" \t")))
+                    i = end
+                    continue
+            else:
+                commands.append(("y", ""))
+        elif command in SED_PRINTING_COMMANDS:
+            commands.append((command, ""))
+            i += 1
+            if command in "lqQ":
+                i = re.compile(r"[ \t]*\d*").match(script, i).end()
+        elif command == "v":
+            commands.append((command, ""))
+            i = re.compile(r"[ \t]*[\d.]*").match(script, i + 1).end()
+        else:
+            return None
+        i = SED_BLANKS.match(script, i).end()
+        if i < len(script) and script[i] not in SED_COMMAND_END:
+            return None
+
+
+def sed_script_targets(script: str) -> list[str] | None:
+    """The files a sed script writes: the file of each `w`/`W` command and `s///w`
+    flag. None when the script does not parse as sed_commands reads it."""
+    commands = sed_commands(script)
+    return None if commands is None else [file for letter, file in commands
+                                          if letter in "wW" and file]
 
 
 def sed_targets(args: list[str]) -> list[str] | None:
     """The files sed writes besides standard output: the `w` targets of its
-    expressions (-e X, -eX, --expression=X, or the first operand when no -e is
-    given). None when it rewrites its input files (-i) or runs a script file the
-    hook cannot see (-f), so that every operand may be written. Short options are
-    read letter by letter: -ni and -nf count."""
-    expressions, operands, take_next = [], [], False
-    for arg in args:
-        if take_next:
-            expressions.append(arg)
-            take_next = False
-        elif arg.startswith(("--in-place", "--file")):
-            return None
-        elif arg.startswith("--expression"):
-            if "=" in arg:
-                expressions.append(arg.split("=", 1)[1])
-            else:
-                take_next = True
-        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
-            for j, letter in enumerate(arg[1:]):
-                if letter in "if":
-                    return None  # -i, -ni, -i.bak, -f, -nf
-                if letter == "e":
-                    attached = arg[j + 2:]
-                    if attached:
-                        expressions.append(attached)
-                    else:
-                        take_next = True
-                    break
-        elif not arg.startswith("-"):
-            operands.append(arg)
-    return [target for script in (expressions or operands[:1])
-            for target in sed_script_targets(script)]
+    scripts (sed_scripts). None when it rewrites its input files (-i), runs a
+    script file the hook cannot see (-f), has an option not in SED_OPTIONS or a
+    script that does not parse: then every operand may be written."""
+    parsed = read_options(args, SED_OPTIONS)
+    if parsed is None or any(name in SED_EDITS_FILES for name, _ in parsed[0]):
+        return None
+    targets = [sed_script_targets(script) for script in sed_scripts(args) or []]
+    if any(found is None for found in targets):
+        return None
+    return [target for found in targets for target in found or []]
 
 
 def sed_files(args: list[str]) -> list[str]:
     """sed's input files: its operands after the script, which is the first
-    operand unless -e, --expression, -f or --file gives it."""
-    positional, script_given, take_next = [], False, False
-    for arg in args:
-        if take_next:
-            take_next = False
-        elif arg.startswith(("--expression", "--file")):
-            script_given, take_next = True, "=" not in arg
-        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
-            for j, letter in enumerate(arg[1:]):
-                if letter == "i":
-                    break  # the rest is a backup suffix
-                if letter in "ef":
-                    script_given, take_next = True, not arg[j + 2:]
+    operand unless -e, --expression, -f or --file gives it. Every word that is no
+    option when an option is not in SED_OPTIONS."""
+    parsed = read_options(args, SED_OPTIONS)
+    if parsed is None:
+        return [arg for arg in args if not arg.startswith("-")]
+    options, operands = parsed
+    script_given = any(name in ("-e", "--expression", "-f", "--file") for name, _ in options)
+    return operands if script_given else operands[1:]
+
+
+# --- Reader programs: which of their options and script commands only read and print.
+# Each option check is a positive list: an option not on it makes the program a
+# possible writer or runner, which the classifier then judges. The awk and jq program
+# checks are the exception: they refuse the names and characters that run, write or
+# reach the environment (AWK_RUNS_OR_REACHES, JQ_REACHES).
+
+
+@dataclass(frozen=True)
+class OptionSpec:
+    """A program's options as getopt reads them. Short letters stand alone
+    (`short_flags`), take a value attached or in the next word (`short_valued`), or
+    take one only attached (`short_optional`, like sed's `-i[SUFFIX]`). Each long
+    name takes `long[name]` values, 0, 1 or 2, in the words after it or one after
+    `=`; a name in `long_optional` takes a value only after `=`."""
+    short_flags: str
+    short_valued: str
+    long: dict[str, int]
+    short_optional: str = ""
+    long_optional: frozenset[str] = frozenset()
+
+
+def long_option(word: str, names: Any) -> str | None:
+    """The long option `word` (`--name` or `--name=value`) names, as getopt_long
+    resolves it: the exact name, or the one name it is a prefix of. None when it is
+    unknown or ambiguous, which the program refuses."""
+    name = word.partition("=")[0]
+    if name in names:
+        return name
+    matches = [candidate for candidate in names if candidate.startswith(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def read_options(args: list[str], spec: OptionSpec
+                 ) -> tuple[list[tuple[str, str | None]], list[str]] | None:
+    """`(options, operands)` of a program's arguments: each option as `(name, value)`
+    (`-k`, `--key`; value None for a flag), read in any order before `--`, as GNU
+    getopt permutes them. None when a word is an option not in `spec`, or lacks its
+    value: the hook cannot tell what the program then does."""
+    options: list[tuple[str, str | None]] = []
+    operands: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            operands += args[i:]
+            break
+        if arg.startswith("--"):
+            name = long_option(arg, spec.long.keys() | spec.long_optional)
+            if name is None:
+                return None
+            if "=" in arg:
+                if spec.long.get(name, 1) != 1:
+                    return None
+                options.append((name, arg.partition("=")[2]))
+                continue
+            count = spec.long.get(name, 0)
+            if i + count > len(args):
+                return None
+            options.append((name, " ".join(args[i:i + count]) if count else None))
+            i += count
+        elif arg.startswith("-") and len(arg) > 1:
+            for position, letter in enumerate(arg[1:], start=2):
+                rest = arg[position:]
+                if letter in spec.short_optional:
+                    options.append(("-" + letter, rest or None))
                     break
-        elif not arg.startswith("-"):
-            positional.append(arg)
-    return positional if script_given else positional[1:]
+                if letter in spec.short_valued:
+                    if not rest:
+                        if i >= len(args):
+                            return None
+                        rest, i = args[i], i + 1
+                    options.append(("-" + letter, rest))
+                    break
+                if letter not in spec.short_flags:
+                    return None
+                options.append(("-" + letter, None))
+        else:
+            operands.append(arg)
+    return options, operands
 
 
-def sed_writes(args: list[str]) -> bool:
-    return sed_targets(args) != []
+# GNU sed's options; -i, --in-place, -f and --file are not read-only.
+SED_OPTIONS = OptionSpec(
+    short_flags="nErsuz", short_valued="efl", short_optional="i",
+    long={"--quiet": 0, "--silent": 0, "--debug": 0, "--expression": 1, "--file": 1,
+          "--follow-symlinks": 0, "--line-length": 1, "--null-data": 0, "--zero-terminated": 0,
+          "--posix": 0, "--regexp-extended": 0, "--sandbox": 0, "--separate": 0,
+          "--unbuffered": 0, "--binary": 0, "--help": 0, "--version": 0},
+    long_optional=frozenset({"--in-place"}))
+SED_EDITS_FILES = {"-i", "--in-place", "-f", "--file"}
+# sed commands that only print or edit the pattern and hold spaces; l, q and Q take
+# an optional number. Not here: e (runs a command), r and R (read a file), w and W
+# (write one).
+SED_PRINTING_COMMANDS = set("dDFgGhHlnNpPqQxz=")
+# Commands that print or edit too, and the flags of a read-only `s///`: no e (runs
+# the pattern space) and no w (writes).
+SED_EDITING_COMMANDS = set("{}#aic:btTyv")
+SED_PRINTING_FLAGS = set("0123456789gpiImM")
+
+
+def sed_script_reads_only(script: str) -> bool:
+    """True when every command of the sed script, as sed_commands reads it, only
+    prints or edits its input: one of SED_PRINTING_COMMANDS or SED_EDITING_COMMANDS,
+    or `s` with flags of SED_PRINTING_FLAGS."""
+    commands = sed_commands(script)
+    return commands is not None and all(
+        letter in SED_PRINTING_COMMANDS or letter in SED_EDITING_COMMANDS
+        or letter == "s" and set(argument) <= SED_PRINTING_FLAGS
+        for letter, argument in commands)
+
+
+def sed_scripts(args: list[str]) -> list[str] | None:
+    """sed's scripts: its -e and --expression values, or else its first operand.
+    None when an option is not in SED_OPTIONS or a script file (-f) gives it."""
+    parsed = read_options(args, SED_OPTIONS)
+    if parsed is None:
+        return None
+    options, operands = parsed
+    if any(name in ("-f", "--file") for name, _ in options):
+        return None
+    return [value or "" for name, value in options if name in ("-e", "--expression")] \
+        or operands[:1]
+
+
+def sed_read_files(args: list[str]) -> list[str]:
+    """The files sed's `r` and `R` commands read, which its operands do not name."""
+    return [file for script in sed_scripts(args) or []
+            for letter, file in sed_commands(script) or [] if letter in "rR" and file]
+
+
+def sed_reads_only(args: list[str]) -> bool:
+    """True when sed only prints: every option is in SED_OPTIONS but -i and -f,
+    and every command of its scripts (sed_scripts) passes sed_script_reads_only."""
+    parsed = read_options(args, SED_OPTIONS)
+    if parsed is None or any(name in SED_EDITS_FILES for name, _ in parsed[0]):
+        return False
+    scripts = sed_scripts(args)
+    return bool(scripts) and all(sed_script_reads_only(script) for script in scripts)
+
+
+# file's options. -C and --compile write X.mgc for each magic file X, -p and
+# --preserve-date reset the files' access times, and -f and --files-from read
+# every file a list names.
+FILE_OPTIONS = OptionSpec(
+    short_flags="vzZbcCikLlhnN0prsSd", short_valued="meFPf",
+    long={"--help": 0, "--version": 0, "--magic-file": 1, "--uncompress": 0,
+          "--uncompress-noreport": 0, "--brief": 0, "--checking-printout": 0, "--exclude": 1,
+          "--exclude-quiet": 1, "--files-from": 1, "--separator": 1, "--mime": 0, "--apple": 0,
+          "--extension": 0, "--mime-type": 0, "--mime-encoding": 0, "--keep-going": 0,
+          "--list": 0, "--dereference": 0, "--no-dereference": 0, "--no-buffer": 0,
+          "--no-pad": 0, "--print0": 0, "--preserve-date": 0, "--parameter": 1, "--raw": 0,
+          "--special-files": 0, "--compile": 0, "--debug": 0})
+FILE_WRITES_OR_LISTS = {"-C", "--compile", "-p", "--preserve-date", "-f", "--files-from"}
+
+
+def file_reads_only(args: list[str]) -> bool:
+    """True when every option of file is in FILE_OPTIONS and none is in FILE_WRITES_OR_LISTS."""
+    parsed = read_options(args, FILE_OPTIONS)
+    return parsed is not None and not any(name in FILE_WRITES_OR_LISTS for name, _ in parsed[0])
+
+
+# The options of POSIX awk and gawk's long spellings of them: a field separator and
+# variable assignments. Any other option (-f, -e, --source, -i, -l, -W, ...) may
+# load or run code the hook cannot see.
+AWK_OPTIONS = OptionSpec(short_flags="", short_valued="Fv",
+                         long={"--field-separator": 1, "--assign": 1})
+AWK_PROGRAMS = {"awk", "gawk", "mawk", "nawk"}
+# What an awk program uses to run a command, read a file or variable no word names,
+# or write: system, getline, the environment (ENVIRON, or SYMTAB that reaches it),
+# ARGV and ARGC (the files it reads next), @ (gawk's @load, @include and indirect
+# calls), and the redirect |.
+AWK_RUNS_OR_REACHES = re.compile(
+    r"\b(?:system|getline|ENVIRON|SYMTAB|FUNCTAB|ARGV|ARGC)\b|[@|]")
+# `>` writes a file only in a print or printf statement; elsewhere it compares.
+AWK_PRINTS = re.compile(r"\bprintf?\b")
+
+
+def awk_reads_only(args: list[str]) -> bool:
+    """True when awk's options are all in AWK_OPTIONS and its program (the first
+    operand) uses nothing of AWK_RUNS_OR_REACHES, nor `>` beside print or printf."""
+    parsed = read_options(args, AWK_OPTIONS)
+    if parsed is None or not parsed[1]:
+        return False
+    program = parsed[1][0]
+    return not (AWK_RUNS_OR_REACHES.search(program)
+                or ">" in program and AWK_PRINTS.search(program))
+
+
+# GNU sort's options. -o and --output write a file, -T and --temporary-directory
+# write files into a directory, --compress-program runs a program, and
+# --files0-from reads every file a list names.
+SORT_OPTIONS = OptionSpec(
+    short_flags="bcCdfghiMmnRrsuVz", short_valued="koStT",
+    long={"--ignore-leading-blanks": 0, "--dictionary-order": 0, "--ignore-case": 0,
+          "--general-numeric-sort": 0, "--ignore-nonprinting": 0, "--month-sort": 0,
+          "--human-numeric-sort": 0, "--numeric-sort": 0, "--random-sort": 0,
+          "--random-source": 1, "--reverse": 0, "--sort": 1, "--version-sort": 0,
+          "--batch-size": 1, "--compress-program": 1, "--debug": 0, "--files0-from": 1,
+          "--key": 1, "--merge": 0, "--output": 1, "--stable": 0, "--buffer-size": 1,
+          "--field-separator": 1, "--temporary-directory": 1, "--parallel": 1,
+          "--unique": 0, "--zero-terminated": 0, "--help": 0, "--version": 0},
+    long_optional=frozenset({"--check"}))
+SORT_WRITES_OR_RUNS = {"-o", "--output", "-T", "--temporary-directory", "--compress-program",
+                       "--files0-from"}
+
+
+def sort_outputs(args: list[str]) -> list[str] | None:
+    """The files sort's -o and --output name, also inside a cluster (`-ro FILE`).
+    None when an option is not in SORT_OPTIONS."""
+    parsed = read_options(args, SORT_OPTIONS)
+    if parsed is None:
+        return None
+    return [value for name, value in parsed[0] if name in ("-o", "--output") and value]
+
+
+def sort_reads_only(args: list[str]) -> bool:
+    """True when every option of sort is in SORT_OPTIONS and none is in SORT_WRITES_OR_RUNS."""
+    parsed = read_options(args, SORT_OPTIONS)
+    return parsed is not None and not any(name in SORT_WRITES_OR_RUNS for name, _ in parsed[0])
+
+
+# GNU uniq's options. Its second operand is the file it writes.
+UNIQ_OPTIONS = OptionSpec(
+    short_flags="cdDiuz", short_valued="fsw",
+    long={"--count": 0, "--repeated": 0, "--skip-fields": 1, "--ignore-case": 0,
+          "--skip-chars": 1, "--unique": 0, "--zero-terminated": 0, "--check-chars": 1,
+          "--help": 0, "--version": 0},
+    long_optional=frozenset({"--all-repeated", "--group"}))
+
+
+def uniq_outputs(args: list[str]) -> list[str] | None:
+    """The file uniq writes, its second operand. None when an option is not in UNIQ_OPTIONS."""
+    parsed = read_options(args, UNIQ_OPTIONS)
+    return None if parsed is None else parsed[1][1:2]
+
+
+# tree's short options that take the next unused word as their value; tree reads a
+# cluster letter by letter, so `-ao FILE` and `-Po PATTERN FILE` write FILE.
+TREE_VALUED = "LPIHTo"
+# What tree's -R writes into every directory at the -L depth limit.
+TREE_RERUN_OUTPUT = "00Tree.html"
+
+
+def tree_outputs(args: list[str]) -> list[str]:
+    """The files tree's -o letters name, each the next word no earlier letter took,
+    and TREE_RERUN_OUTPUT for -R. A value attached to `o` is the output instead, for
+    a tree that reads `-oFILE` as getopt does (tree 2.3.1 refuses it)."""
+    outputs, taken = [], set()
+    for index, arg in enumerate(args):
+        if index in taken or not arg.startswith("-") or arg.startswith("--"):
+            continue
+        following = index + 1
+        for position, letter in enumerate(arg[1:], start=2):
+            if letter == "o" and arg[position:]:
+                outputs.append(arg[position:])
+                break
+            if letter in TREE_VALUED:
+                while following in taken:
+                    following += 1
+                taken.add(following)
+                if letter == "o":
+                    outputs.append(args[following] if following < len(args) else "")
+                following += 1
+            elif letter == "R":
+                outputs.append(TREE_RERUN_OUTPUT)
+    return outputs
+
+
+# jq's options. -f and --from-file load the program from a file, and -L and
+# --library-path load modules, which the hook cannot see.
+JQ_OPTIONS = OptionSpec(
+    short_flags="nRscrjaSCMeVh", short_valued="L",
+    long={"--null-input": 0, "--raw-input": 0, "--slurp": 0, "--compact-output": 0,
+          "--raw-output": 0, "--raw-output0": 0, "--join-output": 0, "--ascii-output": 0,
+          "--sort-keys": 0, "--color-output": 0, "--monochrome-output": 0, "--tab": 0,
+          "--indent": 1, "--unbuffered": 0, "--stream": 0, "--stream-errors": 0, "--seq": 0,
+          "--from-file": 0, "--library-path": 1, "--arg": 2, "--argjson": 2,
+          "--slurpfile": 2, "--rawfile": 2, "--args": 0, "--jsonargs": 0,
+          "--exit-status": 0, "--version": 0, "--build-configuration": 0, "--help": 0})
+JQ_LOADS_CODE = {"-f", "--from-file", "-L", "--library-path"}
+# What a jq program reads the environment or other files with: `env`, `$ENV`, and
+# the module directives import and include. A key `.env` is no such use.
+JQ_REACHES = re.compile(r"\$ENV\b|(?<![.\w$])env\b|\b(?:import|include)\b")
+
+
+def jq_reads_only(args: list[str]) -> bool:
+    """True when jq's options are all in JQ_OPTIONS but those of JQ_LOADS_CODE, and
+    its program (the first operand) uses nothing of JQ_REACHES."""
+    parsed = read_options(args, JQ_OPTIONS)
+    if parsed is None or not parsed[1]:
+        return False
+    options, operands = parsed
+    return (not any(name in JQ_LOADS_CODE for name, _ in options)
+            and not JQ_REACHES.search(operands[0]))
+
+
+# procps ps options that take the next word as their value, in UNIX (-p), BSD (p)
+# and long (--pid) spelling.
+PS_VALUED = {"-C", "-G", "--Group", "-g", "--group", "-p", "p", "--pid", "--ppid", "-q", "q",
+             "--quick-pid", "-s", "--sid", "-t", "t", "--tty", "-u", "U", "--user", "-U",
+             "--User", "-D", "-O", "O", "-o", "o", "--format", "k", "--sort", "--cols",
+             "--columns", "--width", "--rows", "--lines", "--help"}
+
+
+def prints_environment(words: list[str]) -> bool:
+    """True for ps with the BSD `e` option (`ps e`, `ps auxe`, `ps -ef e`), which
+    prints each process's environment, API keys included. `-e` (every process) is
+    another option."""
+    if not words or os.path.basename(words[0]) != "ps":
+        return False
+    takes_value = False
+    for word in words[1:]:
+        if takes_value:
+            takes_value = False
+            continue
+        if not word.startswith("-") and re.fullmatch(r"[A-Za-z]+", word) and "e" in word:
+            return True
+        takes_value = word in PS_VALUED or (
+            not word.startswith("-") and word[-1:] in "pqtUOok" and word.isalpha())
+    return False
+
+
+# procps-ng ps does not read its words as getopt does. A word's first characters set
+# how it is read: `--name` is a long option (exact names only), `-xyz` UNIX letters,
+# a word that starts with a letter BSD letters, and one that starts with a digit
+# begins the list of pids that ends the command. A letter that takes a value ends
+# its word; the value is the rest of the word, or else the next word. After any
+# error, ps rereads every word as BSD letters, where `e` prints each process's
+# environment: `ps -efx` (x is no UNIX letter) and `ps -ueve` (no user `eve`) print it.
+PS_UNIX_FLAGS = set("AadefFHjlLMNTwycZ")
+PS_UNIX_VALUED = set("CGgoOpqstuU")
+PS_BSD_FLAGS = set("AaCcfgHhjlMmnrSsTuvwXxZ")  # BSD's letters but e (the environment)
+PS_BSD_VALUED = set("kOopqtU")
+# Letters whose value BSD letters read the same way, so a reread keeps it a value.
+PS_VALUED_IN_BOTH = set("oOpqtU")
+PS_LONG_FLAGS = {"cumulative", "deselect", "forest", "header", "headers", "heading",
+                 "headings", "no-header", "no-headers", "no-heading", "no-headings",
+                 "noheader", "noheaders", "noheading", "noheadings", "context", "signames"}
+PS_LONG_VALUED = {"Group", "User", "cols", "columns", "width", "date-format", "format",
+                  "group", "pid", "ppid", "quick-pid", "rows", "lines", "sid", "sort",
+                  "tty", "user"}
+# A ps command with `e` among its UNIX letters is fast-allowed only when every word
+# is one ps reads without error in both passes: these letters, values of this form,
+# pids. Its words then never get reread.
+PS_STRICT_UNIX_FLAGS = set("AadefFjlwy")
+PS_STRICT_VALUE = {
+    "o": re.compile(r"[a-z_]+(?:,[a-z_]+)*"), "O": re.compile(r"[a-z_]+(?:,[a-z_]+)*"),
+    "p": re.compile(r"\d+(?:,\d+)*"), "q": re.compile(r"\d+(?:,\d+)*"),
+    "format": re.compile(r"[a-z_]+(?:,[a-z_]+)*"), "pid": re.compile(r"\d+(?:,\d+)*"),
+    "ppid": re.compile(r"\d+(?:,\d+)*"), "sort": re.compile(r"[+-]?[a-z_]+(?:,[+-]?[a-z_]+)*"),
+}
+PS_STRICT_LONG_FLAGS = {"forest", "headers", "no-headers", "cumulative"}
+# Format names that hold the environment (procps-ng 4.0.4 prints nothing for them).
+PS_ENVIRONMENT_FORMATS = re.compile(r"(?:^|[,\s])(?:environ|env)(?:[=:,\s]|$)")
+PS_FORMAT_LETTERS = set("oO")
+PS_FORMAT_LONG = {"format"}
+
+
+def ps_reads_only(args: list[str]) -> bool:
+    """True when ps prints no environment however it reads its words: each word is
+    an option of the lists above or a pid, no BSD word has an `e`, no format names
+    the environment, and an `e` among UNIX letters (or in a value a reread would
+    take for letters) comes only with PS_STRICT words."""
+    strict, has_e = True, False
+    i = 0
+    while i < len(args):
+        word = args[i]
+        i += 1
+        if word.startswith("--"):
+            name, separator, value = word[2:].partition("=")
+            if name in PS_LONG_FLAGS and not separator:
+                strict &= name in PS_STRICT_LONG_FLAGS
+                continue
+            if name not in PS_LONG_VALUED:
+                return False
+            if not separator:
+                if i >= len(args):
+                    return False
+                value, i = args[i], i + 1
+            if name in PS_FORMAT_LONG and PS_ENVIRONMENT_FORMATS.search(value):
+                return False
+            strict &= bool(name in PS_STRICT_VALUE and PS_STRICT_VALUE[name].fullmatch(value))
+            continue
+        if re.fullmatch(r"\d+(?:,\d+)*", word):
+            return all(re.fullmatch(r"[-+]?\d+(?:,\d+)*", rest) for rest in args[i:]) and (
+                strict or not has_e)
+        unix = word.startswith("-")
+        letters = word[1:] if unix else word
+        if not letters or not letters[0].isalpha():
+            return False
+        flags, valued = (PS_UNIX_FLAGS, PS_UNIX_VALUED) if unix else (PS_BSD_FLAGS, PS_BSD_VALUED)
+        for position, letter in enumerate(letters):
+            if letter in valued:
+                value = letters[position + 1:]
+                glued = bool(value)
+                if not glued:
+                    if i >= len(args) or not args[i]:
+                        return False
+                    value, i = args[i], i + 1
+                if letter in PS_FORMAT_LETTERS and PS_ENVIRONMENT_FORMATS.search(value):
+                    return False
+                if unix:
+                    strict &= bool(letter in PS_STRICT_VALUE
+                                   and PS_STRICT_VALUE[letter].fullmatch(value))
+                    if letter not in PS_VALUED_IN_BOTH and (glued or value.startswith("-")):
+                        has_e |= "e" in value  # a reread takes it for letters
+                break
+            if not unix and letter.isdigit():  # pids glued to BSD letters: `p1` is `p 1`
+                if not re.fullmatch(r"\d+(?:,\d+)*", letters[position:]):
+                    return False
+                break
+            if letter not in flags:
+                return False
+            if unix:
+                strict &= letter in PS_STRICT_UNIX_FLAGS
+                has_e |= letter == "e"
+            else:
+                strict = False
+    return strict or not has_e
+
+
+# less and more options that only change how a file is shown. Others load a lesskey
+# file or text, which can set LESSOPEN to a command less runs (-k, --lesskey-src,
+# --lesskey-content), write a log (-o, -O, --log-file), or take a value the hook does
+# not check. Long names must be exact: less resolves a prefix among its own names.
+PAGER_FLAGS = set("aABcdeEfFgGiIJKLmMnNqQrRsSuUVwWX~")
+PAGER_NUMBER_LETTERS = set("bhjxyz#")  # each with digits attached: -x4, -j10
+PAGER_LONG_FLAGS = {
+    "search-skip-screen", "SEARCH-SKIP-SCREEN", "auto-buffers", "clear-screen", "dumb",
+    "quit-at-eof", "QUIT-AT-EOF", "force", "quit-if-one-screen", "hilite-search",
+    "HILITE-SEARCH", "ignore-case", "IGNORE-CASE", "status-column", "quit-on-intr",
+    "no-lessopen", "long-prompt", "LONG-PROMPT", "line-numbers", "LINE-NUMBERS", "quiet",
+    "QUIET", "silent", "SILENT", "raw-control-chars", "RAW-CONTROL-CHARS",
+    "squeeze-blank-lines", "chop-long-lines", "underline-special", "UNDERLINE-SPECIAL",
+    "version", "hilite-unread", "HILITE-UNREAD", "no-init", "tilde", "help", "mouse",
+    "no-keypad", "no-histdups", "incsearch", "use-color", "wordwrap", "status-line",
+    "redraw-on-quit", "file-size", "follow-name", "no-vbell",
+    # util-linux more
+    "logical", "no-pause", "print-over", "clean-print", "exit-on-eof", "squeeze", "plain",
+}
+PAGER_LONG_NUMBERS = {"buffers", "max-back-scroll", "jump-target", "tabs", "max-forw-scroll",
+                      "window", "shift", "lines", "line-num-width"}
+# Initial commands: a line number, the end (G) or follow (F), or more's `+/pattern`.
+PAGER_INITIAL_COMMAND = re.compile(r"\+(?:\d+|G|F|/[ -~]*)")
+
+
+def pager_reads_only(args: list[str]) -> bool:
+    """True when every option of less or more is in the lists above; after `--`
+    every word is a file."""
+    for index, word in enumerate(args):
+        if word == "--":
+            return True
+        if word.startswith("--"):
+            name, separator, value = word[2:].partition("=")
+            if not (name in PAGER_LONG_FLAGS and not separator
+                    or name in PAGER_LONG_NUMBERS and re.fullmatch(r"\d+(?:[.,]\d+)*", value)):
+                return False
+        elif word.startswith("+"):
+            if not PAGER_INITIAL_COMMAND.fullmatch(word):
+                return False
+        elif word.startswith("-") and len(word) > 1:
+            letters = word[1:]
+            if letters.isdigit():  # more -10: lines per screen
+                continue
+            for position, letter in enumerate(letters):
+                if letter in PAGER_NUMBER_LETTERS:
+                    if not re.fullmatch(r"\d+(?:[.,]\d+)*", letters[position + 1:]):
+                        return False
+                    break
+                if letter not in PAGER_FLAGS:
+                    return False
+    return True
 
 
 def program_writes(words: list[str]) -> bool:
@@ -1792,13 +2373,17 @@ def program_writes(words: list[str]) -> bool:
     if program not in READ_ONLY_PROGRAMS:
         return True
     if program == "sed":
-        return sed_writes(args)
+        return not sed_reads_only(args)
     if program == "sort":
-        return any(a == "--output" or a.startswith(("-o", "--output=")) for a in args)
+        return not sort_reads_only(args)
+    if program == "uniq":
+        return uniq_outputs(args) != []
+    if program == "file":
+        return not file_reads_only(args)
     if program == "find":
         return find_writes(args)
     if program == "tree":
-        return any(a.startswith("-o") for a in args)
+        return bool(tree_outputs(args))
     if program == "git":
         i = git_subcommand_index(args)
         subcommand = args[i] if i is not None else ""
@@ -1929,14 +2514,20 @@ def tar_created_archive(args: list[str]) -> list[str] | None:
 
 def written_operands(words: list[str]) -> list[str]:
     """The operands a writing stage writes, where the hook can tell them from what
-    it reads: a copy's destination, the -o file of sort and tree, sed's `w` files
-    (or its input files with -i or -f),
-    a creating archiver's archive. Every operand otherwise; redirects never."""
+    it reads: a copy's destination, the -o file of sort and tree, uniq's second
+    operand, sed's `w` files (or its input files with -i or -f), a creating
+    archiver's archive. Every operand otherwise; redirects never."""
     program, args = os.path.basename(words[0]), words[1:]
     if program in COPIERS:
         return copy_destination(program, args)
-    if program in ("sort", "tree"):
-        return option_values(args, "-o", "--output")
+    if program == "sort":
+        outputs = sort_outputs(args)
+        return operand_words(words) if outputs is None else outputs
+    if program == "uniq":
+        outputs = uniq_outputs(args)
+        return operand_words(words) if outputs is None else outputs
+    if program == "tree":
+        return tree_outputs(args)
     if program == "sed":
         targets = sed_targets(args)
         return sed_files(args) if targets is None else targets
@@ -2180,6 +2771,8 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
         # The names a search excludes (`--exclude=.env`) are patterns, not paths it reads.
         named = [word for position, word in enumerate(stage.words)
                  if searched is None or position not in searched.exclusion_words]
+        if stage.words and os.path.basename(stage.words[0]) == "sed":
+            named += sed_read_files(stage.words[1:])   # `r FILE` names FILE inside the script
         for path in stage_paths(stage, home, named):
             if secret_paths is not None and secret(path, secret_paths):
                 return f"{path} holds keys or credentials, which no tool may read or write"
