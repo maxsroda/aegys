@@ -400,6 +400,7 @@
     "*/.gemini/gemini-credentials.json",
     "*/.gemini/antigravity-cli/antigravity-oauth-token*",
     "*/.claude/.credentials.json",
-    "*/.codex/auth.json"
+    "*/.codex/auth.json",
+    "/proc/*/environ"
   ]
 }

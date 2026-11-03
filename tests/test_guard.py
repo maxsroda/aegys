@@ -1597,6 +1597,172 @@ class AegysTest(unittest.TestCase):
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
             self.assertIn("hostname-bin", res.get("reason", ""), (cmd, res))
 
+    def test_sed_that_runs_a_command_or_reads_another_file_is_not_fast_allowed(self) -> None:
+        """GNU sed's `e` command, the `s///e` flag and `r`/`R` run programs or read files."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        (self.work / ".env").write_text("K=env\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "sed '1e id' a.txt",
+            "sed -n '1e echo X' a.txt",
+            "sed 'e id' a.txt",
+            "sed -n 's/.*/id/e' a.txt",
+            "sed -n 's/x/y/e' a.txt",
+            "sed --expression='1e id' a.txt",
+            "sed --expr='1e id' a.txt",
+            "sed -ne '1e id' a.txt",
+            "sed -n '1r .env' a.txt",
+            "sed 'R .env' a.txt",
+            "sed -n '1r .git/config' a.txt",
+            "sed -n '/x/{r .env\n}' a.txt",
+            "sed '1!e id' a.txt",
+            "sed -n 'p;e id' a.txt",
+            "sed -f script.sed a.txt",
+            "sed -i 's/x/y/' a.txt",
+            "sed --in-place 's/x/y/' a.txt",
+        ))
+
+    def test_sed_with_only_printing_and_editing_commands_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        for cmd in (
+            "sed -n '1,5p' a.txt",
+            "sed 's/a/b/g' a.txt",
+            "sed -E 's/(x)/[\\1]/2;p' a.txt",
+            "sed '/x/d' a.txt",
+            "sed -n '$=' a.txt",
+            "sed 'y/ab/cd/' a.txt",
+            "sed '1i hello' a.txt",
+            "sed ':a;N;$!ba;s/\\n/ /g' a.txt",
+            "sed -n -e '1p' -e '$p' a.txt",
+            "sed -n '/start/,/end/{/end/!p}' a.txt",
+            "sed 's/e/E/I' a.txt",
+            "sed '5q' a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_awk_given_a_program_file_or_source_as_one_word_is_not_fast_allowed(self) -> None:
+        """`-fFILE` and `--source=CODE` run code just as `-f FILE` and `-e CODE` do."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        (self.work / "p.awk").write_text('BEGIN { system("id") }\n', encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "awk -fp.awk a.txt",
+            "gawk -fp.awk a.txt",
+            "awk --source='BEGIN{system(\"id\")}' a.txt",
+            "gawk --source='BEGIN{system(\"id\")}' a.txt",
+            "awk -W source='BEGIN{system(\"id\")}' a.txt",
+            "awk -e 'BEGIN{system(\"id\")}' a.txt",
+            "awk -f p.awk a.txt",
+            "gawk -lfilefuncs 'BEGIN{}'",
+            "gawk '@load \"filefuncs\"; BEGIN{}'",
+            "gawk 'BEGIN{f=\"system\"; @f(\"id\")}'",
+        ))
+
+    def test_awk_that_reads_the_environment_or_other_files_is_not_fast_allowed(self) -> None:
+        """ENVIRON holds the API keys; ARGV and SYMTAB reach files and variables no word names."""
+        self.assert_not_fast_allowed((
+            "awk 'BEGIN{print ENVIRON[\"ANTHROPIC_API_KEY\"]}'",
+            "gawk 'BEGIN{print SYMTAB[\"ENVIRON\"][\"HOME\"]}'",
+            "awk 'BEGIN{ARGV[1]=\".env\"; ARGC=2} {print}'",
+        ))
+
+    def test_awk_with_field_and_variable_options_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        for cmd in (
+            "awk '{print $1}' a.txt",
+            "awk -F: '{print $1}' a.txt",
+            "awk -F , -v n=2 'NR==n' a.txt",
+            "awk -- '{print NF}' a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_sort_that_writes_through_a_cluster_or_runs_a_compressor_is_not_fast_allowed(self) -> None:
+        """`-o` inside a short-option cluster still writes; `--compress-program` runs a program."""
+        (self.work / "a.txt").write_text("b\na\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "sort -ro out.txt a.txt",
+            "sort -uo out.txt a.txt",
+            "sort -roout.txt a.txt",
+            "sort -ro ~/.gemini/config/hooks.json a.txt",
+            "sort -S 1K --compress-program=./z.sh a.txt",
+            "sort --compress-program sh a.txt",
+            "sort --compress-prog=sh a.txt",
+            "sort --outp=out.txt a.txt",
+            "sort -T /tmp a.txt",
+            "sort -o out.txt a.txt",
+        ))
+
+    def test_sort_writing_a_control_file_through_a_cluster_is_denied(self) -> None:
+        res = self.evaluate("sort -ro ~/.gemini/config/hooks.json a.txt",
+                            classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_sort_with_ordering_options_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("b\na\n", encoding="utf-8")
+        for cmd in (
+            "sort a.txt",
+            "sort -rn a.txt",
+            "sort -k2,2 -t, a.txt",
+            "sort -t , -k 1 a.txt",
+            "sort -u -S1K a.txt",
+            "sort --reverse --numeric-sort a.txt",
+            "sort --key=2 --field-separator=: a.txt",
+            "sort -ko a.txt",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_uniq_and_tree_writing_an_output_file_are_not_fast_allowed(self) -> None:
+        """uniq writes its second operand; tree writes -o's file, also inside a cluster."""
+        (self.work / "a.txt").write_text("a\na\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "uniq a.txt out.txt",
+            "uniq -c a.txt out.txt",
+            "uniq -f 1 a.txt out.txt",
+            "tree -ao out.txt .",
+            "tree -o out.txt .",
+        ))
+        for cmd in ("uniq a.txt", "uniq -c -f 1 a.txt", "uniq --skip-chars 2 a.txt", "tree -a ."):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_jq_that_reads_the_environment_is_not_fast_allowed(self) -> None:
+        self.assert_not_fast_allowed((
+            "jq -n env",
+            "jq -n '$ENV.ANTHROPIC_API_KEY'",
+            "jq -n 'env | keys'",
+            "jq --indent 2 -n env",
+            "jq -f prog.jq a.json",
+            "jq -L . -n 'import \"m\" as m; m::f'",
+        ))
+        (self.work / "a.json").write_text('{"env": 1}\n', encoding="utf-8")
+        for cmd in ("jq .a.env a.json", "jq -r '.name' a.json", "jq --arg env x -n '$env'",
+                    "jq -c '.[] | select(.env)' a.json"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_environment_dumps_are_denied_like_env_and_printenv(self) -> None:
+        """`ps` with the environment flags and `/proc/*/environ` print the same secrets `env` does."""
+        for cmd in (
+            "ps axeww",
+            "ps auxe",
+            "ps -ef e",
+            "ps -p 1 eww",
+            "ps e",
+            "cat /proc/self/environ",
+            "cat /proc/1/environ",
+            "strings /proc/self/environ",
+            "tr '\\0' '\\n' < /proc/self/environ",
+            "env",
+            "printenv",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+        for cmd in ("ps aux", "ps -ef", "ps -p 1 -o pid,etime", "ps axo pid,etime", "ps -C sleep",
+                    "ps o etime"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
     def test_a_star_between_two_words_of_a_deny_or_ask_entry_matches_no_arguments_too(self) -> None:
         self.configure(shellCommandRules={"deny": ["mytool * --publish*"], "ask": ["mytool * --dry-run"]})
         for cmd in ("mytool --publish", "mytool site --publish now"):
