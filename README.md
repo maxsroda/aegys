@@ -25,18 +25,18 @@
 ## What it does
 
 - Runs commands on a shipped allow list (`git status`, `cat`, `ls`, …) without asking.
-- Blocks recursive deletes of critical paths, reads of credential files, environment dumps (`env`, `printenv`, `/proc/*/environ`, `ps` with the BSD `e` option), and writes to *agy*'s and git's control files and to *aegys* itself.
+- Blocks recursive deletes of critical paths, reads of credential files, environment dumps (`env`, `printenv`, `/proc/*/environ`), and writes to *agy*'s and git's control files and to *aegys* itself. A `ps` that may print environments is blocked or goes to the classifier; it never runs at once.
 - Blocks a search that walks a folder (`grep -r`, `rg`, `diff -r`) unless it excludes `.env`, `.env.*` and `.git` by name. `git diff --no-index` of two folders cannot exclude them, so it is always blocked.
 - Blocks URLs on a deny list and private or cloud-metadata addresses.
 - Asks you before `sudo`, `doas`, and commands on your own ask list.
 - Sends the rest to a classifier model of your choice, which allows or denies. When the agent retries a denied risky operation by another route without your authorization, *aegys* denies again and tells it to change course.
-- Allows file reads and writes inside your workspace, except config files such as `.git` (or a folder laid out like one) or `.bashrc`; checks the rest the same way as commands.
-- Lets `list_directory`, `find`, and `grep_search` of a single file search outside the workspace, and keeps them allowed with `/aegys off`. It denies them only for credential paths, and for `grep_search` and `find` a folder above one. `grep_search` of a folder cannot exclude `.env` or `.git`, so it goes to the classifier, or asks you with `/aegys off`.
+- Allows file reads and writes inside your workspace, except config files such as `.git` or `.bashrc`, and writes into a folder laid out like `.git`; checks the rest the same way as commands.
+- Lets `list_directory`, `find`, and `grep_search` of a single file search outside the workspace, and keeps them allowed with `/aegys off`. It denies them only for credential paths, and for `grep_search` and `find` a folder above one. For `grep_search` of a folder the guard cannot tell whether it excludes `.env` and `.git`, so it goes to the classifier, or asks you with `/aegys off`.
 - `/aegys off` hands decisions back to you for one conversation: hard blocks stay, and most commands ask first. `/aegys on` switches the guard back.
 - Reads your own allow/ask/deny lists and settings from `~/.gemini/aegys/config.json` on top of the shipped defaults.
 - Asks you instead of guessing when its config is broken or the classifier is unreachable.
 
-You choose the classifier model with `classifierModel` in `~/.gemini/aegys/config.json`, and give *aegys* its API key. The default model is Claude Haiku 5.5. The classifier always runs at low effort.
+You choose the classifier model with `classifierModel` in `~/.gemini/aegys/config.json`, and give *aegys* its API key. The default model is Claude Haiku 5.5. The classifier always runs at low effort; a configurable effort is tracked in [#13](https://github.com/maxsroda/aegys/issues/13).
 
 > **Note:** for now *aegys* speaks only Anthropic's API, so the model must be a Claude model or sit behind an Anthropic-compatible endpoint set with `anthropicBaseUrl` in the same file, and the key goes in `ANTHROPIC_API_KEY`. Support for other providers is tracked in [#13](https://github.com/maxsroda/aegys/issues/13).
 
