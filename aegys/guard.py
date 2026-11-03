@@ -129,6 +129,8 @@ from .command_checks import (
     gh_shows_token,
     reads_a_file_list,
     git_add_stages_broadly,
+    git_object_reads_secret,
+    rg_runs_a_program,
     git_add_forces,
     git_settings_match,
     host_denial_reason,
@@ -627,7 +629,7 @@ def stage_touches_protected_path(stage: Stage, home: Path) -> bool:
 
 
 def stage_matches_allow_patterns(
-    stage: Stage, allow_patterns: list[str], home: Path
+    stage: Stage, allow_patterns: list[str], home: Path, secret_paths: tuple[str, ...] = ()
 ) -> bool:
     """True when a single pipeline/chain stage is deterministically safe and
     covered by `allow_patterns` (or is a read-only `sed`/`awk` filter)."""
@@ -650,9 +652,16 @@ def stage_matches_allow_patterns(
     # then prints it: the classifier judges it.
     if git_add_forces(stage.words):
         return False
-    # A repository's .git/config holds its remote URLs, which may embed a credential:
-    # reading it takes a classifier check (writing it already does, as a protected path).
-    if any(path.parts[-2:] == (".git", "config") for path in stage_paths(stage, home)):
+    # A git settings file holds remote URLs, which may embed a credential: a repository's
+    # .git/config (also a submodule's, a worktree's, in any letter case, or a link to one)
+    # and ~/.gitconfig. Reading one takes a classifier check; writing one already does.
+    if any(git_settings_match(path, home) or path.name.lower() == "config.worktree"
+           and ".git" in (part.lower() for part in path.parts[:-1])
+           for path in stage_paths(stage, home)):
+        return False
+    # `git show HEAD:.env` and `git show :.npmrc` print a secret out of an object, by a
+    # name the path checks do not read as a path.
+    if git_object_reads_secret(stage.words, secret_paths):
         return False
     program = os.path.basename(stage.words[0])
     if program == "sed" and not sed_writes(stage.words[1:]):
@@ -697,7 +706,8 @@ def stage_matches_allow_patterns(
 
 
 def command_fast_allowed(
-    command: str, stages: list[Stage], allow_patterns: list[str], home: Path
+    command: str, stages: list[Stage], allow_patterns: list[str], home: Path,
+    secret_paths: tuple[str, ...] = (),
 ) -> bool:
     """True when the whole command (single command, pipeline, or chain) is
     deterministically allowed without calling the LLM classifier."""
@@ -706,7 +716,7 @@ def command_fast_allowed(
     if has_unquoted_expansion_or_glob(command):
         return False
     return all(
-        stage_matches_allow_patterns(stage, allow_patterns, home) for stage in stages
+        stage_matches_allow_patterns(stage, allow_patterns, home, secret_paths) for stage in stages
     )
 
 
@@ -2017,6 +2027,12 @@ def decide_pre_tool_use(
     if agy_ctrl_deny:
         return deny(f"Blocked by {GUARD_NAME}: {agy_ctrl_deny}.")
 
+    if any(rg_runs_a_program(st.words) for st in stages):
+        return deny(
+            f"Blocked by {GUARD_NAME}: rg --hostname-bin runs an arbitrary program; use rg "
+            "without --hostname-bin."
+        )
+
     if any(gh_shows_token(st.words) for st in stages):
         return deny(
             f"Blocked by {GUARD_NAME}: gh auth status -t / --show-token prints the GitHub "
@@ -2080,7 +2096,9 @@ def decide_pre_tool_use(
     # added only while the status line last reported this conversation's sandbox on.
     sandbox_on = read_state_file(home_path, conv_id).get("sandbox_on") is True
     overwrite = {"overwrite": {"BypassSandbox": True}} if sandbox_on and not bypass_sandbox else {}
-    if command_fast_allowed(command, stages, list(policy.shell_allow), home_path):
+    if command_fast_allowed(
+        command, stages, list(policy.shell_allow), home_path, policy.secret_paths
+    ):
         record_guard_decision(home_path, conv_id, allowed=True)
         return {"decision": "allow", **overwrite}
 
