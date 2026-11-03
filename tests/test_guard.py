@@ -1673,6 +1673,18 @@ class AegysTest(unittest.TestCase):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res.get("decision"), "deny", (cmd, res))
 
+    def test_sed_writing_a_control_file_through_an_abbreviated_long_option_is_denied(self) -> None:
+        """GNU sed reads `--expr` as `--expression` and `--in-pl` as `--in-place`."""
+        for cmd in (
+            "sed --expr='w ~/.gemini/config/hooks.json' a.txt",
+            "sed -n --expr 'w ~/.gemini/config/hooks.json' a.txt",
+            "sed -i --expr='s/a/b/' ~/.gemini/config/hooks.json",
+            "sed --in-pl 's/a/b/' ~/.gemini/config/hooks.json",
+            "sed --in-place=.bak --expr 's/a/b/' ~/.gemini/config/hooks.json",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
     def test_sed_reading_a_secret_with_r_or_R_is_denied_like_cat(self) -> None:
         (self.work / "a.txt").write_text("x\n", encoding="utf-8")
         (self.work / ".env").write_text("K=env\n", encoding="utf-8")

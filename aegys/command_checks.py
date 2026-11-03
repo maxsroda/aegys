@@ -1855,37 +1855,13 @@ def sed_script_targets(script: str) -> list[str] | None:
 
 def sed_targets(args: list[str]) -> list[str] | None:
     """The files sed writes besides standard output: the `w` targets of its
-    expressions (-e X, -eX, --expression=X, or the first operand when no -e is
-    given). None when it rewrites its input files (-i), runs a script file the
-    hook cannot see (-f) or has a script that does not parse, so that every
-    operand may be written. Short options are
-    read letter by letter: -ni and -nf count."""
-    expressions, operands, take_next = [], [], False
-    for arg in args:
-        if take_next:
-            expressions.append(arg)
-            take_next = False
-        elif arg.startswith(("--in-place", "--file")):
-            return None
-        elif arg.startswith("--expression"):
-            if "=" in arg:
-                expressions.append(arg.split("=", 1)[1])
-            else:
-                take_next = True
-        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
-            for j, letter in enumerate(arg[1:]):
-                if letter in "if":
-                    return None  # -i, -ni, -i.bak, -f, -nf
-                if letter == "e":
-                    attached = arg[j + 2:]
-                    if attached:
-                        expressions.append(attached)
-                    else:
-                        take_next = True
-                    break
-        elif not arg.startswith("-"):
-            operands.append(arg)
-    targets = [sed_script_targets(script) for script in (expressions or operands[:1])]
+    scripts (sed_scripts). None when it rewrites its input files (-i), runs a
+    script file the hook cannot see (-f), has an option not in SED_OPTIONS or a
+    script that does not parse: then every operand may be written."""
+    parsed = read_options(args, SED_OPTIONS)
+    if parsed is None or any(name in SED_EDITS_FILES for name, _ in parsed[0]):
+        return None
+    targets = [sed_script_targets(script) for script in sed_scripts(args) or []]
     if any(found is None for found in targets):
         return None
     return [target for found in targets for target in found or []]
@@ -1893,23 +1869,14 @@ def sed_targets(args: list[str]) -> list[str] | None:
 
 def sed_files(args: list[str]) -> list[str]:
     """sed's input files: its operands after the script, which is the first
-    operand unless -e, --expression, -f or --file gives it."""
-    positional, script_given, take_next = [], False, False
-    for arg in args:
-        if take_next:
-            take_next = False
-        elif arg.startswith(("--expression", "--file")):
-            script_given, take_next = True, "=" not in arg
-        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
-            for j, letter in enumerate(arg[1:]):
-                if letter == "i":
-                    break  # the rest is a backup suffix
-                if letter in "ef":
-                    script_given, take_next = True, not arg[j + 2:]
-                    break
-        elif not arg.startswith("-"):
-            positional.append(arg)
-    return positional if script_given else positional[1:]
+    operand unless -e, --expression, -f or --file gives it. Every word that is no
+    option when an option is not in SED_OPTIONS."""
+    parsed = read_options(args, SED_OPTIONS)
+    if parsed is None:
+        return [arg for arg in args if not arg.startswith("-")]
+    options, operands = parsed
+    script_given = any(name in ("-e", "--expression", "-f", "--file") for name, _ in options)
+    return operands if script_given else operands[1:]
 
 
 # --- Reader programs: which of their options and script commands only read and print.
