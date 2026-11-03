@@ -24,26 +24,27 @@
 
 ## What it does
 
-- Runs commands on a shipped allow list (`git status`, `cat`, `rg`, …) without asking.
-- Blocks recursive deletes of critical paths, reads of credential files, and writes to *agy*'s and git's control files and to *aegys* itself.
+- Runs commands on a shipped allow list (`git status`, `cat`, `ls`, …) without asking.
+- Blocks recursive deletes of critical paths, reads of credential files, environment dumps (`env`, `printenv`, `/proc/*/environ`, `ps e`), and writes to *agy*'s and git's control files and to *aegys* itself.
+- Blocks a recursive search (`grep -r`, `rg`, `diff -r`) unless it excludes `.env`, `.env.*` and `.git` by name. `git diff --no-index` of two folders cannot exclude them, so it is always blocked.
 - Blocks URLs on a deny list and private or cloud-metadata addresses.
 - Asks you before `sudo`, `doas`, and commands on your own ask list.
 - Sends the rest to a classifier model of your choice, which allows or denies. When the agent retries a denied risky operation by another route without your authorization, *aegys* denies again and tells it to change course.
-- Allows file reads and writes inside your workspace, except config files such as `.git` or `.bashrc`; checks the rest the same way as commands.
-- Lets `list_directory`, `grep_search` and `find` search outside the workspace, and keeps them allowed with `/aegys off`. It denies them only for credential paths, and for `grep_search` and `find` a folder above one; the classifier never sees them.
+- Allows file reads and writes inside your workspace, except config files such as `.git` (or a folder laid out like one) or `.bashrc`; checks the rest the same way as commands.
+- Lets `list_directory`, `find`, and `grep_search` of a single file search outside the workspace, and keeps them allowed with `/aegys off`. It denies them only for credential paths, and for `grep_search` and `find` a folder above one. `grep_search` of a folder cannot exclude `.env` or `.git`, so it goes to the classifier, or asks you with `/aegys off`.
 - `/aegys off` hands decisions back to you for one conversation: hard blocks stay, and most commands ask first. `/aegys on` switches the guard back.
 - Reads your own allow/ask/deny lists and settings from `~/.gemini/aegys/config.json` on top of the shipped defaults.
 - Asks you instead of guessing when its config is broken or the classifier is unreachable.
 
-You choose the classifier model and give *aegys* its API key. The default model is Claude Haiku 5.5 Low.
+You choose the classifier model with `classifierModel` in `~/.gemini/aegys/config.json`, and give *aegys* its API key. The default model is Claude Haiku 5.5. The classifier always runs at low effort.
 
-> **Note:** for now *aegys* speaks only Anthropic's API, so the model must be a Claude model or sit behind an Anthropic-compatible endpoint, and the key goes in `ANTHROPIC_API_KEY`. Support for other providers is tracked in [#13](https://github.com/maxsroda/aegys/issues/13).
+> **Note:** for now *aegys* speaks only Anthropic's API, so the model must be a Claude model or sit behind an Anthropic-compatible endpoint set with `anthropicBaseUrl` in the same file, and the key goes in `ANTHROPIC_API_KEY`. Support for other providers is tracked in [#13](https://github.com/maxsroda/aegys/issues/13).
 
 ## What the classifier sees
 
 On each call it judges, the classifier gets:
 
-- The action: the full text of a shell command; for a file tool, its name and arguments as JSON, cut to 8000 characters.
+- The action: the full text of a shell command; for a file or search tool, its name and arguments as JSON, cut to 8000 characters.
 - Your messages and the agent's tool calls with their arguments, from this conversation. Tool outputs and the agent's own prose are not sent.
 - The instruction files: `~/.gemini/config/AGENTS.md`, and `AGENTS.md`, `GEMINI.md` and `CLAUDE.md` from each workspace folder. Each is cut to 4000 characters.
 - The recent denials in this conversation, so it can spot a retry by another route.
