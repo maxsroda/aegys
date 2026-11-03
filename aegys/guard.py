@@ -1835,8 +1835,8 @@ def evaluate_file_access(
     # above, as a git settings file.)
     if tool_name in WRITE_TOOL_NAMES and root is not None:
         ancestor = root
-        for part in path.relative_to(root).parts[:-1]:
-            ancestor = ancestor / part
+        for part in (None, *path.relative_to(root).parts[:-1]):
+            ancestor = ancestor / part if part is not None else ancestor
             if is_git_directory(ancestor):
                 root = None
                 break
