@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import patch
 
 from aegys import config as config_module
+from aegys.command_checks import tree_outputs
 from aegys.guard import (
     CLASSIFIER_DECISION_TOOL_NAME,
     anthropic_messages_call,
@@ -1838,6 +1839,21 @@ class AegysTest(unittest.TestCase):
             "ps --info", "ps -ef --bogus",
         ))
 
+    def test_ps_env_letters_before_a_pid_list_are_not_fast_allowed(self) -> None:
+        """A pid list ends ps's words; the `e` letters before it still count."""
+        self.assert_not_fast_allowed(("ps -u -e 12345", "ps -auxe 12345", "ps -ueve 1"))
+
+    def test_ps_environment_format_with_a_width_is_not_fast_allowed(self) -> None:
+        self.assert_not_fast_allowed(("ps -o environ:50 -p 1", "ps -o pid,environ:50"))
+
+    def test_ps_selection_values_spelled_with_e_stay_fast_allowed(self) -> None:
+        """A value in the word after -u, -g, -s, -C or --user stays a value when ps rereads
+        the words as BSD letters (it then fails on the bare word), so it prints no
+        environment."""
+        for cmd in ("ps -u e", "ps -u eve", "ps -g e", "ps -s e", "ps -C eve", "ps --user eve"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
     def test_ps_in_unix_and_bsd_spellings_without_the_environment_stays_fast_allowed(self) -> None:
         for cmd in ("ps aux", "ps -ef", "ps -eF", "ps -elf", "ps -eo pid,args",
                     "ps -eo pid,etime", "ps -p 1 -o pid,etime", "ps -ef --forest", "ps -A",
@@ -1906,6 +1922,9 @@ class AegysTest(unittest.TestCase):
     def test_tree_rerunning_at_the_depth_limit_is_not_fast_allowed(self) -> None:
         """-R writes 00Tree.html into every directory at the -L limit."""
         self.assert_not_fast_allowed(("tree -R -H . -L 1 .", "tree -aR -L 1 .", "tree -LR 1 ."))
+
+    def test_tree_attached_output_takes_no_next_word(self) -> None:
+        self.assertEqual(tree_outputs(["-aoOUT", "x"]), ["OUT"])
 
     def test_tree_attached_output_into_a_control_file_is_denied(self) -> None:
         res = self.evaluate("tree -ao~/.gemini/config/hooks.json .", classifier_caller=unexpected_caller)

@@ -2135,22 +2135,23 @@ TREE_RERUN_OUTPUT = "00Tree.html"
 
 def tree_outputs(args: list[str]) -> list[str]:
     """The files tree's -o letters name, each the next word no earlier letter took,
-    and TREE_RERUN_OUTPUT for -R. The rest of a word after `o` counts too, for a
-    tree that reads `-oFILE` as getopt does (tree 2.3.1 refuses it)."""
+    and TREE_RERUN_OUTPUT for -R. A value attached to `o` is the output instead, for
+    a tree that reads `-oFILE` as getopt does (tree 2.3.1 refuses it)."""
     outputs, taken = [], set()
     for index, arg in enumerate(args):
         if index in taken or not arg.startswith("-") or arg.startswith("--"):
             continue
         following = index + 1
         for position, letter in enumerate(arg[1:], start=2):
+            if letter == "o" and arg[position:]:
+                outputs.append(arg[position:])
+                break
             if letter in TREE_VALUED:
                 while following in taken:
                     following += 1
                 taken.add(following)
                 if letter == "o":
                     outputs.append(args[following] if following < len(args) else "")
-                    if arg[position:]:
-                        outputs.append(arg[position:])
                 following += 1
             elif letter == "R":
                 outputs.append(TREE_RERUN_OUTPUT)
@@ -2242,7 +2243,7 @@ PS_STRICT_VALUE = {
 }
 PS_STRICT_LONG_FLAGS = {"forest", "headers", "no-headers", "cumulative"}
 # Format names that hold the environment (procps-ng 4.0.4 prints nothing for them).
-PS_ENVIRONMENT_FORMATS = re.compile(r"(?:^|[,\s])(?:environ|env)(?:[=,\s]|$)")
+PS_ENVIRONMENT_FORMATS = re.compile(r"(?:^|[,\s])(?:environ|env)(?:[=:,\s]|$)")
 PS_FORMAT_LETTERS = set("oO")
 PS_FORMAT_LONG = {"format"}
 
