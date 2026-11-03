@@ -872,12 +872,24 @@ def secret(path: Path, secret_paths: tuple[str, ...]) -> bool:
                for pattern in secret_paths for name in names)
 
 
+CHECKSUM_PROGRAMS = {"md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum",
+                     "sha512sum", "shasum", "b2sum", "cksum"}
+
+
 def reads_a_file_list(words: list[str]) -> bool:
-    """True for sort, wc and du with `--files0-from` (or a prefix of it), which read
-    every file a list names."""
-    return (bool(words) and os.path.basename(words[0]) in ("sort", "wc", "du")
-            and any(word.startswith("--fi") and "--files0-from".startswith(word.partition("=")[0])
-                    for word in words[1:]))
+    """True for sort, wc and du with `--files0-from` (or a prefix of it), and for a
+    checksum program with -c or --check, which read every file a list names."""
+    if not words:
+        return False
+    program, args = os.path.basename(words[0]), words[1:]
+    if program in ("sort", "wc", "du"):
+        return any(word.startswith("--fi") and "--files0-from".startswith(word.partition("=")[0])
+                   for word in args)
+    if program in CHECKSUM_PROGRAMS:
+        return any(word.startswith("--c") and "--check".startswith(word)
+                   or word.startswith("-") and not word.startswith("--") and "c" in word
+                   for word in args)
+    return False
 
 
 ENV_PATHSPEC = re.compile(r"^:(?:[!^]|\((?P<magic>[^)]*)\))\*\.env\*$")
@@ -1399,8 +1411,6 @@ def reads_only_stdin_or_files(stage: Stage, search: Search, home: Path) -> bool:
     reads_stdin = stage.piped or any(word in ("<", "<<<", HEREDOC_MARKER) for word in stage.raw)
     if not search.explicit_starts:
         return search.program == "rg" and reads_stdin
-    if search.program == "git":
-        return False
     return all(start.is_file() for start in stage_paths(stage, home, search.starts))
 
 
@@ -1880,8 +1890,10 @@ def sed_files(args: list[str]) -> list[str]:
 
 
 # --- Reader programs: which of their options and script commands only read and print.
-# Each check is a positive list: an option or command not on it makes the program a
-# possible writer or runner, which the classifier then judges.
+# Each option check is a positive list: an option not on it makes the program a
+# possible writer or runner, which the classifier then judges. The awk and jq program
+# checks are the exception: they refuse the names and characters that run, write or
+# reach the environment (AWK_RUNS_OR_REACHES, JQ_REACHES).
 
 
 @dataclass(frozen=True)
@@ -2029,7 +2041,7 @@ FILE_OPTIONS = OptionSpec(
           "--extension": 0, "--mime-type": 0, "--mime-encoding": 0, "--keep-going": 0,
           "--list": 0, "--dereference": 0, "--no-dereference": 0, "--no-buffer": 0,
           "--no-pad": 0, "--print0": 0, "--preserve-date": 0, "--parameter": 1, "--raw": 0,
-          "--special-files": 0, "--no-sandbox": 0, "--compile": 0, "--debug": 0})
+          "--special-files": 0, "--compile": 0, "--debug": 0})
 FILE_WRITES_OR_LISTS = {"-C", "--compile", "-p", "--preserve-date", "-f", "--files-from"}
 
 
@@ -2048,18 +2060,22 @@ AWK_PROGRAMS = {"awk", "gawk", "mawk", "nawk"}
 # What an awk program uses to run a command, read a file or variable no word names,
 # or write: system, getline, the environment (ENVIRON, or SYMTAB that reaches it),
 # ARGV and ARGC (the files it reads next), @ (gawk's @load, @include and indirect
-# calls), and the redirects > and |.
+# calls), and the redirect |.
 AWK_RUNS_OR_REACHES = re.compile(
-    r"\b(?:system|getline|ENVIRON|SYMTAB|FUNCTAB|ARGV|ARGC)\b|[@>|]")
+    r"\b(?:system|getline|ENVIRON|SYMTAB|FUNCTAB|ARGV|ARGC)\b|[@|]")
+# `>` writes a file only in a print or printf statement; elsewhere it compares.
+AWK_PRINTS = re.compile(r"\bprintf?\b")
 
 
 def awk_reads_only(args: list[str]) -> bool:
     """True when awk's options are all in AWK_OPTIONS and its program (the first
-    operand) uses nothing of AWK_RUNS_OR_REACHES."""
+    operand) uses nothing of AWK_RUNS_OR_REACHES, nor `>` beside print or printf."""
     parsed = read_options(args, AWK_OPTIONS)
     if parsed is None or not parsed[1]:
         return False
-    return not AWK_RUNS_OR_REACHES.search(parsed[1][0])
+    program = parsed[1][0]
+    return not (AWK_RUNS_OR_REACHES.search(program)
+                or ">" in program and AWK_PRINTS.search(program))
 
 
 # GNU sort's options. -o and --output write a file, -T and --temporary-directory
@@ -2113,23 +2129,31 @@ def uniq_outputs(args: list[str]) -> list[str] | None:
 # tree's short options that take the next unused word as their value; tree reads a
 # cluster letter by letter, so `-ao FILE` and `-Po PATTERN FILE` write FILE.
 TREE_VALUED = "LPIHTo"
+# What tree's -R writes into every directory at the -L depth limit.
+TREE_RERUN_OUTPUT = "00Tree.html"
 
 
 def tree_outputs(args: list[str]) -> list[str]:
-    """The files tree's -o letters name, each the next word no earlier letter took."""
+    """The files tree's -o letters name, each the next word no earlier letter took,
+    and TREE_RERUN_OUTPUT for -R. The rest of a word after `o` counts too, for a
+    tree that reads `-oFILE` as getopt does (tree 2.3.1 refuses it)."""
     outputs, taken = [], set()
     for index, arg in enumerate(args):
         if index in taken or not arg.startswith("-") or arg.startswith("--"):
             continue
         following = index + 1
-        for letter in arg[1:]:
+        for position, letter in enumerate(arg[1:], start=2):
             if letter in TREE_VALUED:
                 while following in taken:
                     following += 1
                 taken.add(following)
                 if letter == "o":
                     outputs.append(args[following] if following < len(args) else "")
+                    if arg[position:]:
+                        outputs.append(arg[position:])
                 following += 1
+            elif letter == "R":
+                outputs.append(TREE_RERUN_OUTPUT)
     return outputs
 
 
@@ -2186,6 +2210,157 @@ def prints_environment(words: list[str]) -> bool:
             not word.startswith("-") and word[-1:] in "pqtUOok" and word.isalpha())
     return False
 
+
+# procps-ng ps does not read its words as getopt does. A word's first characters set
+# how it is read: `--name` is a long option (exact names only), `-xyz` UNIX letters,
+# a word that starts with a letter BSD letters, and one that starts with a digit
+# begins the list of pids that ends the command. A letter that takes a value ends
+# its word; the value is the rest of the word, or else the next word. After any
+# error, ps rereads every word as BSD letters, where `e` prints each process's
+# environment: `ps -efx` (x is no UNIX letter) and `ps -ueve` (no user `eve`) print it.
+PS_UNIX_FLAGS = set("AadefFHjlLMNTwycZ")
+PS_UNIX_VALUED = set("CGgoOpqstuU")
+PS_BSD_FLAGS = set("AaCcfgHhjlMmnrSsTuvwXxZ")  # BSD's letters but e (the environment)
+PS_BSD_VALUED = set("kOopqtU")
+# Letters whose value BSD letters read the same way, so a reread keeps it a value.
+PS_VALUED_IN_BOTH = set("oOpqtU")
+PS_LONG_FLAGS = {"cumulative", "deselect", "forest", "header", "headers", "heading",
+                 "headings", "no-header", "no-headers", "no-heading", "no-headings",
+                 "noheader", "noheaders", "noheading", "noheadings", "context", "signames"}
+PS_LONG_VALUED = {"Group", "User", "cols", "columns", "width", "date-format", "format",
+                  "group", "pid", "ppid", "quick-pid", "rows", "lines", "sid", "sort",
+                  "tty", "user"}
+# A ps command with `e` among its UNIX letters is fast-allowed only when every word
+# is one ps reads without error in both passes: these letters, values of this form,
+# pids. Its words then never get reread.
+PS_STRICT_UNIX_FLAGS = set("AadefFjlwy")
+PS_STRICT_VALUE = {
+    "o": re.compile(r"[a-z_]+(?:,[a-z_]+)*"), "O": re.compile(r"[a-z_]+(?:,[a-z_]+)*"),
+    "p": re.compile(r"\d+(?:,\d+)*"), "q": re.compile(r"\d+(?:,\d+)*"),
+    "format": re.compile(r"[a-z_]+(?:,[a-z_]+)*"), "pid": re.compile(r"\d+(?:,\d+)*"),
+    "ppid": re.compile(r"\d+(?:,\d+)*"), "sort": re.compile(r"[+-]?[a-z_]+(?:,[+-]?[a-z_]+)*"),
+}
+PS_STRICT_LONG_FLAGS = {"forest", "headers", "no-headers", "cumulative"}
+# Format names that hold the environment (procps-ng 4.0.4 prints nothing for them).
+PS_ENVIRONMENT_FORMATS = re.compile(r"(?:^|[,\s])(?:environ|env)(?:[=,\s]|$)")
+PS_FORMAT_LETTERS = set("oO")
+PS_FORMAT_LONG = {"format"}
+
+
+def ps_reads_only(args: list[str]) -> bool:
+    """True when ps prints no environment however it reads its words: each word is
+    an option of the lists above or a pid, no BSD word has an `e`, no format names
+    the environment, and an `e` among UNIX letters (or in a value a reread would
+    take for letters) comes only with PS_STRICT words."""
+    strict, has_e = True, False
+    i = 0
+    while i < len(args):
+        word = args[i]
+        i += 1
+        if word.startswith("--"):
+            name, separator, value = word[2:].partition("=")
+            if name in PS_LONG_FLAGS and not separator:
+                strict &= name in PS_STRICT_LONG_FLAGS
+                continue
+            if name not in PS_LONG_VALUED:
+                return False
+            if not separator:
+                if i >= len(args):
+                    return False
+                value, i = args[i], i + 1
+            if name in PS_FORMAT_LONG and PS_ENVIRONMENT_FORMATS.search(value):
+                return False
+            strict &= bool(name in PS_STRICT_VALUE and PS_STRICT_VALUE[name].fullmatch(value))
+            continue
+        if re.fullmatch(r"\d+(?:,\d+)*", word):
+            return all(re.fullmatch(r"[-+]?\d+(?:,\d+)*", rest) for rest in args[i:]) and (
+                strict or not has_e)
+        unix = word.startswith("-")
+        letters = word[1:] if unix else word
+        if not letters or not letters[0].isalpha():
+            return False
+        flags, valued = (PS_UNIX_FLAGS, PS_UNIX_VALUED) if unix else (PS_BSD_FLAGS, PS_BSD_VALUED)
+        for position, letter in enumerate(letters):
+            if letter in valued:
+                value = letters[position + 1:]
+                glued = bool(value)
+                if not glued:
+                    if i >= len(args) or not args[i]:
+                        return False
+                    value, i = args[i], i + 1
+                if letter in PS_FORMAT_LETTERS and PS_ENVIRONMENT_FORMATS.search(value):
+                    return False
+                if unix:
+                    strict &= bool(letter in PS_STRICT_VALUE
+                                   and PS_STRICT_VALUE[letter].fullmatch(value))
+                    if letter not in PS_VALUED_IN_BOTH and (glued or value.startswith("-")):
+                        has_e |= "e" in value  # a reread takes it for letters
+                break
+            if not unix and letter.isdigit():  # pids glued to BSD letters: `p1` is `p 1`
+                if not re.fullmatch(r"\d+(?:,\d+)*", letters[position:]):
+                    return False
+                break
+            if letter not in flags:
+                return False
+            if unix:
+                strict &= letter in PS_STRICT_UNIX_FLAGS
+                has_e |= letter == "e"
+            else:
+                strict = False
+    return strict or not has_e
+
+
+# less and more options that only change how a file is shown. Others load a lesskey
+# file or text, which can set LESSOPEN to a command less runs (-k, --lesskey-src,
+# --lesskey-content), write a log (-o, -O, --log-file), or take a value the hook does
+# not check. Long names must be exact: less resolves a prefix among its own names.
+PAGER_FLAGS = set("aABcdeEfFgGiIJKLmMnNqQrRsSuUVwWX~")
+PAGER_NUMBER_LETTERS = set("bhjxyz#")  # each with digits attached: -x4, -j10
+PAGER_LONG_FLAGS = {
+    "search-skip-screen", "SEARCH-SKIP-SCREEN", "auto-buffers", "clear-screen", "dumb",
+    "quit-at-eof", "QUIT-AT-EOF", "force", "quit-if-one-screen", "hilite-search",
+    "HILITE-SEARCH", "ignore-case", "IGNORE-CASE", "status-column", "quit-on-intr",
+    "no-lessopen", "long-prompt", "LONG-PROMPT", "line-numbers", "LINE-NUMBERS", "quiet",
+    "QUIET", "silent", "SILENT", "raw-control-chars", "RAW-CONTROL-CHARS",
+    "squeeze-blank-lines", "chop-long-lines", "underline-special", "UNDERLINE-SPECIAL",
+    "version", "hilite-unread", "HILITE-UNREAD", "no-init", "tilde", "help", "mouse",
+    "no-keypad", "no-histdups", "incsearch", "use-color", "wordwrap", "status-line",
+    "redraw-on-quit", "file-size", "follow-name", "no-vbell",
+    # util-linux more
+    "logical", "no-pause", "print-over", "clean-print", "exit-on-eof", "squeeze", "plain",
+}
+PAGER_LONG_NUMBERS = {"buffers", "max-back-scroll", "jump-target", "tabs", "max-forw-scroll",
+                      "window", "shift", "lines", "line-num-width"}
+# Initial commands: a line number, the end (G) or follow (F), or more's `+/pattern`.
+PAGER_INITIAL_COMMAND = re.compile(r"\+(?:\d+|G|F|/[ -~]*)")
+
+
+def pager_reads_only(args: list[str]) -> bool:
+    """True when every option of less or more is in the lists above; after `--`
+    every word is a file."""
+    for index, word in enumerate(args):
+        if word == "--":
+            return True
+        if word.startswith("--"):
+            name, separator, value = word[2:].partition("=")
+            if not (name in PAGER_LONG_FLAGS and not separator
+                    or name in PAGER_LONG_NUMBERS and re.fullmatch(r"\d+(?:[.,]\d+)*", value)):
+                return False
+        elif word.startswith("+"):
+            if not PAGER_INITIAL_COMMAND.fullmatch(word):
+                return False
+        elif word.startswith("-") and len(word) > 1:
+            letters = word[1:]
+            if letters.isdigit():  # more -10: lines per screen
+                continue
+            for position, letter in enumerate(letters):
+                if letter in PAGER_NUMBER_LETTERS:
+                    if not re.fullmatch(r"\d+(?:[.,]\d+)*", letters[position + 1:]):
+                        return False
+                    break
+                if letter not in PAGER_FLAGS:
+                    return False
+    return True
 
 
 def program_writes(words: list[str]) -> bool:

@@ -144,7 +144,9 @@ from .command_checks import (
     matches_bash_deny_pattern,
     matches_wildcard_pattern,
     program_writes,
+    pager_reads_only,
     prints_environment,
+    ps_reads_only,
     redirect_targets,
     resolve_word,
     secret,
@@ -608,6 +610,10 @@ def stage_touches_protected_path(stage: Stage, home: Path) -> bool:
     return False
 
 
+# Readers that print a file's name, size, times and mode, never its content.
+METADATA_READERS = {"ls", "stat"}
+
+
 def stage_matches_allow_patterns(
     stage: Stage, allow_patterns: list[str], home: Path, secret_paths: tuple[str, ...] = ()
 ) -> bool:
@@ -632,27 +638,41 @@ def stage_matches_allow_patterns(
     # then prints it: the classifier judges it.
     if git_add_forces(stage.words):
         return False
+    program, args = os.path.basename(stage.words[0]), stage.words[1:]
     # A git settings file holds remote URLs, which may embed a credential: a repository's
     # .git/config (also a submodule's, a worktree's, in any letter case, or a link to one)
     # and ~/.gitconfig. Reading one takes a classifier check; writing one already does.
-    if any(git_settings_match(path, home) or path.name.lower() == "config.worktree"
-           and ".git" in (part.lower() for part in path.parts[:-1])
-           for path in stage_paths(stage, home)):
+    # ls and stat print only a file's metadata.
+    if program not in METADATA_READERS and any(
+            git_settings_match(path, home) or path.name.lower() == "config.worktree"
+            and ".git" in (part.lower() for part in path.parts[:-1])
+            for path in stage_paths(stage, home)):
         return False
     # `git show HEAD:.env` and `git show :.npmrc` print a secret out of an object, by a
     # name the path checks do not read as a path.
     if git_object_reads_secret(stage.words, secret_paths):
         return False
-    program, args = os.path.basename(stage.words[0]), stage.words[1:]
-    if program == "sed" and sed_reads_only(args):
+    # sed and awk are judged by their words alone, so only when nothing comes before
+    # them: xargs appends operands chosen at run time (`ls -a | xargs sed -n 1p` prints
+    # .env), `env -C DIR` moves to a directory the paths are not checked against, and
+    # an assignment (LD_PRELOAD=...) changes what runs.
+    bare = stage.raw[:1] == stage.words[:1]
+    if program == "sed" and sed_reads_only(args) and bare:
         return True
-    if program in AWK_PROGRAMS and awk_reads_only(args):
+    if program in AWK_PROGRAMS and awk_reads_only(args) and bare:
         return True
     # A reader whose options or operands make it write (sort -ro FILE, uniq IN OUT)
     # takes a classifier check; git's subcommands are judged by the allow list.
     if program in READ_ONLY_PROGRAMS and program != "git" and program_writes(stage.words):
         return False
     if program == "jq" and not jq_reads_only(args):
+        return False
+    # Every git subcommand with --output writes that file (git diff-tree --output=F).
+    if program == "git" and any(arg.startswith("--output") for arg in args):
+        return False
+    if program == "ps" and not ps_reads_only(args):
+        return False
+    if program in ("less", "more") and not pager_reads_only(args):
         return False
     candidate_with_redir = (
         f"{base_cmd} {redirects[0]}" if redirects else base_cmd

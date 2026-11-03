@@ -1828,6 +1828,116 @@ class AegysTest(unittest.TestCase):
             res = self.evaluate(cmd, classifier_caller=unexpected_caller)
             self.assertEqual(res, {"decision": "allow"}, cmd)
 
+    def test_ps_env_flag_in_every_procps_spelling_is_not_fast_allowed(self) -> None:
+        """BSD `e` glued to a pid, and dash clusters procps rereads as BSD letters after
+        any parse error, print that process's (or every process's) environment."""
+        self.assert_not_fast_allowed((
+            "ps ae12345", "ps ex12345", "ps e12345,1", "ps ewww1", "ps ae1",
+            "ps -efx", "ps -auxe", "ps -xe", "ps -axe", "ps -ue", "ps -ve",
+            "ps -eo pid,args -x", "ps -ueve", "ps -u -e", "ps -eo environ",
+            "ps --info", "ps -ef --bogus",
+        ))
+
+    def test_ps_in_unix_and_bsd_spellings_without_the_environment_stays_fast_allowed(self) -> None:
+        for cmd in ("ps aux", "ps -ef", "ps -eF", "ps -elf", "ps -eo pid,args",
+                    "ps -eo pid,etime", "ps -p 1 -o pid,etime", "ps -ef --forest", "ps -A",
+                    "ps axo pid,etime", "ps -C sleep", "ps o etime", "ps -u root",
+                    "ps --pid 1 -o pid,ppid,etime,args", "ps -eo pid,comm --sort=-etime",
+                    "ps -p 1,2", "ps -fp 1", "ps -o pid= -p 1", "ps 1"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_pstree_is_fast_allowed(self) -> None:
+        for cmd in ("pstree -p 1", "pstree -ap 1", "pstree"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_less_and_more_options_that_run_or_write_are_not_fast_allowed(self) -> None:
+        """A lesskey file or text can set LESSOPEN, which less runs; -o/-O write a log;
+        a `+` initial command can run `!CMD`."""
+        (self.work / "a.txt").write_text("x\n", encoding="utf-8")
+        self.assert_not_fast_allowed((
+            "less '--lesskey-content=#env;LESSOPEN=|touch pwned %s' a.txt",
+            "less --lesskey-src=keys a.txt", "less -k keys a.txt", "less -kkeys a.txt",
+            "less -o log a.txt", "less -Olog a.txt", "less --log-file=log a.txt",
+            "less --LOG-FILE log a.txt", "less --lesskey-c=x a.txt", "less '+!id' a.txt",
+            "less -N -k keys a.txt", "less -Nk keys a.txt",
+            "more '--lesskey-content=#env;LESSOPEN=|id %s' a.txt", "more -k keys a.txt",
+        ))
+        for cmd in ("less a.txt", "less -R a.txt", "less -N -S a.txt", "less -RS a.txt",
+                    "less +G a.txt", "less +10 a.txt", "less -x4 a.txt", "less --no-lessopen a.txt",
+                    "more a.txt", "more -10 a.txt", "more +5 a.txt", "more +/x a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+
+    def test_sed_and_awk_given_files_by_xargs_are_not_fast_allowed(self) -> None:
+        """xargs appends operands chosen at run time, such as .env, which no word names."""
+        self.assert_not_fast_allowed((
+            "ls -a | xargs sed -n 1p", "ls -a | xargs awk '{print}'",
+            "find . | xargs -n1 sed -n p", "printf '.env' | xargs -0 gawk 1",
+            "xargs -a list.txt sed -n p",
+        ))
+
+    def test_sed_and_awk_after_a_wrapper_or_assignment_are_not_fast_allowed(self) -> None:
+        """env -C moves to a directory the path checks never see; an assignment such as
+        LD_PRELOAD changes what runs."""
+        self.assert_not_fast_allowed((
+            "env -C /proc/self sed -n p environ", "env --chdir=/proc/self awk 1 environ",
+            "env -C ~/.ssh sed -n p id_ed25519", "env -C .git awk 1 config",
+            "LD_PRELOAD=./x.so sed -n 1p a.txt", "nice sed -n 1p a.txt",
+            "timeout 5 awk 1 a.txt", "stdbuf -o0 sed -n p a.txt", "command sed -n p a.txt",
+            "nohup awk 1 a.txt",
+        ))
+
+    def test_git_output_option_and_checksum_lists_are_not_fast_allowed(self) -> None:
+        """--output writes a file for every git subcommand; `sha256sum -c LIST` reads every
+        file LIST names."""
+        self.assert_not_fast_allowed((
+            "git diff-tree --output=out.txt HEAD", "git diff-index --output out.txt HEAD",
+            "git diff-files --output=out.txt", "git rev-list --output=out.txt HEAD",
+            "git shortlog --output=out.txt HEAD",
+            "sha256sum -c sums.txt", "md5sum --check sums.txt", "sha1sum -bc sums.txt",
+            "shasum --ch sums.txt",
+        ))
+        (self.work / "a.txt").write_text("a\n", encoding="utf-8")
+        res = self.evaluate("sha256sum a.txt", classifier_caller=unexpected_caller)
+        self.assertEqual(res, {"decision": "allow"})
+
+    def test_tree_rerunning_at_the_depth_limit_is_not_fast_allowed(self) -> None:
+        """-R writes 00Tree.html into every directory at the -L limit."""
+        self.assert_not_fast_allowed(("tree -R -H . -L 1 .", "tree -aR -L 1 .", "tree -LR 1 ."))
+
+    def test_tree_attached_output_into_a_control_file_is_denied(self) -> None:
+        res = self.evaluate("tree -ao~/.gemini/config/hooks.json .", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_metadata_readers_of_git_config_stay_fast_allowed(self) -> None:
+        """ls and stat print no file content, so naming .git/config reads no remote URL."""
+        (self.work / ".git").mkdir(exist_ok=True)
+        (self.work / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        for cmd in ("ls -la .git/config", "ls -ld .git .git/config", "stat .git/config"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+        self.assert_not_fast_allowed(("cat .git/config", "head .git/config"))
+
+    def test_git_diff_no_index_of_two_regular_files_is_allowed(self) -> None:
+        (self.work / "a.txt").write_text("a\n", encoding="utf-8")
+        (self.work / "b.txt").write_text("b\n", encoding="utf-8")
+        res = self.evaluate("git diff --no-index a.txt b.txt", classifier_caller=unexpected_caller)
+        self.assertEqual(res, {"decision": "allow"})
+        (self.work / "d").mkdir()
+        res = self.evaluate("git diff --no-index a.txt d", classifier_caller=unexpected_caller)
+        self.assertEqual(res.get("decision"), "deny", res)
+
+    def test_awk_comparison_without_print_stays_fast_allowed(self) -> None:
+        (self.work / "a.txt").write_text("3\n", encoding="utf-8")
+        for cmd in ("awk '$1 > 2' a.txt", "awk 'NF>1 && $2>=0' a.txt"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res, {"decision": "allow"}, cmd)
+        self.assert_not_fast_allowed(("awk '{print > \"out\"}' a.txt",
+                                      "awk '$1 > 2 {print $1 > \"out\"}' a.txt",
+                                      "awk '{printf \"%s\", $1 > \"out\"}' a.txt"))
+
     def test_a_star_between_two_words_of_a_deny_or_ask_entry_matches_no_arguments_too(self) -> None:
         self.configure(shellCommandRules={"deny": ["mytool * --publish*"], "ask": ["mytool * --dry-run"]})
         for cmd in ("mytool --publish", "mytool site --publish now"):
