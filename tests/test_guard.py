@@ -1968,12 +1968,49 @@ class AegysTest(unittest.TestCase):
                     "git add . ':(exclude,top,icase)*.env*'", "git add -p", "git add -e",
                     # ambiguous prefixes are errors in git, and stage nothing
                     "git add --inter src/a.py", "git add --u src/a.py", "git add --verb src/a.py",
-                    # the readers of the index are not guarded one by one
-                    "git diff --cached", "git diff HEAD", "git status -v", "git diff-index -p HEAD",
-                    "git show :.env.staging"):
+                    # the readers that print whole trees are guarded by the staging step
+                    "git diff --cached", "git diff HEAD", "git status -v", "git diff-index -p HEAD"):
             self.assertEqual(
                 self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
             )
+
+    def test_git_readers_of_a_named_object_do_not_print_a_secret_path(self) -> None:
+        self.assert_not_fast_allowed((
+            "git show HEAD:.env", "git show :.env.staging", "git show :0:.env", "git show HEAD:./.env",
+            "git show HEAD~1:sub/.env.local", "git cat-file -p HEAD:.env",
+            "git cat-file blob :.env.staging", "git show :.npmrc", "git cat-file -p HEAD:.git-credentials",
+            "git show HEAD:sub/.pypirc", "git diff HEAD:.env HEAD~1:.env", "git log -p HEAD:.env",
+            "git -C . show HEAD:.env",
+        ))
+        for cmd in ("git show HEAD:README.md", "git show HEAD:src/a.py", "git cat-file -p HEAD:a.py",
+                    "git show HEAD", "git cat-file -t HEAD", "git show :a.txt",
+                    "git log --pretty=format:%h", "git show HEAD:docs/env.md"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_reading_a_git_settings_file_reaches_the_classifier(self) -> None:
+        (self.work / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        (self.work / "cfg").symlink_to(self.work / ".git" / "config")
+        self.assert_not_fast_allowed((
+            "cat .git/config", "cat .git/modules/sub/config", "cat .GIT/Config", "cat .git/CONFIG",
+            "cat .git/config.worktree", "head -n 1 .git/worktrees/w/config.worktree",
+            "cat sub/.git/modules/x/config", "cat cfg", "cat ~/.gitconfig", "cat ~/.config/git/config",
+        ))
+        (self.work / "config").write_text("x\n", encoding="utf-8")
+        for cmd in ("cat config", "cat a.txt", "cat .gitignore", "cat .git/HEAD"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
+    def test_rg_hostname_bin_is_denied_even_without_the_shipped_deny_entry(self) -> None:
+        self.configure(removeDefaults={"shellCommandRules": {"deny": ["rg *--hostname-bin*"]}})
+        for cmd in ("rg --hostname-bin ./x foo", "rg --hostname-bin=./x foo",
+                    'rg "--hostname-bin" ./x foo', "rg '--hostname-bin=./x' foo",
+                    "rg foo 2>&1 --hostname-bin ./x", "\\rg --hostname-bin ./x foo"):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+            self.assertIn("hostname-bin", res.get("reason", ""), (cmd, res))
 
     def test_a_search_that_reads_a_pipe_or_a_file_is_not_recursive(self) -> None:
         (self.work / "a.txt").write_text("K\n", encoding="utf-8")

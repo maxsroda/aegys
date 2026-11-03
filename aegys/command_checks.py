@@ -911,8 +911,10 @@ def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path)
     """True for `git add` of `.`, a directory, a glob, `-A`/`--all`, `-u`/`--update`,
     `-i`/`--interactive` or a pathspec file, which stages every un-ignored `.env.*` the
     work tree holds (and `git diff --cached`, `git status -v` and others then print it),
-    unless the command carries an excluding pathspec such as `':!*.env*'`. Guarding the staging step holds
-    for every reader of the index."""
+    unless the command carries an excluding pathspec such as `':!*.env*'`. Guarding the
+    staging step covers the readers that print whole trees, and only for `.env.*`: a
+    reader that names an index entry (`git show :.npmrc`) is guarded by
+    `git_object_reads_secret`, and a bare reader of history (`git log -p`) is not guarded."""
     if not words or os.path.basename(words[0]) != "git" or "add" not in words[1:]:
         return False
     rest = words[words.index("add") + 1:]
@@ -937,6 +939,39 @@ def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path)
             except (ValueError, OSError, RuntimeError):
                 return True
     return False
+
+
+GIT_OBJECT_READERS = {"show", "cat-file", "diff", "log"}
+
+
+def git_object_reads_secret(words: list[str], secret_paths: tuple[str, ...]) -> bool:
+    """True for a git reader (`show`, `cat-file`, `diff`, `log`) with an operand that
+    names a secret path inside an object: `REV:path`, `:path` (the index) or `:N:path`.
+    `expand_word` reads `HEAD:.env` as a file named `HEAD:.env`, so the path checks never
+    see it. The path is read from the repository root, written with a leading `/` for
+    the secret globs."""
+    if not words or os.path.basename(words[0]) != "git":
+        return False
+    rest = words[1:]
+    if not GIT_OBJECT_READERS & set(rest):
+        return False
+    for word in rest:
+        if word.startswith("-") or ":" not in word:
+            continue
+        revision, _, path = word.partition(":")
+        if re.fullmatch(r"[0-3]", path.partition(":")[0]) and revision == "":
+            path = path.partition(":")[2]  # `:N:path`, an index entry at stage N
+        path = os.path.normpath("/" + path)
+        if secret(Path(path), secret_paths):
+            return True
+    return False
+
+
+def rg_runs_a_program(words: list[str]) -> bool:
+    """True for rg with `--hostname-bin`, which runs a program to learn the host name."""
+    return (bool(words) and os.path.basename(words[0]) == "rg"
+            and any(word == "--hostname-bin" or word.startswith("--hostname-bin=")
+                    for word in words[1:]))
 
 
 def git_add_forces(words: list[str]) -> bool:

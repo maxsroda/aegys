@@ -177,10 +177,6 @@ class CommandStagesAndSubstitutionsTest(unittest.TestCase):
         self.assertIsNotNone(critical_removal(backtick_paren_rm, self.work, self.home))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DenyPatternTest(unittest.TestCase):
     def test_the_shipped_find_patterns_match_a_find_without_a_path(self) -> None:
         for flag in ("-delete", "-exec", "-execdir", "-fls", "-fprint", "-fprint0",
@@ -225,3 +221,7 @@ class SearchExclusionTest(unittest.TestCase):
     def test_a_glob_with_a_slash_never_counts_as_an_exclusion(self) -> None:
         search = search_starts(["rg", "--hidden", "-g", "!src/.env", "K"])
         self.assertEqual(search.filters, ())
+
+
+if __name__ == "__main__":
+    unittest.main()
