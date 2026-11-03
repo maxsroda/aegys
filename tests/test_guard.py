@@ -356,6 +356,60 @@ class AegysTest(unittest.TestCase):
             self.assertEqual(res.get("decision"), "deny", (tool_name, path, res))
             self.assertIn("git settings file", res.get("reason", ""), (tool_name, path, res))
 
+    def make_git_directory(self, path: Path) -> Path:
+        """A directory git recognises as a git directory by its contents, under a name
+        other than .git: a HEAD file beside objects/ and refs/."""
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (path / "objects").mkdir(exist_ok=True)
+        (path / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+        return path
+
+    def test_file_tools_deny_config_in_a_git_directory_not_named_git(self) -> None:
+        # A git directory recognised by content (HEAD, objects/, refs/) holds the same
+        # `config` git reads and runs programs from (core.fsmonitor, diff textconv), so
+        # a write to it is refused like one to .git/config.
+        gd = self.make_git_directory(self.work / "gd")
+        for tool_name in ("write_file", "edit_file"):
+            res = self.evaluate_file(
+                tool_name, str(gd / "config"), classifier_caller=unexpected_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", (tool_name, res))
+            self.assertIn("git settings file", res.get("reason", ""), (tool_name, res))
+
+    def test_file_tools_send_other_writes_in_a_git_directory_to_the_classifier(self) -> None:
+        # Every other file in such a directory (HEAD, hooks/*, refs/*) is guarded like one
+        # under .git: not fast-allowed, the classifier decides.
+        gd = self.make_git_directory(self.work / "gd")
+        for path in (gd / "HEAD", gd / "hooks" / "pre-commit", gd / "refs" / "heads" / "main"):
+            res = self.evaluate_file(
+                "write_file", str(path), classifier_caller=soft_deny_caller
+            )
+            self.assertNotEqual(res.get("decision"), "allow", (path, res))
+        # a sibling that is not a git directory stays fast-allowed
+        (self.work / "src").mkdir()
+        self.assertEqual(
+            self.evaluate_file("write_file", str(self.work / "src" / "a.py"),
+                               classifier_caller=unexpected_caller),
+            {"decision": "allow"},
+        )
+
+    def test_git_commands_in_a_git_directory_not_named_git_reach_the_classifier(self) -> None:
+        # Running git with its git directory as the working directory (after a cd), or with
+        # -C or --git-dir pointing at it, makes git read that directory's config and run the
+        # programs it names (core.fsmonitor): the classifier judges it, it is not fast-allowed.
+        self.make_git_directory(self.work / "gd")
+        (self.work / "src").mkdir()
+        self.assert_not_fast_allowed((
+            "cd gd && git status", "cd gd && git diff", "git -C gd status",
+            "git --git-dir=gd status", "git --git-dir=gd diff",
+        ))
+        # ordinary git in a work tree, and in a plain subdirectory, stays fast-allowed
+        for cmd in ("git status", "git diff", "cd src && git status"):
+            self.assertEqual(
+                self.evaluate(cmd, classifier_caller=unexpected_caller), {"decision": "allow"}, cmd
+            )
+
     def test_file_tools_deny_writes_through_symlink_to_git_settings(self) -> None:
         # A dotfile manager often links ~/.gitconfig into a dotfiles repository. The
         # target is written under its own name, and a workspace link resolves to it.

@@ -1516,12 +1516,29 @@ def git_config_target(words: list[str], cwd: Path, home: Path) -> Path | None:
     return cwd / ".git" / "config"
 
 
+def is_git_directory(path: Path) -> bool:
+    """True when path is itself a git directory, recognised the way git does, by the
+    contents it reads to find one: a `HEAD` file beside an `objects/` and a `refs/`
+    directory. This covers `.git`, a bare repository, a submodule's git directory and a
+    GIT_DIR laid out by hand under any name. git reads such a directory's `config` and
+    runs the programs it names (core.fsmonitor, diff textconv). An ordinary work tree is
+    not one: it holds a `.git` entry rather than these three."""
+    try:
+        return ((path / "HEAD").is_file()
+                and (path / "objects").is_dir()
+                and (path / "refs").is_dir())
+    except OSError:
+        return False
+
+
 def git_settings_match(path: Path, home: Path) -> Path | None:
     """The git settings file that path is, or shares a file with, or None. git runs the
     programs these files name (core.fsmonitor, diff drivers' textconv). They are
     ~/.gitconfig and ~/.config/git/config, which git reads on every run, and a `config`
-    under a `.git` directory (a repository's, or a submodule's .git/modules/<name>/config),
-    which git reads when it runs in that repository. A name matches in any letter case.
+    under a `.git` directory (a repository's, or a submodule's .git/modules/<name>/config)
+    or directly inside any directory that is a git directory by content (see
+    is_git_directory, which covers a git directory under a name other than .git), which git
+    reads when it runs in that repository. A name matches in any letter case.
     A path shares a file with a settings file when it is a symbolic or hard link to it,
     checked with os.path.samefile against those files and the .git/config files above
     path. Not seen: a hard link to a settings file of a repository that does not contain
@@ -1534,7 +1551,9 @@ def git_settings_match(path: Path, home: Path) -> Path | None:
     for setting in home_settings:
         if lowered == str(setting).lower():
             return setting
-    if path.name.lower() == "config" and any(p.lower() == ".git" for p in path.parts[:-1]):
+    if path.name.lower() == "config" and (
+            any(p.lower() == ".git" for p in path.parts[:-1])
+            or is_git_directory(path.parent)):
         return path
     if not path.is_file():
         return None
@@ -2739,6 +2758,32 @@ def git_c_directories(stage: Stage, home: Path) -> list[Path]:
             continue
         directories.append(base)
     return directories
+
+
+def git_directory_run_in(stage: Stage, home: Path) -> Path | None:
+    """The git directory a `git` stage operates in when that directory is itself a git
+    directory (not a work tree): its working directory after any `cd`, a `-C` target, or
+    an explicit `--git-dir`. git reads that directory's `config` there, so a planted
+    core.fsmonitor runs. None for the common case, git in an ordinary work tree, which the
+    fast path still allows. GIT_DIR in the environment already refuses the stage."""
+    if not stage.words or os.path.basename(stage.words[0]) != "git":
+        return None
+    args = stage.words[1:]
+    i = git_subcommand_index(args)
+    head = args[:i] if i is not None else args
+    base = stage.cwds[-1]
+    candidates: list[Path] = []
+    for j, arg in enumerate(head):
+        value = arg.split("=", 1)[1] if arg.startswith("--git-dir=") else (
+            head[j + 1] if arg == "--git-dir" and j + 1 < len(head) else None)
+        if value is not None:
+            try:
+                candidates.append(resolve_word(value, base, home))
+            except (ValueError, OSError, RuntimeError):
+                continue
+    candidates.extend(git_c_directories(stage, home))
+    candidates.append(base)
+    return next((d for d in candidates if is_git_directory(d)), None)
 
 
 def git_top(path: Path) -> Path | None:

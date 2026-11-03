@@ -54,13 +54,15 @@ For ``read_file``, ``view_file``, ``write_file`` and ``edit_file``, in order:
    of agy and of the other harnesses included); a write into agy's control directories or into
    the launcher directories of the harness config repository (see
    ``aegys/config.py``); a write that changes a git settings file (``~/.gitconfig``,
-   ``~/.config/git/config``, or a ``config`` under a ``.git`` directory, a submodule's
-   included), by name or by sharing a file with one through a symbolic or hard link
-   (see ``git_settings_match`` in ``aegys/command_checks.py``).
+   ``~/.config/git/config``, or a ``config`` under a ``.git`` directory or any other
+   directory that is a git directory by content, a submodule's included), by name or by
+   sharing a file with one through a symbolic or hard link (see ``git_settings_match`` in
+   ``aegys/command_checks.py``).
 2. **Workspace fast allow:** a path under a workspace root or the working
    directory, unless a protected name such as ``.git`` or ``.gemini`` occurs in
-   it, or the call writes into the harness config repository, ``~/.gemini`` or
-   the aegys package.
+   it, the path lies inside a git directory recognised by content (see
+   ``is_git_directory``), or the call writes into the harness config repository,
+   ``~/.gemini`` or the aegys package.
    Returns ``{"decision": "allow"}``.
 3. **Guard off:** ``{"decision": "force_ask", ...}``.
 4. **Classifier:** the verdict rules of 5, with the file action as input.
@@ -135,8 +137,10 @@ from .command_checks import (
     git_object_reads_secret,
     rg_runs_a_program,
     git_add_forces,
+    git_directory_run_in,
     git_settings_match,
     host_denial_reason,
+    is_git_directory,
     inline_code,
     input_targets,
     jq_reads_only,
@@ -647,6 +651,11 @@ def stage_matches_allow_patterns(
             git_settings_match(path, home) or path.name.lower() == "config.worktree"
             and ".git" in (part.lower() for part in path.parts[:-1])
             for path in stage_paths(stage, home)):
+        return False
+    # A `git` command whose git directory is itself a git directory, not a work tree (its
+    # cwd after a `cd`, a `-C` target, or a `--git-dir`), makes git read that directory's
+    # config and run the programs it names (core.fsmonitor): the classifier judges it.
+    if program == "git" and git_directory_run_in(stage, home) is not None:
         return False
     # `git show HEAD:.env` and `git show :.npmrc` print a secret out of an object, by a
     # name the path checks do not read as a path.
@@ -1820,6 +1829,17 @@ def evaluate_file_access(
         inside(path, r) for r in classified_write_roots(home)
     ):
         root = None
+    # A write into a git directory recognised by content, under a name other than .git, is
+    # guarded like one under .git: git runs programs its files name, so the classifier
+    # judges it rather than the fast path allowing it. (A `config` there is already denied
+    # above, as a git settings file.)
+    if tool_name in WRITE_TOOL_NAMES and root is not None:
+        ancestor = root
+        for part in path.relative_to(root).parts[:-1]:
+            ancestor = ancestor / part
+            if is_git_directory(ancestor):
+                root = None
+                break
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home)}
     if root is not None and not any(
