@@ -877,6 +877,9 @@ def set_guard_enabled(home: Path, conversation_id: str | None, enabled: bool) ->
 
 
 RECENT_DENIALS_KEPT = 5
+# Only security-policy blocks enter recent_denials and count for strikes;
+# fail-closed classifier format or truncation errors (tier="none") do not.
+POLICY_DENY_TIERS = ("deterministic", "hard_deny", "soft_deny", "evasion")
 
 
 def action_digest(action: str) -> str:
@@ -900,6 +903,7 @@ def recent_denials(state: dict[str, Any]) -> list[dict[str, Any]]:
         e for e in (entries if isinstance(entries, list) else [])
         if isinstance(e, dict) and isinstance(e.get("at"), int)
         and now - e["at"] <= STRIKE_WINDOW_ACTIONS
+        and ("tier" not in e or e.get("tier") in POLICY_DENY_TIERS)
     ]
 
 
@@ -955,7 +959,7 @@ def record_guard_decision(
     classifier_denied: bool = False,
     action: str = "",
     reason: str = "",
-    tier: str = "deterministic",
+    tier: str | None = "deterministic",
     user_turn: str = "",
     clear_strikes: bool = False,
 ) -> dict[str, int]:
@@ -975,7 +979,7 @@ def record_guard_decision(
         if clear_strikes:
             state["strikes"] = 0
             state.pop("strike_at", None)
-        if denied and action:
+        if denied and action and tier in POLICY_DENY_TIERS:
             entries = state.get("recent_denials")
             entries = entries if isinstance(entries, list) else []
             entries.append({
@@ -1056,15 +1060,20 @@ def escalated_deny(
     *,
     evasion: bool = False,
     classifier: bool = False,
-    tier: str = "deterministic",
+    tier: str | None = "deterministic",
     user_turn: str = "",
 ) -> dict[str, Any]:
-    """Deny `action`. A repeat of a denied action, or an action the classifier
-    judged evasion, is a strike, and its deny tells the agent to change course
-    instead of retrying. Nothing escalates to the user: agy prompts have no
-    timeout and would stall an unattended session."""
-    with state_lock(home, conversation_id):
-        text = strike_message(home, conversation_id, action, message, evasion, user_turn)
+    """Deny `action`. A repeat of a policy-denied action, or an action the
+    classifier judged evasion, is a strike, and its deny tells the agent to
+    change course instead of retrying. Fail-closed classifier format or
+    truncation errors (`tier` outside `POLICY_DENY_TIERS`) still deny without
+    recording a policy denial or strike. Nothing escalates to the user: agy
+    prompts have no timeout and would stall an unattended session."""
+    if tier in POLICY_DENY_TIERS:
+        with state_lock(home, conversation_id):
+            text = strike_message(home, conversation_id, action, message, evasion, user_turn)
+    else:
+        text = message
     record_guard_decision(
         home, conversation_id, denied=True, classifier_denied=classifier,
         action=action, reason=message, tier=tier, user_turn=user_turn,
