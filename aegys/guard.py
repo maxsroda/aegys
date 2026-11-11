@@ -877,9 +877,10 @@ def set_guard_enabled(home: Path, conversation_id: str | None, enabled: bool) ->
 
 
 RECENT_DENIALS_KEPT = 5
-# Only security-policy blocks enter recent_denials and count for strikes;
-# fail-closed classifier format or truncation errors (tier="none") do not.
-POLICY_DENY_TIERS = ("deterministic", "hard_deny", "soft_deny", "evasion")
+# Fail-closed classifier format or truncation errors (tier=FAIL_CLOSED_TIER) do
+# not enter recent_denials or count for strikes; deterministic and clean
+# classifier blocks (including tier="none") do.
+FAIL_CLOSED_TIER = "fail_closed"
 
 
 def action_digest(action: str) -> str:
@@ -903,7 +904,7 @@ def recent_denials(state: dict[str, Any]) -> list[dict[str, Any]]:
         e for e in (entries if isinstance(entries, list) else [])
         if isinstance(e, dict) and isinstance(e.get("at"), int)
         and now - e["at"] <= STRIKE_WINDOW_ACTIONS
-        and ("tier" not in e or e.get("tier") in POLICY_DENY_TIERS)
+        and e.get("tier") != FAIL_CLOSED_TIER
     ]
 
 
@@ -959,7 +960,7 @@ def record_guard_decision(
     classifier_denied: bool = False,
     action: str = "",
     reason: str = "",
-    tier: str | None = "deterministic",
+    tier: str = "deterministic",
     user_turn: str = "",
     clear_strikes: bool = False,
 ) -> dict[str, int]:
@@ -979,7 +980,7 @@ def record_guard_decision(
         if clear_strikes:
             state["strikes"] = 0
             state.pop("strike_at", None)
-        if denied and action and tier in POLICY_DENY_TIERS:
+        if denied and action and tier != FAIL_CLOSED_TIER:
             entries = state.get("recent_denials")
             entries = entries if isinstance(entries, list) else []
             entries.append({
@@ -1060,16 +1061,16 @@ def escalated_deny(
     *,
     evasion: bool = False,
     classifier: bool = False,
-    tier: str | None = "deterministic",
+    tier: str = "deterministic",
     user_turn: str = "",
 ) -> dict[str, Any]:
-    """Deny `action`. A repeat of a policy-denied action, or an action the
-    classifier judged evasion, is a strike, and its deny tells the agent to
-    change course instead of retrying. Fail-closed classifier format or
-    truncation errors (`tier` outside `POLICY_DENY_TIERS`) still deny without
-    recording a policy denial or strike. Nothing escalates to the user: agy
-    prompts have no timeout and would stall an unattended session."""
-    if tier in POLICY_DENY_TIERS:
+    """Deny `action`. A repeat of a denied action, or an action the classifier
+    judged evasion, is a strike, and its deny tells the agent to change course
+    instead of retrying. Fail-closed classifier format or truncation errors
+    (`tier == FAIL_CLOSED_TIER`) still deny without entering `recent_denials`
+    or counting a strike. Nothing escalates to the user: agy prompts have no
+    timeout and would stall an unattended session."""
+    if tier != FAIL_CLOSED_TIER:
         with state_lock(home, conversation_id):
             text = strike_message(home, conversation_id, action, message, evasion, user_turn)
     else:
@@ -1614,7 +1615,7 @@ def classify_in_stages(
     else:
         return {
             "decision": "block",
-            "tier": "none",
+            "tier": FAIL_CLOSED_TIER,
             "reason": fast_last_reason,
         }
 
@@ -1658,13 +1659,13 @@ def classify_in_stages(
         elif det_stop not in ("end_turn", "stop"):
             return {
                 "decision": "block",
-                "tier": "none",
+                "tier": FAIL_CLOSED_TIER,
                 "reason": (
                     f"Classifier response did not stop cleanly ({det_stop}); "
                     "aegys fails closed."
                 ),
             }
-    return {"decision": "block", "tier": "none", "reason": last_reason}
+    return {"decision": "block", "tier": FAIL_CLOSED_TIER, "reason": last_reason}
 
 
 # --- Top-level PreToolUse evaluation ---------------------------------------------
