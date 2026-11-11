@@ -140,6 +140,31 @@ class StringHelpersTest(unittest.TestCase):
         self.assertTrue(words.inside(Path("/a/b"), root))
         self.assertFalse(words.inside(Path("/ab"), root))
 
+    def test_path_probes_handle_300_byte_word(self) -> None:
+        long_path = Path("a" * 300)
+        self.assertFalse(words.path_exists(long_path))
+        self.assertFalse(words.path_is_file(long_path))
+        self.assertFalse(words.path_is_dir(long_path))
+        self.assertFalse(words.path_exists("a" * 300))
+        self.assertFalse(words.path_is_file("a" * 300))
+        self.assertFalse(words.path_is_dir("a" * 300))
+
+    def test_path_probes_handle_existing_and_missing_paths(self) -> None:
+        this_file = Path(__file__)
+        self.assertTrue(words.path_exists(this_file))
+        self.assertTrue(words.path_is_file(this_file))
+        self.assertFalse(words.path_is_dir(this_file))
+
+        this_dir = this_file.parent
+        self.assertTrue(words.path_exists(this_dir))
+        self.assertFalse(words.path_is_file(this_dir))
+        self.assertTrue(words.path_is_dir(this_dir))
+
+        missing = this_dir / "definitely_nonexistent_file_xyz"
+        self.assertFalse(words.path_exists(missing))
+        self.assertFalse(words.path_is_file(missing))
+        self.assertFalse(words.path_is_dir(missing))
+
 
 if __name__ == "__main__":
     unittest.main()

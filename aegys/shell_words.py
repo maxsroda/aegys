@@ -62,6 +62,33 @@ def inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def path_exists(path: Path | str) -> bool:
+    """True when path exists. Returns False on OSError (including ENAMETOOLONG)."""
+    try:
+        p = path if isinstance(path, Path) else Path(path)
+        return p.exists()
+    except OSError:
+        return False
+
+
+def path_is_file(path: Path | str) -> bool:
+    """True when path is an existing regular file. Returns False on OSError (including ENAMETOOLONG)."""
+    try:
+        p = path if isinstance(path, Path) else Path(path)
+        return p.is_file()
+    except OSError:
+        return False
+
+
+def path_is_dir(path: Path | str) -> bool:
+    """True when path is an existing directory. Returns False on OSError (including ENAMETOOLONG)."""
+    try:
+        p = path if isinstance(path, Path) else Path(path)
+        return p.is_dir()
+    except OSError:
+        return False
+
+
 # --- bash ----------------------------------------------------------------------
 
 def split_stages(command: str, comments: bool = True) -> list[list[str]]:
