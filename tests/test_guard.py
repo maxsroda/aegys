@@ -26,6 +26,8 @@ from aegys.guard import (
     pre_invocation_response,
     load_guard_state,
     read_state_file,
+    recent_denials_text,
+    write_state_file,
 )
 
 # The checkout root: the tests run from here, so `python -m aegys.guard` imports this package.
@@ -2861,6 +2863,313 @@ class AegysTest(unittest.TestCase):
         # 4. Project instructions and transcript entries with 300-byte path
         self.assertEqual(load_project_instructions([str(self.work / long_word)], self.home), "")
         self.assertEqual(collect_agy_transcript_entries(self.work / long_word), [])
+
+    def test_classifier_fail_closed_errors_do_not_pollute_recent_denials_or_evasion_context(
+        self,
+    ) -> None:
+        def fast_truncated_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            return {"stop_reason": "max_tokens", "content": [{"type": "text", "text": ""}]}
+
+        def fast_malformed_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "maybe"}]}
+
+        def detailed_truncated_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {"stop_reason": "max_tokens", "content": [{"type": "text", "text": ""}]}
+
+        def detailed_missing_tool_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "allow"}]}
+
+        def detailed_refusal_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {"stop_reason": "refusal", "content": [{"type": "text", "text": ""}]}
+
+        for idx, caller in enumerate(
+            (
+                fast_truncated_caller,
+                fast_malformed_caller,
+                detailed_truncated_caller,
+                detailed_missing_tool_caller,
+                detailed_refusal_caller,
+            )
+        ):
+            res = self.evaluate(f"python3 -c 'print({idx})'", classifier_caller=caller)
+            self.assertEqual(res.get("decision"), "deny", (idx, res))
+            self.assertIn("Blocked by aegys classifier (fail_closed):", res.get("reason", ""), (idx, res))
+            self.assertIn("aegys fails closed", res.get("reason", ""), (idx, res))
+
+        state = read_state_file(self.home, "conv-1234")
+        self.assertEqual(state.get("recent_denials", []), [], state)
+        self.assertEqual(state.get("denied"), 5)
+        self.assertEqual(state.get("classifier_denied"), 5)
+        self.assertEqual(recent_denials_text(self.home, "conv-1234", "current-turn"), "")
+
+        seen_messages: list[str] = []
+
+        def inspecting_allow_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            seen_messages.extend(part.get("text", "") for m in msgs for part in m["content"])
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "0"}]}
+
+        res_next = self.evaluate("python3 -c 'print(99)'", classifier_caller=inspecting_allow_caller)
+        self.assertEqual(res_next, {"decision": "allow"}, res_next)
+        self.assertTrue(
+            any("<recent-denied-actions>\n(none)\n</recent-denied-actions>" in m for m in seen_messages),
+            seen_messages,
+        )
+
+        # Fail-closed errors also must not evict an earlier policy denial from the 5-entry buffer.
+        self.assertEqual(self.evaluate("cat ~/.ssh/id_rsa").get("decision"), "deny")
+        for idx in range(6):
+            res = self.evaluate(
+                f"python3 -c 'print({100 + idx})'", classifier_caller=fast_truncated_caller
+            )
+            self.assertEqual(res.get("decision"), "deny", res)
+        denials_after = read_state_file(self.home, "conv-1234").get("recent_denials", [])
+        self.assertEqual(len(denials_after), 1, denials_after)
+        self.assertEqual(denials_after[0].get("action"), "cat ~/.ssh/id_rsa")
+
+    def test_classifier_fail_closed_repeats_do_not_accumulate_strikes(self) -> None:
+        def truncated_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            return {"stop_reason": "max_tokens", "content": [{"type": "text", "text": ""}]}
+
+        cmd = "python3 -c 'print(123)'"
+        res_t1_a = self.evaluate(cmd, last_user_input="Run check.", classifier_caller=truncated_caller)
+        res_t1_b = self.evaluate(cmd, last_user_input="Run check.", classifier_caller=truncated_caller)
+        res_t2 = self.evaluate(
+            cmd, last_user_input="Run check again.", classifier_caller=truncated_caller
+        )
+        for res in (res_t1_a, res_t1_b, res_t2):
+            self.assertEqual(res.get("decision"), "deny", res)
+            self.assertNotIn("attempt", res.get("reason", ""), res)
+
+        state = read_state_file(self.home, "conv-1234")
+        self.assertEqual(state.get("strikes", 0), 0, state)
+        self.assertNotIn("strike_at", state)
+
+        # A transient fail-closed response on a previously soft-denied command does not count as a strike.
+        denied_cmd = 'd=$(mktemp -d) && git clone . "$d/retry"'
+        self.assertEqual(
+            self.evaluate(
+                denied_cmd, last_user_input="Task", classifier_caller=soft_deny_caller
+            ).get("decision"),
+            "deny",
+        )
+        res_transient = self.evaluate(
+            denied_cmd, last_user_input="Task", classifier_caller=truncated_caller
+        )
+        self.assertEqual(res_transient.get("decision"), "deny", res_transient)
+        self.assertNotIn("attempt", res_transient.get("reason", ""), res_transient)
+        self.assertEqual(read_state_file(self.home, "conv-1234").get("strikes", 0), 0)
+
+    def test_classifier_clean_block_with_tier_none_enters_recent_denials_and_counts_strike(
+        self,
+    ) -> None:
+        def block_none_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": CLASSIFIER_DECISION_TOOL_NAME,
+                        "input": {
+                            "decision": "block",
+                            "tier": "none",
+                            "reason": "Policy blocks this helper.",
+                        },
+                    }
+                ],
+            }
+
+        cmd = "python3 -c 'print(42)'"
+        res1 = self.evaluate(cmd, last_user_input="Run helper.", classifier_caller=block_none_caller)
+        self.assertEqual(res1.get("decision"), "deny", res1)
+        self.assertEqual(
+            res1.get("reason"),
+            "Blocked by aegys classifier (none): Policy blocks this helper.",
+        )
+
+        state = read_state_file(self.home, "conv-1234")
+        denials = state.get("recent_denials", [])
+        self.assertEqual(len(denials), 1, state)
+        self.assertEqual(denials[0].get("tier"), "none")
+
+        seen_messages: list[str] = []
+
+        def inspecting_allow_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            seen_messages.extend(part.get("text", "") for m in msgs for part in m["content"])
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "0"}]}
+
+        res_reroute = self.evaluate(
+            "python3 -c 'print(43)'",
+            last_user_input="Run helper.",
+            classifier_caller=inspecting_allow_caller,
+        )
+        self.assertEqual(res_reroute, {"decision": "allow"}, res_reroute)
+        self.assertTrue(
+            any("[tier=none]" in m and "Policy blocks this helper." in m for m in seen_messages),
+            seen_messages,
+        )
+
+        res2 = self.evaluate(cmd, last_user_input="Run helper.", classifier_caller=block_none_caller)
+        self.assertEqual(res2.get("decision"), "deny", res2)
+        self.assertIn("attempt 1 at a goal aegys already denied", res2.get("reason", ""))
+        self.assertEqual(read_state_file(self.home, "conv-1234").get("strikes"), 1)
+
+    def test_pre_existing_fail_closed_entries_in_state_file_are_ignored(self) -> None:
+        import hashlib
+
+        fail_closed_cmd = "python3 -c 'print(6)'"
+        fail_closed_action = json.dumps({"toolName": "bash", "input": {"command": fail_closed_cmd}})
+        none_cmd = "python3 -c 'print(7)'"
+        none_action = json.dumps({"toolName": "bash", "input": {"command": none_cmd}})
+        hard_cmd = "python3 -c 'print(8)'"
+        hard_action = json.dumps({"toolName": "bash", "input": {"command": hard_cmd}})
+        legacy_cmd = "cat ~/.ssh/id_rsa"
+        write_state_file(
+            self.home,
+            "conv-1234",
+            {
+                "allowed": 0,
+                "denied": 4,
+                "classifier_allowed": 0,
+                "classifier_denied": 3,
+                "recent_denials": [
+                    {
+                        "action": fail_closed_action,
+                        "digest": hashlib.sha256(fail_closed_action.encode("utf-8")).hexdigest()[:16],
+                        "reason": "Blocked by aegys classifier (fail_closed): Fast classifier response did not stop cleanly (max_tokens); aegys fails closed.",
+                        "at": 0,
+                        "tier": "fail_closed",
+                        "user_turn": "turn-1",
+                    },
+                    {
+                        "action": none_action,
+                        "digest": hashlib.sha256(none_action.encode("utf-8")).hexdigest()[:16],
+                        "reason": "Blocked by aegys classifier (none): Policy blocks this helper.",
+                        "at": 1,
+                        "tier": "none",
+                        "user_turn": "turn-1",
+                    },
+                    {
+                        "action": hard_action,
+                        "digest": hashlib.sha256(hard_action.encode("utf-8")).hexdigest()[:16],
+                        "reason": "Blocked by aegys classifier (hard_deny): Credential exfiltration.",
+                        "at": 2,
+                        "tier": "hard_deny",
+                        "user_turn": "turn-1",
+                    },
+                    {
+                        "action": legacy_cmd,
+                        "digest": hashlib.sha256(legacy_cmd.encode("utf-8")).hexdigest()[:16],
+                        "reason": "Blocked by aegys: credentials.",
+                        "at": 3,
+                    },
+                ],
+            },
+        )
+        rendered = recent_denials_text(self.home, "conv-1234", "turn-2")
+        self.assertNotIn("Fast classifier response", rendered)
+        self.assertNotIn("tier=fail_closed", rendered)
+        self.assertIn("tier=none", rendered)
+        self.assertIn("tier=hard_deny", rendered)
+        self.assertIn(legacy_cmd, rendered)
+
+        # Repeating the pre-existing tier='fail_closed' action across turns does not trigger a repeat strike.
+        res_fail_closed_repeat = self.evaluate(
+            fail_closed_cmd, last_user_input="Turn 2", classifier_caller=soft_deny_caller
+        )
+        self.assertEqual(res_fail_closed_repeat.get("decision"), "deny", res_fail_closed_repeat)
+        self.assertNotIn("attempt", res_fail_closed_repeat.get("reason", ""), res_fail_closed_repeat)
+
+        # Repeating the clean tier='none', hard_deny, or legacy deterministic entry still counts as a strike.
+        res_none_repeat = self.evaluate(
+            none_cmd, last_user_input="Turn 2", classifier_caller=soft_deny_caller
+        )
+        self.assertIn("attempt 1 at a goal aegys already denied", res_none_repeat.get("reason", ""))
+
+        def hard_deny_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            if tools is None:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "1"}]}
+            return {
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": CLASSIFIER_DECISION_TOOL_NAME,
+                        "input": {
+                            "decision": "block",
+                            "tier": "hard_deny",
+                            "reason": "Credential exfiltration.",
+                        },
+                    }
+                ],
+            }
+
+        res_hard_repeat = self.evaluate(
+            hard_cmd, last_user_input="Turn 2", classifier_caller=hard_deny_caller
+        )
+        self.assertIn("attempt 2 at a goal aegys already denied", res_hard_repeat.get("reason", ""))
+        self.assertEqual(
+            read_state_file(self.home, "conv-1234")["recent_denials"][-1].get("tier"), "hard_deny"
+        )
+        res_legacy_repeat = self.evaluate(legacy_cmd, last_user_input="Turn 2")
+        self.assertIn("attempt 3 at a goal aegys already denied", res_legacy_repeat.get("reason", ""))
 
 
 if __name__ == "__main__":
