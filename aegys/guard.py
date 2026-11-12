@@ -161,7 +161,7 @@ from .command_checks import (
     urls_in,
     written_operands,
 )
-from .shell_words import WRITERS
+from .shell_words import WRITERS, path_exists, path_is_dir, path_is_file
 
 
 DEFAULT_CLASSIFIER_MODEL = "anthropic/claude-haiku-5-5"
@@ -1214,7 +1214,7 @@ def collect_agy_transcript_entries(
     transcript, appending `lastUserInput` if not already at the end."""
     entries: list[dict[str, Any]] = []
     last_seen_user = ""
-    if transcript_path and transcript_path.is_file():
+    if transcript_path and path_is_file(transcript_path):
         try:
             lines = transcript_path.read_text(
                 encoding="utf-8", errors="replace"
@@ -1366,7 +1366,7 @@ def load_project_instructions(workspace_paths: list[str], home: Path) -> str:
             resolved = path.resolve()
         except OSError:
             continue
-        if resolved in seen or not resolved.is_file():
+        if resolved in seen or not path_is_file(resolved):
             continue
         seen.add(resolved)
         try:
@@ -1909,7 +1909,7 @@ def evaluate_search_access(
                 f"Blocked by {GUARD_NAME}: {tool_name} of {path} reaches credentials in {area}.",
                 user_turn=user_turn_digest(payload),
             )
-        searches_a_tree |= tool_name == "grep_search" and path.is_dir()
+        searches_a_tree |= tool_name == "grep_search" and path_is_dir(path)
     if searches_a_tree:
         # grep_search has no way to exclude .env or .git (unverified: its arguments are
         # not documented here), so the classifier judges a search of a directory.

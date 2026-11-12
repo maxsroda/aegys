@@ -11,11 +11,21 @@ from aegys.command_checks import (
     command_stages,
     command_substitutions,
     critical_removal,
+    git_add_stages_broadly,
+    git_diff_reads_outside_the_work_tree,
+    git_directory_above,
+    git_settings_match,
+    git_top,
     host_denial_reason,
+    is_git_directory,
     NameFilter,
     matches_bash_deny_pattern,
     name_filtered_out,
+    reads_only_stdin_or_files,
+    repository_root,
+    repository_settings,
     search_starts,
+    Stage,
     uncovered_secrets,
     urls_in,
 )
@@ -221,6 +231,61 @@ class SearchExclusionTest(unittest.TestCase):
     def test_a_glob_with_a_slash_never_counts_as_an_exclusion(self) -> None:
         search = search_starts(["rg", "--hidden", "-g", "!src/.env", "K"])
         self.assertEqual(search.filters, ())
+
+
+class LongWordProbeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.long_word = "a" * 300
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.home = self.temp_dir / "home"
+        self.home.mkdir()
+        self.cwd = self.temp_dir / "repo"
+        self.cwd.mkdir()
+
+    def test_git_diff_reads_outside_the_work_tree_with_300_byte_word(self) -> None:
+        (self.cwd / ".git").mkdir()
+        (self.cwd / "inside.txt").write_text("x\n", encoding="utf-8")
+        # Long word operand should not raise ENAMETOOLONG; non-existent path doesn't read outside work tree
+        self.assertFalse(
+            git_diff_reads_outside_the_work_tree([self.long_word, "inside.txt"], self.cwd, self.home)
+        )
+        self.assertFalse(
+            git_diff_reads_outside_the_work_tree([self.long_word, self.long_word], self.cwd, self.home)
+        )
+        # Should not crash even when another operand is outside the work tree
+        self.assertTrue(
+            git_diff_reads_outside_the_work_tree([self.long_word, "/etc/hostname"], self.cwd, self.home)
+        )
+
+    def test_reads_only_stdin_or_files_with_300_byte_word(self) -> None:
+        search = search_starts(["rg", "foo", self.long_word])
+        self.assertIsNotNone(search)
+        stage = Stage(["rg", "foo", self.long_word], (self.cwd,), True, False, f"rg foo {self.long_word}", ["rg", "foo", self.long_word], False)
+        self.assertFalse(reads_only_stdin_or_files(stage, search, self.home))
+
+    def test_git_add_stages_broadly_with_300_byte_word(self) -> None:
+        self.assertFalse(
+            git_add_stages_broadly(["git", "add", self.long_word], (self.cwd,), self.home)
+        )
+
+    def test_git_settings_match_with_300_byte_word(self) -> None:
+        self.assertIsNone(git_settings_match(self.cwd / self.long_word, self.home))
+        self.assertIsNone(git_settings_match(self.cwd / self.long_word / "subfile", self.home))
+
+    def test_is_git_directory_with_300_byte_word(self) -> None:
+        self.assertFalse(is_git_directory(self.cwd / self.long_word))
+
+    def test_repository_settings_with_300_byte_word(self) -> None:
+        self.assertEqual(repository_settings(self.cwd / self.long_word / "subfile"), [])
+
+    def test_git_top_with_300_byte_word(self) -> None:
+        self.assertIsNone(git_top(self.cwd / self.long_word))
+
+    def test_git_directory_above_with_300_byte_word(self) -> None:
+        self.assertIsNone(git_directory_above(self.cwd / self.long_word))
+
+    def test_repository_root_with_300_byte_word(self) -> None:
+        self.assertIsNone(repository_root(self.cwd / self.long_word))
 
 
 if __name__ == "__main__":

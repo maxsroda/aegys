@@ -18,9 +18,11 @@ from aegys.guard import (
     anthropic_messages_call,
     build_classifier_system_prompt,
     build_classifier_transcript,
+    collect_agy_transcript_entries,
     evaluate_pre_tool_use,
     format_status_line,
     guard_enabled,
+    load_project_instructions,
     pre_invocation_response,
     load_guard_state,
     read_state_file,
@@ -2823,6 +2825,44 @@ class AegysTest(unittest.TestCase):
         self.assertEqual(res2.get("decision"), "deny", res2)
         self.assertNotIn("attempt 2 at a goal", res2.get("reason", ""))
         self.assertNotIn("attempt 1 at a goal", res2.get("reason", ""))
+
+    def test_probes_handle_300_byte_word(self) -> None:
+        long_word = "a" * 300
+        # 1. Shell commands with 300-byte word
+        # git diff with long word should not crash with ENAMETOOLONG
+        res = self.evaluate(f"git diff --no-index {long_word} /etc/hostname", classifier_caller=unexpected_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+        # rg with long word should not crash
+        res = self.evaluate(f"rg foo {long_word}", classifier_caller=unexpected_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+        # grep with long word should not crash
+        res = self.evaluate(f"grep -r foo {long_word}", classifier_caller=unexpected_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+        # git add with long word should not crash
+        res = self.evaluate(f"git add {long_word}", classifier_caller=unexpected_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+        # git -C with long word should not crash
+        res = self.evaluate(f"git -C {long_word} status", classifier_caller=allow_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+        # python command with long word (triggers bash_path_denial)
+        res = self.evaluate(f"python3 {long_word}", classifier_caller=allow_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+
+        # 2. File tools with 300-byte word
+        res = self.evaluate_file("write_file", str(self.work / long_word), classifier_caller=allow_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+        res = self.evaluate_file("read_file", str(self.work / long_word), classifier_caller=allow_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+        res = self.evaluate_file("edit_file", str(self.work / long_word), classifier_caller=allow_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+
+        # 3. Search tools with 300-byte word
+        res = self.search_tool("grep_search", self.work / long_word, classifier_caller=allow_caller)
+        self.assertIn(res.get("decision"), ("allow", "deny"))
+
+        # 4. Project instructions and transcript entries with 300-byte path
+        self.assertEqual(load_project_instructions([str(self.work / long_word)], self.home), "")
+        self.assertEqual(collect_agy_transcript_entries(self.work / long_word), [])
 
     def test_classifier_fail_closed_errors_do_not_pollute_recent_denials_or_evasion_context(
         self,

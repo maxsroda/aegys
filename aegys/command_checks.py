@@ -40,7 +40,7 @@ from .config import Policy, harness_config_repository
 from .shell_words import (
     FIND_WRITE_FLAGS, PRINTERS, PUNCTUATION, READERS, SEARCHERS, SEPARATOR_CHARS,
     SHELLS, WRITERS, brace_expansions, git_config_writes, git_subcommand_index,
-    inside, unwrap,
+    inside, path_exists, path_is_dir, path_is_file, unwrap,
 )
 
 
@@ -946,7 +946,7 @@ def git_add_stages_broadly(words: list[str], cwds: tuple[Path, ...], home: Path)
             return True
         for cwd in cwds:
             try:
-                if any(path.is_dir() for path in expand_word(operand, cwd, home)):
+                if any(path_is_dir(path) for path in expand_word(operand, cwd, home)):
                     return True
             except (ValueError, OSError, RuntimeError):
                 return True
@@ -1174,7 +1174,7 @@ def inside_a_git_directory(path: Path) -> bool:
 
 def repository_root(cwd: Path) -> Path | None:
     """The nearest directory at or above cwd that holds a `.git`, or None."""
-    return next((d for d in (cwd, *cwd.parents) if (d / ".git").exists()), None)
+    return next((d for d in (cwd, *cwd.parents) if path_exists(d / ".git")), None)
 
 
 def git_diff_reads_outside_the_work_tree(operands: list[str], cwd: Path, home: Path) -> bool:
@@ -1188,7 +1188,7 @@ def git_diff_reads_outside_the_work_tree(operands: list[str], cwd: Path, home: P
             paths = expand_word(operand, cwd, home)
         except (ValueError, OSError, RuntimeError):
             continue
-        if any(path.exists() and (root is None or not inside(path, root)) for path in paths):
+        if any(path_exists(path) and (root is None or not inside(path, root)) for path in paths):
             return True
     return False
 
@@ -1411,7 +1411,7 @@ def reads_only_stdin_or_files(stage: Stage, search: Search, home: Path) -> bool:
     reads_stdin = stage.piped or any(word in ("<", "<<<", HEREDOC_MARKER) for word in stage.raw)
     if not search.explicit_starts:
         return search.program == "rg" and reads_stdin
-    return all(start.is_file() for start in stage_paths(stage, home, search.starts))
+    return all(path_is_file(start) for start in stage_paths(stage, home, search.starts))
 
 
 def search_denial(search: Search, missing: list[str]) -> str:
@@ -1526,10 +1526,10 @@ def is_git_directory(path: Path) -> bool:
     (core.fsmonitor, diff textconv). An ordinary work tree is not one: it holds a `.git`
     entry rather than these."""
     try:
-        if not (path / "HEAD").is_file():
+        if not path_is_file(path / "HEAD"):
             return False
-        return (((path / "objects").is_dir() and (path / "refs").is_dir())
-                or (path / "commondir").is_file())
+        return (((path_is_dir(path / "objects") and path_is_dir(path / "refs"))
+                or path_is_file(path / "commondir")))
     except OSError:
         return False
 
@@ -1558,11 +1558,11 @@ def git_settings_match(path: Path, home: Path) -> Path | None:
             any(p.lower() == ".git" for p in path.parts[:-1])
             or is_git_directory(path.parent)):
         return path
-    if not path.is_file():
+    if not path_is_file(path):
         return None
     for setting in (*home_settings, *repository_settings(path)):
         try:
-            if setting.is_file() and os.path.samefile(path, setting):
+            if path_is_file(setting) and os.path.samefile(path, setting):
                 return setting
         except OSError:
             continue
@@ -1575,7 +1575,7 @@ def repository_settings(path: Path) -> list[Path]:
     settings: list[Path] = []
     for directory in path.parents:
         git_dir = directory / ".git"
-        if git_dir.is_dir():
+        if path_is_dir(git_dir):
             settings.append(git_dir / "config")
             settings.extend(submodule_settings(git_dir / "modules"))
     return settings
@@ -1585,7 +1585,7 @@ def submodule_settings(modules: Path) -> list[Path]:
     """The `config` of each submodule git directory under `modules`, nested submodules
     included. Only the module directories are listed, never their objects."""
     try:
-        entries = [entry for entry in modules.iterdir() if entry.is_dir()]
+        entries = [entry for entry in modules.iterdir() if path_is_dir(entry)]
     except OSError:
         return []
     settings: list[Path] = []
@@ -2774,10 +2774,7 @@ def git_directory_above(start: Path) -> Path | None:
     for directory in (start, *start.parents):
         if is_git_directory(directory):
             return directory
-        try:
-            if (directory / ".git").exists():
-                return None
-        except OSError:
+        if path_exists(directory / ".git"):
             return None
     return None
 
@@ -2815,7 +2812,7 @@ def git_directory_run_in(stage: Stage, home: Path) -> Path | None:
 def git_top(path: Path) -> Path | None:
     """The working tree path lies in: the nearest directory at or above it with a
     `.git` entry (a directory in a main clone, a file in a linked worktree)."""
-    return next((d for d in (path, *path.parents) if (d / ".git").exists()), None)
+    return next((d for d in (path, *path.parents) if path_exists(d / ".git")), None)
 
 
 def bash_path_denial(command: str, cwd: Path, home: Path,
