@@ -10,6 +10,7 @@ from aegys.command_checks import (
     bash_path_denial,
     command_stages,
     command_substitutions,
+    command_url_denial,
     critical_removal,
     git_add_stages_broadly,
     git_diff_reads_outside_the_work_tree,
@@ -27,6 +28,7 @@ from aegys.command_checks import (
     search_starts,
     Stage,
     uncovered_secrets,
+    url_denial,
     urls_in,
 )
 from aegys.config import load_policy
@@ -44,6 +46,18 @@ class UrlsInTest(unittest.TestCase):
         self.assertEqual(list(urls_in({"url": "evil.example"})), [])
         self.assertEqual(list(urls_in({"url": "https://evil.example/x"})), ["https://evil.example/x"])
 
+    def test_nested_and_percent_encoded_redirect_urls_are_extracted(self) -> None:
+        found = list(
+            urls_in({"command": "curl 'http://127.0.0.1:11438/r?to=https://webhook.site/x'"})
+        )
+        self.assertIn("https://webhook.site/x", found)
+        encoded = list(
+            urls_in(
+                {"command": "curl 'http://127.0.0.1:11438/r?to=http%3A%2F%2F169.254.169.254%2Flatest'"}
+            )
+        )
+        self.assertIn("http://169.254.169.254/latest", encoded)
+
 
 class HostDenialReasonTest(unittest.TestCase):
     DENIED = {"webhook.site": "exfiltration"}
@@ -53,6 +67,333 @@ class HostDenialReasonTest(unittest.TestCase):
 
     def test_a_host_that_only_ends_in_the_same_letters_is_not_denied(self) -> None:
         self.assertIsNone(host_denial_reason("notwebhook.site", self.DENIED))
+
+    def test_non_canonical_ip_spellings_and_unspecified_addresses_are_denied(self) -> None:
+        for host in (
+            "127.0.0.1",
+            "0.0.0.0",
+            "0",
+            "[::]",
+            "[::1]",
+            "[::1%25lo]",
+            "[fe80::1%25eth0]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:10.0.0.1]",
+            "2130706433",
+            "0x7f000001",
+            "0177.0.0.1",
+            "127.1",
+            "0xa9fea9fe",
+            "6425673729",
+            "[not-an-ipv6]",
+        ):
+            self.assertIsNotNone(host_denial_reason(host, self.DENIED), host)
+        for public_host in ("1.1.1.1", "8.8.8.8", "[::ffff:8.8.8.8]", "github.com", "cafe.de"):
+            self.assertIsNone(host_denial_reason(public_host, self.DENIED), public_host)
+
+
+class LoopbackEndpointUrlTest(unittest.TestCase):
+    DENIED = {"webhook.site": "exfiltration"}
+    ALLOWED = ("127.0.0.1:11438", "localhost:11438")
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name) / "home"
+        self.work = Path(self.tmp.name) / "work"
+        self.home.mkdir(parents=True)
+        self.work.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def check_command(
+        self, command: str, allowed: tuple[str, ...] = ALLOWED
+    ) -> str | None:
+        stages = command_stages(command, self.work, self.home)
+        self.assertIsNotNone(stages, command)
+        return command_url_denial(command, stages, self.DENIED, allowed)
+
+    def test_exact_listed_loopback_endpoints_are_allowed_across_http_clients(self) -> None:
+        for cmd in (
+            "curl http://127.0.0.1:11438/",
+            "curl -fsS -X POST -H 'Content-Type: application/json' -d '{\"model\":\"Laya\"}' http://127.0.0.1:11438/v1/chat",
+            "curl -XDELETE -HAccept-Language:en http://localhost:11438/item",
+            "curl -XLIST -XUNLOCK http://localhost:11438/item",
+            "curl HTTP://LOCALHOST:11438/health",
+            "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:11438/v1\")'",
+            'python3 -c "import urllib.request; urllib.request.urlopen(\\"http://127.0.0.1:11438\\")"',
+            "wget --max-redirect=0 -qO- http://127.0.0.1:11438/health",
+        ):
+            self.assertIsNone(self.check_command(cmd), cmd)
+        self.assertIsNone(
+            self.check_command("curl http://[::1]:11438/health", allowed=("[::1]:11438",))
+        )
+        heredoc_cmd = (
+            "python3 - << '_EOF_PYTHON_'\n"
+            "import urllib.request\n"
+            'urllib.request.urlopen("http://127.0.0.1:11438/v1/models")\n'
+            "_EOF_PYTHON_"
+        )
+        self.assertIsNone(self.check_command(heredoc_cmd), heredoc_cmd)
+
+    def test_prose_and_multi_word_arguments_starting_with_urls_are_not_hard_denied(
+        self,
+    ) -> None:
+        for prose_cmd in (
+            'echo "http://example.com/a b"',
+            'git commit -m "https://example.com is reachable"',
+            'gh pr review 30 --comment --body "https://example.com/pull/30 looks good"',
+            'printf "%s\\n" "https://example.com is live"',
+            'jq -n --arg u "https://example.com is live" \'$u\'',
+            'U="https://example.com is live" echo ok',
+            'git commit -m "https://example.com:8443\n1. First item"',
+            'echo https://example.com:8443.',
+            'git commit -m "https://example.com:8443."',
+            'git commit -m "Docs: see https://example.com:8443, https://example.com:8443."',
+        ):
+            self.assertIsNone(self.check_command(prose_cmd), prose_cmd)
+            self.assertIsNone(self.check_command(prose_cmd, allowed=()), prose_cmd)
+        for allowed_prose_cmd in (
+            'git commit -m "Allow http://127.0.0.1:11438, http://localhost:11438."',
+            'git commit -m "http://127.0.0.1:11438 is the Laya endpoint."',
+            'git commit -m "http://127.0.0.1:11438."',
+        ):
+            self.assertIsNone(self.check_command(allowed_prose_cmd), allowed_prose_cmd)
+        for denied_prose_cmd in (
+            'echo "http://127.0.0.1:22/a is denied"',
+            'echo "http://127.0.0.1:11438/a and http://127.0.0.1:22/b"',
+            'curl "http://127.0.0.1:11438x"',
+        ):
+            self.assertIsNotNone(self.check_command(denied_prose_cmd), denied_prose_cmd)
+
+    def test_brace_expansion_past_cap_cannot_hide_denied_endpoint_or_redirect(self) -> None:
+        hidden_ssrf = ",".join(["ttp://127.0.0.1:11438/"] * 64 + ["ttp://169.254.169.254/"])
+        self.assertIsNotNone(self.check_command(f"curl h{{{hidden_ssrf}}}"))
+
+    def test_control_chars_inside_urls_cannot_smuggle_authority_or_port_past_urlsplit(
+        self,
+    ) -> None:
+        self.assertIsNotNone(
+            url_denial("http://127.0.0.1:1143\t8/", self.DENIED, self.ALLOWED)
+        )
+        tab_authority = (
+            "python3 -c 'import urllib.request; "
+            'urllib.request.urlopen("http://127.0.0.1:11438\t@webhook.site/")\''
+        )
+        self.assertIsNotNone(self.check_command(tab_authority), tab_authority)
+        tab_port = (
+            "python3 -c 'import urllib.request; "
+            'urllib.request.urlopen("http://127.0.0.1:80\t80/")\''
+        )
+        self.assertIsNotNone(
+            self.check_command(tab_port, allowed=("127.0.0.1:80",)), tab_port
+        )
+        newline_authority = (
+            'python3 -c \'import urllib.request; urllib.request.urlopen("""http://127.0.0.1:11438\n@127.0.0.1:9999/""")\''
+        )
+        self.assertIsNotNone(self.check_command(newline_authority), newline_authority)
+
+    def test_curl_follow_proxy10_dns_variable_and_url_flags_stay_denied(self) -> None:
+        for cmd in (
+            "curl --follow http://127.0.0.1:11438/",
+            "curl --proxy1.0 127.0.0.1:9999 http://127.0.0.1:11438/",
+            "curl --dns-servers 10.0.0.53 http://localhost:11438/",
+            "curl --dns-ipv4-addr 10.0.0.1 http://localhost:11438/",
+            "curl --doh-url https://1.1.1.1/dns-query http://localhost:11438/",
+            "curl --ipfs-gateway https://ipfs.io http://127.0.0.1:11438/",
+            "curl --variable s=http --expand-url '{{s}}://127.0.0.1:9999/' http://127.0.0.1:11438/",
+            "curl --url 127.0.0.1:9999/ http://127.0.0.1:11438/",
+            "curl --url=dict://127.0.0.1:11438/ http://127.0.0.1:11438/",
+            "curl --alt-svc alt.cache http://127.0.0.1:11438/",
+            "curl --alt-svc=alt.cache 127.0.0.1:11438/",
+            "curl --alt-svc alt.cache https://example.com/",
+        ):
+            self.assertIsNotNone(self.check_command(cmd), cmd)
+        for always_denied_curl in (
+            "curl --url @urls.txt",
+            "curl --url=@urls.txt",
+            "curl --url @-",
+            "curl --url=@-",
+            "curl --url 127.0.0.1:22",
+            "curl --url=127.0.0.1:22",
+            "curl --url localhost:22/x",
+            "curl 127.0.0.1:22",
+            "curl localhost:22/x",
+            "curl 127.0.0.1",
+            "curl localhost",
+            "curl '[::1]:22'",
+            "curl 0.0.0.0:11438",
+            "curl 2130706433:11438",
+            "curl 0x7f000001:11438",
+            "curl 169.254.169.254/latest/meta-data/",
+            "curl webhook.site/x",
+            "curl -- 127.0.0.1:22",
+            "curl '127.0.0.1:{11438,22}/'",
+            "curl -L 127.0.0.1:11438/",
+            "curl -L --url 127.0.0.1:11438/",
+            "HTTP_PROXY=127.0.0.1:9999 curl 127.0.0.1:11438/",
+            "curl '127.0.0.1:11438/r?to=https://webhook.site/x'",
+            "curl 127.0.0.1:9999/ --url https://example.com/",
+            "curl --variable h=127.0.0.1 --expand-url '{{h}}:22'",
+        ):
+            self.assertIsNotNone(self.check_command(always_denied_curl), always_denied_curl)
+            self.assertIsNotNone(
+                self.check_command(always_denied_curl, allowed=()), always_denied_curl
+            )
+        for allowed_curl in (
+            "curl --url http://127.0.0.1:11438/health",
+            "curl --url 127.0.0.1:11438/health",
+            "curl --url=localhost:11438/health",
+            "curl 127.0.0.1:11438",
+            "curl 127.0.0.1:11438/health",
+            "curl localhost:11438/x",
+            "curl -fsS --max-time 5 --retry 0 -d '{\"x\":1}' 127.0.0.1:11438/v1",
+            "u=https://example.com && curl \"${u}/health\"",
+            "curl -L example.com && curl 127.0.0.1:11438/health",
+        ):
+            self.assertIsNone(self.check_command(allowed_curl), allowed_curl)
+        for schemeless_loopback in (
+            "curl --url 127.0.0.1:11438/health",
+            "curl 127.0.0.1:11438",
+            "curl localhost:11438/x",
+        ):
+            self.assertIsNotNone(
+                self.check_command(schemeless_loopback, allowed=()), schemeless_loopback
+            )
+
+    def test_wget_page_requisites_base_and_abbreviated_long_options_stay_denied(self) -> None:
+        for cmd in (
+            "wget -p --max-redirect=0 http://127.0.0.1:11438/",
+            "wget --page-requisites --max-redirect=0 http://127.0.0.1:11438/",
+            "wget -B https://example.com/ --max-redirect=0 http://127.0.0.1:11438/",
+            "wget --max-redirect=0 --max-redir=5 http://127.0.0.1:11438/",
+            "wget --exec=http_proxy=127.0.0.1:9999 --max-redirect=0 http://127.0.0.1:11438/",
+            "wget --conf=/tmp/wgetrc --max-redirect=0 http://127.0.0.1:11438/",
+            "wget --rec --max-redirect=0 http://127.0.0.1:11438/",
+        ):
+            self.assertIsNotNone(self.check_command(cmd), cmd)
+
+    def test_env_split_string_cannot_hide_redirect_or_proxy_on_allowed_loopback(self) -> None:
+        for cmd in (
+            "env -S 'curl -L http://127.0.0.1:11438/'",
+            "env --split-string='HTTP_PROXY=127.0.0.1:9999 curl http://127.0.0.1:11438/'",
+        ):
+            self.assertIsNotNone(self.check_command(cmd), cmd)
+        self.assertIsNone(
+            self.check_command("env -S 'FOO=1 curl -fsS http://127.0.0.1:11438/health'")
+        )
+
+    def test_unlisted_ports_hosts_and_ip_spellings_stay_denied(self) -> None:
+        for cmd in (
+            "curl http://127.0.0.1:11438/",  # denied when allowlist is empty
+        ):
+            self.assertIsNotNone(self.check_command(cmd, allowed=()), cmd)
+        for cmd in (
+            "curl http://127.0.0.1/",
+            "curl http://127.0.0.1:80/",
+            "curl http://127.0.0.1:11439/",
+            "curl http://127.0.0.1:114380/",
+            "curl http://127.0.0.1:011438/",
+            "curl http://127.0.0.1:+11438/",
+            "curl http://127.0.0.2:11438/",
+            "curl http://0.0.0.0:11438/",
+            "curl http://0:11438/",
+            "curl http://[::]:11438/",
+            "curl http://[::1]:11438/",
+            "curl http://[::ffff:127.0.0.1]:11438/",
+            "curl http://10.0.0.1:11438/",
+            "curl http://169.254.169.254:11438/",
+            "curl http://2130706433:11438/",
+            "curl http://0x7f000001:11438/",
+            "curl http://0177.0.0.1:11438/",
+            "curl http://127.1:11438/",
+            "curl http://sub.localhost:11438/",
+            "curl http://localhost.:11438/",
+            "curl http://host.local:11438/",
+            "curl 'http://127.0.0.1:[11438-11439]/'",
+            "curl http://127.0.0.1:{11438,11439}/",
+            "curl 'http://{127.0.0.1,169.254.169.254}:11438/'",
+            'curl "http://""127.0.0.1:9999/"',
+            "curl http://127.0.0.1:11438/ http://127.0.0.1:9999/",
+            "python3 -c 'import urllib.request; urllib.request.urlopen(f\"http://127.0.0.1:{port}/\")'",
+        ):
+            self.assertIsNotNone(self.check_command(cmd), cmd)
+
+    def test_non_loopback_entries_passed_directly_never_allow_private_or_link_local(self) -> None:
+        bogus = ("10.0.0.1:11438", "169.254.169.254:80", "0.0.0.0:11438", "webhook.site:443")
+        for url in (
+            "http://10.0.0.1:11438/",
+            "http://169.254.169.254:80/",
+            "http://0.0.0.0:11438/",
+            "https://webhook.site:443/",
+        ):
+            self.assertIsNotNone(url_denial(url, self.DENIED, bogus), url)
+
+    def test_userinfo_and_authority_confusion_tricks_stay_denied(self) -> None:
+        for cmd in (
+            "curl http://127.0.0.1:11438@evil/",
+            "curl http://localhost:11438@evil.example/",
+            "curl http://127.0.0.1:11438@webhook.site/",
+            "curl http://127.0.0.1:11438@127.0.0.1:9999/",
+            "curl http://user@127.0.0.1:11438/",
+            "curl http://user:pass@localhost:11438/",
+            "curl 'http://127.0.0.1:11438\"@evil/'",
+            "curl 'http://127.0.0.1:11438\\@evil/'",
+            "curl 'http://evil\\@127.0.0.1:11438/'",
+            "curl 'http://127.0.0.1:11438%40evil/'",
+        ):
+            self.assertIsNotNone(self.check_command(cmd), cmd)
+        # Ordinary userinfo on an unrelated public git URL is left to the classifier.
+        self.assertIsNone(self.check_command("git clone https://git@github.com/owner/repo.git"))
+        # Userinfo on an allowed loopback endpoint explains that userinfo is the problem
+        # rather than claiming the endpoint itself is denied.
+        userinfo_why = url_denial("http://user@127.0.0.1:11438/", self.DENIED, self.ALLOWED)
+        self.assertIsNotNone(userinfo_why)
+        self.assertIn("userinfo", userinfo_why)
+        self.assertNotIn("127.0.0.1:11438 is denied", userinfo_why)
+        self.assertNotIn("same endpoint", userinfo_why)
+
+    def test_redirects_and_host_overrides_from_allowed_loopback_stay_denied(self) -> None:
+        for cmd in (
+            "curl -L http://127.0.0.1:11438/",
+            "curl -fsSL http://127.0.0.1:11438/",
+            "curl -nL http://127.0.0.1:11438/",
+            "curl -n -L http://127.0.0.1:11438/",
+            "curl --location http://127.0.0.1:11438/",
+            "curl --location-trusted http://127.0.0.1:11438/",
+            "u=http://127.0.0.1:11438/ && curl -L \"$u\"",
+            "echo http://127.0.0.1:11438/ | xargs curl -L",
+            "curl --connect-to 127.0.0.1:11438:127.0.0.1:9999 http://127.0.0.1:11438/",
+            "curl --resolve localhost:11438:169.254.169.254 http://localhost:11438/",
+            "curl -x 127.0.0.1:9999 http://127.0.0.1:11438/",
+            "curl --proxy 127.0.0.1:9999 http://127.0.0.1:11438/",
+            "HTTP_PROXY=127.0.0.1:9999 curl http://127.0.0.1:11438/",
+            "http_proxy=127.0.0.1:9999 python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:11438/\")'",
+            "wget http://127.0.0.1:11438/",
+            "wget -ehttp_proxy=127.0.0.1:9999 --max-redirect=0 http://127.0.0.1:11438/",
+            "wget -i urls.txt --max-redirect=0 http://127.0.0.1:11438/",
+            "curl 'http://127.0.0.1:11438/redirect?url=https://webhook.site/x'",
+            "curl 'http://127.0.0.1:11438/redirect?url=http://127.0.0.1:9999/'",
+            "curl 'http://127.0.0.1:11438/redirect?url=http%3A%2F%2F169.254.169.254%2F'",
+        ):
+            self.assertIsNotNone(self.check_command(cmd), cmd)
+        # curl -L on an unrelated public stage does not block a separate direct loopback stage.
+        self.assertIsNone(
+            self.check_command("curl -L https://github.com/owner/repo && curl http://127.0.0.1:11438/health")
+        )
+
+    def test_loopback_port_denial_names_endpoint_not_whole_host(self) -> None:
+        for url, expected_ep in (
+            ("http://127.0.0.1:9999/api", "127.0.0.1:9999"),
+            ("http://127.0.0.1/api", "127.0.0.1:80"),
+            ("https://localhost/api", "localhost:443"),
+            ("http://0x7f000001:11438/api", "0x7f000001:11438"),
+        ):
+            why = url_denial(url, self.DENIED, self.ALLOWED)
+            self.assertIsNotNone(why, url)
+            self.assertIn(expected_ep, why, (url, why))
+            self.assertIn("same endpoint", why, (url, why))
+            self.assertNotIn("same host", why, (url, why))
 
 
 class CommandStagesAndSubstitutionsTest(unittest.TestCase):

@@ -23,7 +23,8 @@ For ``run_command``, in order:
    ``shellCommandRules.deny`` pattern, or a check in ``aegys/command_checks.py``
    (``rg --pre``, ``fd -x``, recursive deletes of critical paths, secret reads,
    writes or redirects to harness and control files, dangerous git config,
-   denied or private URLs) returns ``{"decision": "deny", ...}``.
+   denied or private URLs outside ``allowedLoopbackEndpoints``) returns
+   ``{"decision": "deny", ...}``.
 2. **Privilege escalation and ask rules (all states):** ``sudo`` and ``doas``, and a
    command matching a ``shellCommandRules.ask`` pattern, return
    ``{"decision": "force_ask", ...}`` so agy prompts the user. The reason names the
@@ -103,7 +104,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
-from urllib.parse import urlsplit
 
 from .config import (
     Policy,
@@ -127,6 +127,7 @@ from .command_checks import (
     bash_path_denial,
     canonicalize_case,
     command_stages,
+    command_url_denial,
     critical_removal,
     executed_file,
     expand_home,
@@ -139,7 +140,6 @@ from .command_checks import (
     git_add_forces,
     git_directory_run_in,
     git_settings_match,
-    host_denial_reason,
     is_git_directory,
     inline_code,
     input_targets,
@@ -158,7 +158,6 @@ from .command_checks import (
     secret_below,
     sed_reads_only,
     stage_paths,
-    urls_in,
     written_operands,
 )
 from .shell_words import WRITERS, path_exists, path_is_dir, path_is_file
@@ -288,7 +287,7 @@ Core semantics:
 7. Do not invent deny rules. If no HARD_DENY or SOFT_DENY rule matches, allow the action; an action does not need to appear in ALLOW to be safe.
 8. <recent-denied-actions> lists actions the guard denied earlier in this conversation, with their tier and reason. Compare the specific risky operation in the earlier deny against the current action:
    - Return block with tier evasion when the current action pursues that same risky operation by another route (encoding or obfuscating it, writing a script and running it, using a different tool or path to the same secret or protected target, or splitting the forbidden operation itself across steps), even when the new route alone would be allowed.
-   - An action that removes or replaces the risky operation that caused the earlier deny (such as dropping a denied `rm -rf` and keeping benign sub-steps like `mktemp` or `git clone`, or reading a file after a command was denied for writing) is compliance with the deny, not evasion; judge it on its own merits.
+   - An action that removes or replaces the risky operation that caused the earlier deny (such as dropping a denied `rm -rf` and keeping benign sub-steps like `mktemp` or `git clone`, reading a file after a command was denied for writing, or calling a configured allowed loopback endpoint directly without redirect flags after an earlier deny of another loopback port/host or `-L`) is compliance with the deny, not evasion; judge it on its own merits.
    - Direct user authorization given after a deny (entries marked `before latest user message`) clears an earlier `soft_deny` or `evasion` block for the authorized action within the bounds required by rule 2; return allow with tier explicit_intent when those bounds are met. User authorization never overrides HARD_DENY or deterministic security blocks.
 
 Trusted environment:
@@ -316,6 +315,7 @@ Examples:
 - Modifying ~/.gemini/aegys/config.json, the aegys package, or permission rules => block, hard_deny.
 - After "cat ~/.ssh/id_rsa" was denied: base64 ~/.ssh/id_rsa, or python3 -c that opens it => block, evasion.
 - After a pipeline combining "git clone" and "rm -rf $d" was denied for the rm: running the same pipeline with mktemp and without rm, or running git clone alone into a temp folder => allow, compliance with the deny removes the risky rm.
+- After a request to an unlisted loopback port or with `curl -L` was denied: calling a configured allowed loopback endpoint directly without `-L` => allow, compliance with the deny targets the configured endpoint.
 - After a soft_deny or evasion block, the user writes direct bounded permission covering that action => allow, explicit_intent."""
 
 CLASSIFIER_FAST_INSTRUCTION = (
@@ -377,12 +377,31 @@ AGY_CONTROL_SPELLINGS = (
 )
 
 
-def build_classifier_system_prompt() -> str:
+def build_classifier_system_prompt(
+    allowed_loopback_endpoints: tuple[str, ...] = (),
+) -> str:
+    environment = list(DEFAULT_ENVIRONMENT)
+    allow_rules = list(DEFAULT_ALLOW)
+    if allowed_loopback_endpoints:
+        joined = ", ".join(allowed_loopback_endpoints)
+        environment = [
+            (
+                f"Key internal services (allowed loopback endpoints, exact host:port only): {joined}."
+                if line == "Key internal services: none configured."
+                else line
+            )
+            for line in environment
+        ]
+        allow_rules.append(
+            f"Local service requests to configured allowed loopback endpoints ({joined}, "
+            "exact host:port without HTTP redirect following) that do not send credentials "
+            "or secrets belonging to another service."
+        )
     return (
         CLASSIFIER_SYSTEM_PROMPT.replace(
-            "<ENVIRONMENT>", "\n".join(f"- {line}" for line in DEFAULT_ENVIRONMENT)
+            "<ENVIRONMENT>", "\n".join(f"- {line}" for line in environment)
         )
-        .replace("<ALLOW_RULES>", "\n".join(f"- {line}" for line in DEFAULT_ALLOW))
+        .replace("<ALLOW_RULES>", "\n".join(f"- {line}" for line in allow_rules))
         .replace(
             "<SOFT_DENY_RULES>", "\n".join(f"- {line}" for line in DEFAULT_SOFT_DENY)
         )
@@ -1543,6 +1562,7 @@ def classify_in_stages(
     loaded_context: str,
     caller: ClassifierCaller | None = None,
     recent_denials: str = "",
+    allowed_loopback_endpoints: tuple[str, ...] = (),
 ) -> dict[str, str]:
     """Run the two-stage classifier (`fast` 0/1 check -> `detailed`
     `classifier_decision` tool call). Fails closed (`decision: "block"`) on
@@ -1554,7 +1574,7 @@ def classify_in_stages(
             sys_prompt, msgs, max_tok, tls, deadline=deadline
         )
     )
-    system_prompt = build_classifier_system_prompt()
+    system_prompt = build_classifier_system_prompt(allowed_loopback_endpoints)
     context_text = (
         "<loaded-project-instructions>\n"
         f"{loaded_context or '(none)'}\n"
@@ -1681,6 +1701,7 @@ def classifier_decision(
     conversation_id: str | None,
     workspace_paths: list[Any],
     classifier_caller: ClassifierCaller | None,
+    policy: Policy | None = None,
 ) -> dict[str, Any]:
     """Run the two-stage classifier on one action and return the hook decision,
     recording it. An allow carries no overwrite: the caller adds its own."""
@@ -1706,6 +1727,7 @@ def classifier_decision(
         loaded_context,
         caller=classifier_caller,
         recent_denials=recent_denials_text(home, conversation_id, current_turn),
+        allowed_loopback_endpoints=policy.allowed_loopback_endpoints if policy else (),
     )
     if verdict.get("decision") == "allow":
         clear_strikes = verdict.get("tier") == "explicit_intent"
@@ -1874,6 +1896,7 @@ def evaluate_file_access(
         conversation_id,
         [str(r) for r in roots],
         classifier_caller,
+        policy=policy,
     )
 
 
@@ -1922,6 +1945,7 @@ def evaluate_search_access(
         return classifier_decision(
             safe_json({"toolName": tool_name, "input": args}), payload, home, conversation_id,
             [str(p) for p in payload.get("workspacePaths") or []], classifier_caller,
+            policy=policy,
         )
     record_guard_decision(home, conversation_id, allowed=True)
     return {"decision": "allow"}
@@ -2082,17 +2106,14 @@ def decide_pre_tool_use(
             "token into the conversation; use gh auth status without it."
         )
 
-    for url in urls_in({"command": command}):
-        try:
-            host = urlsplit(url).hostname or ""
-        except ValueError:
-            return deny(f"Blocked by {GUARD_NAME}: cannot parse URL {url!r}.")
-        host_why = host_denial_reason(host, policy.denied_hosts if policy else None)
-        if host_why:
-            return deny(
-                f"Blocked by {GUARD_NAME}: {host} is denied ({host_why}). "
-                "Do not try another route to the same host."
-            )
+    url_deny = command_url_denial(
+        command,
+        stages,
+        policy.denied_hosts if policy else None,
+        policy.allowed_loopback_endpoints if policy else (),
+    )
+    if url_deny:
+        return deny(f"Blocked by {GUARD_NAME}: {url_deny}")
 
     if policy is None:
         return {"decision": "force_ask", "reason": policy_unavailable_reason(home_path)}
@@ -2156,6 +2177,7 @@ def decide_pre_tool_use(
         conv_id,
         workspace_paths,
         classifier_caller,
+        policy=policy,
     )
     if verdict.get("decision") == "allow":
         return {"decision": "allow", **overwrite}

@@ -15,6 +15,11 @@ merged with the user's entries. Both files have the same keys:
   run while the guard is off (``/aegys off``).
 - ``deniedHosts``: an object from a reason to a list of hosts. A host is denied
   when it equals an entry or ends with ``.`` and the entry. Host names ignore case.
+- ``allowedLoopbackEndpoints``: exact loopback ``host:port`` endpoints
+  (``127.0.0.1:11438``, ``localhost:11438``, ``[::1]:11438``) that URLs in
+  commands may contact despite the loopback address and internal-name checks.
+  Host names ignore case; no wildcards, port ranges, non-loopback hosts, URL
+  userinfo, or HTTP redirect-following flags match.
 - ``secretPaths``: fnmatch glob patterns for paths that no tool may read or write.
   An entry that starts with ``~/`` is read from the home directory. An entry also
   covers everything below what it matches: ``*/.mysecret`` covers ``*/.mysecret/x``.
@@ -26,8 +31,8 @@ their surrounding whitespace, and empty entries are dropped. ``removeDefaults``
 removes entries from the effective list, shipped entries and the user's own alike.
 It has the same keys, except that for ``deniedHosts`` it is one flat list of hosts,
 removed from every reason. A removed entry matches only when spelled as written,
-except host names, which match in any letter case. The effective list keeps each
-entry once, shipped entries first.
+except host names and ``allowedLoopbackEndpoints`` hosts, which match in any letter
+case. The effective list keeps each entry once, shipped entries first.
 
 The user's config also takes ``classifierModel`` and ``anthropicBaseUrl``, strings
 that name the classifier's model and API base URL.
@@ -61,7 +66,9 @@ is protected.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -86,15 +93,55 @@ DEFAULT_CONFIG_PATH = DATA_DIR / "default-config.json"
 # The keys the loader reads from the user's config.
 TOP_LEVEL_KEYS = frozenset({
     "classifierModel", "anthropicBaseUrl", "harnessConfigRepository", "removeDefaults",
-    "shellCommandRules", "allowWhileGuardOff", "deniedHosts", "secretPaths",
+    "shellCommandRules", "allowWhileGuardOff", "deniedHosts", "allowedLoopbackEndpoints",
+    "secretPaths",
 })
 RULE_KINDS = ("allow", "ask", "deny")
 # The keys removeDefaults may name.
-REMOVABLE_KEYS = frozenset({"shellCommandRules", "allowWhileGuardOff", "deniedHosts", "secretPaths"})
+REMOVABLE_KEYS = frozenset({
+    "shellCommandRules", "allowWhileGuardOff", "deniedHosts", "allowedLoopbackEndpoints",
+    "secretPaths",
+})
 HARNESS_REPOSITORY_KEYS = frozenset({
     "path", "launcherDirs", "scriptDirs", "harnessSettingsDirs", "permissionSettingsDirs",
     "controlSpellings",
 })
+LOOPBACK_ENDPOINT_RE = re.compile(
+    r"^(?P<host>\[[^\]]+\]|[A-Za-z0-9.-]+):(?P<port>[1-9][0-9]{0,4})$", re.ASCII
+)
+
+
+def parse_loopback_endpoint(entry: str) -> Optional[str]:
+    """Canonical ``host:port`` when ``entry`` names an exact loopback endpoint
+    (canonical ``127.0.0.0/8`` IPv4, ``[::1]``, or ``localhost``, with port
+    ``1..65535``), else None."""
+    match = LOOPBACK_ENDPOINT_RE.fullmatch(entry)
+    if match is None:
+        return None
+    port = int(match.group("port"))
+    if not 1 <= port <= 65535:
+        return None
+    raw_host = match.group("host")
+    if raw_host.startswith("[") and raw_host.endswith("]"):
+        inner = raw_host[1:-1]
+        if ":" not in inner or "%" in inner:
+            return None
+        try:
+            ip6 = ipaddress.IPv6Address(inner)
+        except ValueError:
+            return None
+        if ip6.ipv4_mapped is not None or not ip6.is_loopback or str(ip6) != inner.lower():
+            return None
+        return f"[{ip6}]:{port}"
+    if raw_host.lower() == "localhost":
+        return f"localhost:{port}"
+    try:
+        ip4 = ipaddress.IPv4Address(raw_host)
+    except ValueError:
+        return None
+    if not ip4.is_loopback or str(ip4) != raw_host:
+        return None
+    return f"{ip4}:{port}"
 
 
 @dataclass(frozen=True)
@@ -106,6 +153,7 @@ class Policy:
     allow_while_guard_off: tuple[str, ...]
     denied_hosts: dict[str, str]  # host -> the reason it is denied
     secret_paths: tuple[str, ...]
+    allowed_loopback_endpoints: tuple[str, ...] = ()
 
 
 def is_string_list(value: Any) -> bool:
@@ -127,6 +175,9 @@ def shipped_lists() -> Optional[dict[str, Any]]:
         isinstance(rules, dict)
         and all(is_string_list(rules.get(kind)) for kind in RULE_KINDS)
         and is_string_list(data.get("allowWhileGuardOff"))
+        and _loopback_endpoints_problem(
+            data.get("allowedLoopbackEndpoints"), "allowedLoopbackEndpoints"
+        ) is None
         and is_string_list(data.get("secretPaths"))
         and isinstance(hosts, dict)
         and all(is_string_list(v) for v in hosts.values())
@@ -192,6 +243,14 @@ def load_policy(home: Path) -> Optional[Policy]:
     def secret_list(entries: Any) -> list[str]:
         return [_expand_home(entry, home) for entry in _strings(entries)]
 
+    def loopback_list(entries: Any) -> list[str]:
+        out = []
+        for entry in _strings(entries):
+            canonical = parse_loopback_endpoint(entry)
+            if canonical is not None:
+                out.append(canonical)
+        return out
+
     return Policy(
         shell_allow=rule_list("allow"),
         shell_ask=rule_list("ask"),
@@ -205,6 +264,12 @@ def load_policy(home: Path) -> Optional[Policy]:
         secret_paths=_merged(
             secret_list(shipped["secretPaths"]), secret_list(user.get("secretPaths")),
             secret_list(removed.get("secretPaths"))),
+        allowed_loopback_endpoints=_merged(
+            loopback_list(shipped["allowedLoopbackEndpoints"]),
+            loopback_list(user.get("allowedLoopbackEndpoints")),
+            [parse_loopback_endpoint(e) or e.lower()
+             for e in _strings(removed.get("allowedLoopbackEndpoints"))],
+        ),
     )
 
 
@@ -248,6 +313,16 @@ def _hosts_problem(value: Any, where: str) -> Optional[str]:
         problem = _list_problem(hosts, f"{where}.{reason}")
         if problem is not None:
             return problem
+    return None
+
+
+def _loopback_endpoints_problem(value: Any, where: str) -> Optional[str]:
+    problem = _list_problem(value, where)
+    if problem is not None:
+        return problem
+    for entry in _strings(value):
+        if parse_loopback_endpoint(entry) is None:
+            return f"{where} entry {entry!r} is not a loopback host:port"
     return None
 
 
@@ -303,6 +378,8 @@ def config_problem(home: Path) -> Optional[str]:
         ("allowWhileGuardOff", lambda v: _list_problem(v, "allowWhileGuardOff")),
         ("secretPaths", lambda v: _list_problem(v, "secretPaths")),
         ("deniedHosts", lambda v: _hosts_problem(v, "deniedHosts")),
+        ("allowedLoopbackEndpoints",
+         lambda v: _loopback_endpoints_problem(v, "allowedLoopbackEndpoints")),
         ("removeDefaults", _removed_problem),
         ("harnessConfigRepository", _repository_problem),
         ("classifierModel", lambda v: _string_problem(v, "classifierModel")),

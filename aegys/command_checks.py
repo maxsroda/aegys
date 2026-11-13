@@ -1,8 +1,8 @@
 """Deterministic checks on shell commands, file paths and URLs, for the aegys guard.
 
 guard.py runs these checks before it decides a command. Checks 1 and 3, and the
-address test of check 4, are fixed in code. Check 2 and the host names of check 4
-come from the policy lists (see ``aegys/config.py``):
+address test of check 4, are fixed in code. Check 2 and the host and loopback
+endpoint lists of check 4 come from the policy (see ``aegys/config.py``):
 
 1. ``rg --pre CMD`` and ``fd -x CMD``: flags that run a command on every file.
    The check sees the flag anywhere in its stage of the command.
@@ -11,8 +11,9 @@ come from the policy lists (see ``aegys/config.py``):
 3. Control files: a write, redirect or inline code that names one changes what
    the harnesses, git or this guard run or allow, so it is denied. So are a
    recursive delete of a critical path and git settings that can run a program.
-4. URLs: each URL in a command is checked against the policy's ``deniedHosts``
-   and against private, loopback, link-local and metadata addresses (SSRF).
+4. URLs: each URL in a command is checked against exact ``host:port`` matches in
+   ``allowedLoopbackEndpoints``, then against the policy's ``deniedHosts`` and
+   against private, loopback, link-local and metadata addresses (SSRF).
 
 Commands are split into stages by ``aegys/shell_words.py``. Directory changes
 inside the command are followed.
@@ -31,12 +32,14 @@ import itertools
 import os
 import re
 import shlex
+import socket
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
-from .config import Policy, harness_config_repository
+from .config import Policy, harness_config_repository, parse_loopback_endpoint
 from .shell_words import (
     FIND_WRITE_FLAGS, PRINTERS, PUNCTUATION, READERS, SEARCHERS, SEPARATOR_CHARS,
     SHELLS, WRITERS, brace_expansions, git_config_writes, git_subcommand_index,
@@ -2937,7 +2940,8 @@ def bash_path_denial(command: str, cwd: Path, home: Path,
 
 # --- URLs: hosts no tool may contact --------------------------------------------
 # A host matches if it equals an entry or ends with "." + entry. The listed hosts
-# are the policy's deniedHosts (see aegys/config.py).
+# are the policy's deniedHosts, and exact loopback host:port exceptions come from
+# allowedLoopbackEndpoints (see aegys/config.py).
 
 # Names that resolve inside this machine's own network or to cloud metadata.
 # web_fetch runs locally, so a URL here reaches services the model should not.
@@ -2945,33 +2949,162 @@ INTERNAL_HOST_SUFFIXES = [
     "localhost", "local", "internal", "lan", "home.arpa", "metadata.google.internal",
 ]
 INTERNAL_REASON = "internal / private network name"
+ADDRESS_REASON = "private, loopback, link-local or metadata address"
 
 # "]" stays inside a URL so bracketed IPv6 hosts like http://[::1]/ survive.
 URL_PATTERN = re.compile(r"https?://[^\s'\"<>`)}]+", re.IGNORECASE)
+URL_CONT_PATTERN = re.compile(r"(?:[\t\r\n]*[^\s'\"<>`)}]+)+")
+HTTP_SCHEME_PREFIX = re.compile(r"^https?://", re.IGNORECASE)
+INET_ATON_PART = re.compile(r"^(?:[0-9]+|0[xX][0-9A-Fa-f]+)$")
+PROXY_ENV_VAR = re.compile(r"^(?:https?_proxy|all_proxy)=(.+)$", re.IGNORECASE)
+BRACE_EXPANSION_CAP = 64
+CURL_VALUED_SHORT = frozenset("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+CURL_VALUED_LONG = frozenset({
+    "--abstract-unix-socket", "--alt-svc", "--aws-sigv4", "--cacert", "--capath",
+    "--cert", "--cert-type", "--ciphers", "--config", "--connect-timeout",
+    "--connect-to", "--continue-at", "--cookie", "--cookie-jar", "--create-file-mode",
+    "--crlfile", "--curves", "--data", "--data-ascii", "--data-binary", "--data-raw",
+    "--data-urlencode", "--delegation", "--dns-interface", "--dns-ipv4-addr",
+    "--dns-ipv6-addr", "--dns-servers", "--doh-url", "--dump-header", "--ech",
+    "--egd-file", "--engine", "--etag-compare", "--etag-save", "--expect100-timeout",
+    "--form", "--form-string", "--ftp-account", "--ftp-alternative-to-user",
+    "--ftp-method", "--ftp-port", "--ftp-ssl-ccc-mode", "--happy-eyeballs-timeout-ms",
+    "--haproxy-clientip", "--header", "--hostpubmd5", "--hostpubsha256", "--hsts",
+    "--interface", "--ip-tos", "--ipfs-gateway", "--json", "--keepalive-cnt",
+    "--keepalive-time", "--key", "--key-type", "--knownhosts", "--krb", "--libcurl",
+    "--limit-rate", "--local-port", "--login-options", "--mail-auth", "--mail-from",
+    "--mail-rcpt", "--max-filesize", "--max-redirs", "--max-time", "--netrc-file",
+    "--noproxy", "--oauth2-bearer", "--output", "--output-dir", "--parallel-max",
+    "--parallel-max-host", "--pass", "--pinnedpubkey", "--preproxy", "--proto",
+    "--proto-default", "--proto-redir", "--proxy", "--proxy-cacert", "--proxy-capath",
+    "--proxy-cert", "--proxy-cert-type", "--proxy-ciphers", "--proxy-crlfile",
+    "--proxy-header", "--proxy-key", "--proxy-key-type", "--proxy-pass",
+    "--proxy-pinnedpubkey", "--proxy-service-name", "--proxy-tls13-ciphers",
+    "--proxy-tlsauthtype", "--proxy-tlspassword", "--proxy-tlsuser", "--proxy-user",
+    "--proxy1.0", "--pubkey", "--quote", "--random-file", "--range", "--rate",
+    "--referer", "--request", "--request-target", "--resolve", "--retry",
+    "--retry-delay", "--retry-max-time", "--sasl-authzid", "--service-name",
+    "--sigalgs", "--socks4", "--socks4a", "--socks5", "--socks5-gssapi-service",
+    "--socks5-hostname", "--speed-limit", "--speed-time", "--ssl-sessions",
+    "--stderr", "--telnet-option", "--tftp-blksize", "--time-cond", "--tls-max",
+    "--tls13-ciphers", "--tlsauthtype", "--tlspassword", "--tlsuser", "--trace",
+    "--trace-ascii", "--trace-config", "--unix-socket", "--upload-file",
+    "--upload-flags", "--url", "--url-query", "--user", "--user-agent", "--variable",
+    "--vlan-priority", "--write-out",
+})
+CURL_BLOCKED_LONG = frozenset({
+    "--proxy", "--proxy1.0", "--preproxy",
+    "--socks4", "--socks4a", "--socks5", "--socks5-hostname",
+    "--connect-to", "--resolve", "--alt-svc",
+    "--unix-socket", "--abstract-unix-socket",
+    "--dns-servers", "--dns-ipv4-addr", "--dns-ipv6-addr", "--dns-interface",
+    "--doh-url", "--ipfs-gateway",
+    "--config", "--variable",
+})
+WGET_BLOCKED_LONG_PREFIXES = (
+    ("--execute", "--exe"),
+    ("--config", "--conf"),
+    ("--input-file", "--inp"),
+    ("--input-metalink", "--input-m"),
+    ("--metalink-over-http", "--meta"),
+    ("--recursive", "--rec"),
+    ("--mirror", "--mi"),
+    ("--span-hosts", "--spa"),
+    ("--page-requisites", "--pag"),
+    ("--dns-servers", "--dns-s"),
+    ("--base", "--bas"),
+    ("--follow-ftp", "--follow-f"),
+    ("--follow-tags", "--follow-t"),
+)
+
+
+def _ip_is_denied(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_multicast
+    )
+
+
+def _ip_is_loopback(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return False
+    return ip.is_loopback
+
+
+def _is_loopback_host(host: str) -> bool:
+    raw = host.lower().rstrip(".")
+    if raw == "localhost":
+        return True
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    if "%" in raw:
+        return False
+    try:
+        ip = ipaddress.ip_address(raw)
+    except ValueError:
+        ip = None
+    if ip is None and ":" not in raw:
+        parts = raw.split(".")
+        if 1 <= len(parts) <= 4 and all(INET_ATON_PART.fullmatch(p) for p in parts):
+            try:
+                ip = ipaddress.IPv4Address(socket.inet_aton(raw))
+            except OSError:
+                return False
+    return ip is not None and _ip_is_loopback(ip)
 
 
 def host_denial_reason(host: str, denied_hosts: dict[str, str] | None) -> str | None:
-    """Why a host must not be contacted, or None. Private, loopback, link-local and
-    reserved addresses are always denied. Then the names: those of denied_hosts (host
-    to reason, from the policy) and the internal suffixes. Without a policy,
-    denied_hosts is None and only the address check and the internal suffixes apply."""
-    host = host.lower().rstrip(".")
-    if not host:
+    """Why a host must not be contacted, or None. Private, loopback, link-local,
+    unspecified, multicast and reserved addresses (including non-canonical IPv4
+    spellings ``inet_aton`` accepts and IPv6 zone IDs) are always denied. Then the
+    names: those of denied_hosts (host to reason, from the policy) and the internal
+    suffixes. Without a policy, denied_hosts is None and only the address check and
+    the internal suffixes apply."""
+    raw = host.lower()
+    if not raw.rstrip("."):
         return None
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
+    if raw.startswith("["):
+        if not raw.endswith("]"):
+            return "malformed IPv6 address"
+        inner = raw[1:-1]
+        if ":" not in inner:
+            return "malformed IPv6 address"
+        addr_text = inner.split("%", 1)[0]
+        try:
+            ip6 = ipaddress.IPv6Address(addr_text)
+        except ValueError:
+            return "malformed IPv6 address"
+        if "%" in inner or _ip_is_denied(ip6):
+            return ADDRESS_REASON
+        return None
+    if "]" in raw:
+        return "malformed host"
+    candidate = raw.rstrip(".")
+    addr_candidate = candidate.split("%", 1)[0] if ":" in candidate and "%" in candidate else candidate
     try:
-        ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(addr_candidate)
     except ValueError:
         ip = None
+    if ip is None and ":" not in candidate:
+        parts = candidate.split(".")
+        if 1 <= len(parts) <= 4 and all(INET_ATON_PART.fullmatch(p) for p in parts):
+            try:
+                ip = ipaddress.IPv4Address(socket.inet_aton(candidate))
+            except OSError:
+                return "malformed IP address"
     if ip is not None:
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            return "private, loopback, link-local or metadata address"
-        return None
+        if "%" in candidate or _ip_is_denied(ip):
+            return ADDRESS_REASON
     names = (*(denied_hosts or {}).items(),
              *((name, INTERNAL_REASON) for name in INTERNAL_HOST_SUFFIXES))
     for denied, why in names:
-        if host == denied or host.endswith("." + denied):
+        if candidate == denied or candidate.endswith("." + denied):
             return why
     return None
 
@@ -2988,10 +3121,555 @@ def iter_strings(value: Any):
             yield from iter_strings(v)
 
 
+def _embedded_urls(url: str) -> list[str]:
+    """Any full http(s) URLs embedded in ``url`` past its own scheme, raw or
+    percent-encoded (up to two decoding passes), in order without duplicates."""
+    if "://" not in url:
+        return []
+    remainder = url.split("://", 1)[1]
+    seen: dict[str, None] = {}
+    current = remainder
+    for _ in range(3):
+        for nested in URL_PATTERN.findall(current):
+            trimmed = nested.rstrip(".,;!?")
+            if trimmed:
+                seen.setdefault(trimmed, None)
+        decoded = unquote(current)
+        if decoded == current:
+            break
+        current = decoded
+    return list(seen)
+
+
 def urls_in(tool_input: dict[str, Any]):
-    """Every full http(s) URL in the strings of a tool input."""
+    """Every full http(s) URL in the strings of a tool input, including nested
+    or percent-encoded http(s) URLs in query strings and paths."""
     for text in iter_strings(tool_input):
-        yield from URL_PATTERN.findall(text)
+        for match in URL_PATTERN.finditer(text):
+            url = match.group(0)
+            start, end = match.start(), match.end()
+            if (
+                url.endswith("\\")
+                and start >= 2
+                and end < len(text)
+                and text[end] in ('"', "'")
+                and text[start - 2 : start] == "\\" + text[end]
+            ):
+                url = url[:-1]
+            if (
+                end == len(text)
+                or text[end].isspace()
+                or text[end] in ('"', "'", ")", "}", ">", "`")
+            ):
+                url = url.rstrip(".,;!?")
+            yield url
+            for nested in _embedded_urls(url):
+                yield nested
+            if end < len(text) and text[end] in "\t\r\n" and "://" in url:
+                after_scheme = url.split("://", 1)[1]
+                authority_only = (
+                    "/" not in after_scheme
+                    and "?" not in after_scheme
+                    and "#" not in after_scheme
+                )
+                ws_end = end
+                while ws_end < len(text) and text[ws_end] in "\t\r\n":
+                    ws_end += 1
+                if authority_only and ws_end < len(text) and (
+                    text[ws_end] in "@:"
+                    or (
+                        text[ws_end].isdigit()
+                        and (
+                            "\n" not in text[end:ws_end]
+                            or _is_loopback_host(after_scheme.split(":", 1)[0])
+                        )
+                    )
+                ):
+                    tail = URL_CONT_PATTERN.match(text, ws_end)
+                    if tail:
+                        joined = (
+                            url
+                            + tail.group(0)
+                            .replace("\t", "")
+                            .replace("\r", "")
+                            .replace("\n", "")
+                        )
+                        yield joined
+                        for nested in _embedded_urls(joined):
+                            yield nested
+
+
+def _canonical_allowed_endpoints(
+    allowed_loopback_endpoints: tuple[str, ...] | list[str] | frozenset[str],
+) -> frozenset[str]:
+    return frozenset(
+        ep
+        for entry in allowed_loopback_endpoints
+        for ep in (parse_loopback_endpoint(entry),)
+        if ep is not None
+    )
+
+
+def _url_has_unsafe_chars(url: str) -> bool:
+    return any(ord(ch) <= 32 or ord(ch) == 127 for ch in url)
+
+
+def _netloc_is_clean(netloc: str) -> bool:
+    if not netloc:
+        return False
+    for ch in netloc:
+        if ord(ch) <= 32 or ord(ch) >= 127 or ch in '\\"\'<>`{}':
+            return False
+    return True
+
+
+def _allowed_loopback_match(url: str, allowed_set: frozenset[str]) -> str | None:
+    """Canonical ``host:port`` if ``url`` targets an entry of ``allowed_set`` cleanly."""
+    if not allowed_set or _url_has_unsafe_chars(url):
+        return None
+    try:
+        parts = urlsplit(url)
+        _ = parts.port
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not _netloc_is_clean(parts.netloc):
+        return None
+    canonical = parse_loopback_endpoint(parts.netloc)
+    return canonical if canonical in allowed_set else None
+
+
+def url_denial(
+    url: str,
+    denied_hosts: dict[str, str] | None,
+    allowed_loopback_endpoints: tuple[str, ...] | list[str] | frozenset[str] = (),
+) -> str | None:
+    """Why ``url`` must not be contacted, or None when allowed past the URL check."""
+    if _url_has_unsafe_chars(url):
+        return f"cannot parse URL {url!r}."
+    allowed_set = _canonical_allowed_endpoints(allowed_loopback_endpoints)
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return f"cannot parse URL {url!r}."
+    if parts.scheme.lower() not in ("http", "https") or not _netloc_is_clean(parts.netloc):
+        return f"cannot parse URL {url!r}."
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo_raw, host_part = netloc.rsplit("@", 1)
+    else:
+        userinfo_raw, host_part = "", netloc
+    if "%" in host_part or not (parts.hostname or ""):
+        return f"cannot parse URL {url!r}."
+    if not userinfo_raw:
+        canonical = parse_loopback_endpoint(host_part)
+        if canonical is not None and canonical in allowed_set:
+            return None
+    else:
+        for segment in userinfo_raw.split("@"):
+            for candidate_seg in dict.fromkeys((segment, unquote(segment))):
+                if candidate_seg.startswith("[") and "]" in candidate_seg:
+                    cand_host = candidate_seg[: candidate_seg.index("]") + 1]
+                else:
+                    cand_host = candidate_seg.split(":", 1)[0]
+                spoof_why = host_denial_reason(cand_host, denied_hosts)
+                if spoof_why:
+                    return (
+                        f"URL {url!r} embeds denied or internal host {cand_host!r} in userinfo "
+                        f"({spoof_why}). Remove userinfo from the URL."
+                    )
+        canonical = parse_loopback_endpoint(host_part)
+        if canonical is not None and canonical in allowed_set:
+            return (
+                f"URL {url!r} includes userinfo on allowed loopback endpoint {canonical}, "
+                "which is not allowed. Retry without userinfo."
+            )
+    raw_host = (
+        host_part[: host_part.index("]") + 1]
+        if host_part.startswith("[") and "]" in host_part
+        else host_part.split(":", 1)[0]
+    )
+    display_host = parts.hostname or raw_host
+    host_why = host_denial_reason(raw_host, denied_hosts)
+    if host_why is None:
+        return None
+    if _is_loopback_host(raw_host):
+        effective_port = (
+            port if port is not None else (443 if parts.scheme.lower() == "https" else 80)
+        )
+        target = f"{raw_host.lower().rstrip('.')}:{effective_port}"
+        return f"{target} is denied ({host_why}). Do not try another route to the same endpoint."
+    return f"{display_host} is denied ({host_why}). Do not try another route to the same host."
+
+
+def _curl_loopback_flag_denial(
+    args: list[str],
+    denied_hosts: dict[str, str] | None,
+    allowed_set: frozenset[str],
+) -> str | None:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            opt = arg.split("=", 1)[0]
+            if opt in ("--location", "--location-trusted", "--follow"):
+                return (
+                    f"curl {opt} follows HTTP redirects, which could leave the allowed "
+                    "loopback endpoint; run curl without -L/--location/--follow."
+                )
+            if opt in CURL_BLOCKED_LONG or opt.startswith("--expand-"):
+                return (
+                    f"curl {opt} overrides the destination or reads options from a file "
+                    "and is not allowed with an allowed loopback endpoint."
+                )
+            if opt == "--url":
+                if "=" in arg:
+                    raw_url = arg.split("=", 1)[1]
+                elif i + 1 < len(args):
+                    raw_url = args[i + 1]
+                    i += 1
+                else:
+                    return "curl --url requires a destination URL."
+                if not raw_url:
+                    return "curl --url requires a destination URL."
+                if raw_url.startswith("@"):
+                    return (
+                        "curl --url @file reads URLs from a file or stdin and is not "
+                        "allowed; pass explicit URLs instead."
+                    )
+                normalized = _normalize_curl_target(raw_url)
+                if normalized is not None:
+                    url_why = url_denial(normalized, denied_hosts, allowed_set)
+                    if url_why:
+                        return url_why
+        elif arg.startswith("-") and len(arg) > 1:
+            flags = arg[1:]
+            for idx, ch in enumerate(flags):
+                if ch == "L":
+                    return (
+                        "curl -L follows HTTP redirects, which could leave the allowed "
+                        "loopback endpoint; run curl without -L."
+                    )
+                if ch in ("x", "U", "K"):
+                    return (
+                        f"curl -{ch} overrides the proxy or reads options from a file "
+                        "and is not allowed with an allowed loopback endpoint."
+                    )
+                if ch in CURL_VALUED_SHORT:
+                    if idx + 1 == len(flags):
+                        i += 1
+                    break
+        i += 1
+    return None
+
+
+WGET_VALUED_SHORT = frozenset("oaiBtOTwQPUlARDIX")
+
+
+def _wget_loopback_flag_denial(args: list[str]) -> str | None:
+    last_max_redirect: str | None = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            opt = arg.split("=", 1)[0]
+            if any(
+                opt.startswith(min_prefix) and full_opt.startswith(opt)
+                for full_opt, min_prefix in WGET_BLOCKED_LONG_PREFIXES
+            ):
+                return (
+                    f"wget {opt} overrides configuration or follows extra URLs and is not "
+                    "allowed with an allowed loopback endpoint."
+                )
+            if opt.startswith("--max") and "--max-redirect".startswith(opt):
+                if "=" in arg:
+                    last_max_redirect = arg.split("=", 1)[1]
+                elif i + 1 < len(args):
+                    last_max_redirect = args[i + 1]
+                    i += 1
+                else:
+                    last_max_redirect = ""
+        elif arg.startswith("-") and len(arg) > 1:
+            flags = arg[1:]
+            for idx, ch in enumerate(flags):
+                if ch in ("e", "i", "r", "m", "H", "p", "B"):
+                    return (
+                        f"wget -{ch} overrides configuration or follows extra URLs and is not "
+                        "allowed with an allowed loopback endpoint."
+                    )
+                if ch in WGET_VALUED_SHORT:
+                    if idx + 1 == len(flags):
+                        i += 1
+                    break
+        i += 1
+    if last_max_redirect != "0":
+        return (
+            "wget follows HTTP redirects by default, which could leave the allowed "
+            "loopback endpoint; pass --max-redirect=0 or use curl without -L."
+        )
+    return None
+
+
+def _stage_proxy_denial(stage: Stage) -> str | None:
+    tokens = list(stage.raw)
+    if stage.words and stage.words[0] == "export":
+        tokens.extend(stage.words[1:])
+    for token in tokens:
+        match = PROXY_ENV_VAR.match(token)
+        if match and match.group(1):
+            var_name = token.split("=", 1)[0]
+            return (
+                f"{var_name} routes requests through a proxy and is not allowed "
+                "with an allowed loopback endpoint."
+            )
+    return None
+
+
+def _env_split_strings(raw: list[str]) -> list[str]:
+    words = strip_privilege(raw)
+    while words and ASSIGNMENT_WORD.match(words[0]):
+        words = words[1:]
+    if not words or os.path.basename(words[0]) != "env":
+        return []
+    out: list[str] = []
+    i = 1
+    while i < len(words):
+        w = words[i]
+        if ASSIGNMENT_WORD.match(w):
+            i += 1
+            continue
+        if not w.startswith("-"):
+            break
+        if w in ("-S", "--split-string"):
+            if i + 1 < len(words):
+                out.append(words[i + 1])
+                i += 2
+                continue
+        elif w.startswith("-S") and len(w) > 2:
+            out.append(w[2:])
+        elif w.startswith("--split-string="):
+            out.append(w.split("=", 1)[1])
+        elif w in ("-u", "-C", "-P"):
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _normalize_curl_target(raw_target: str) -> str | None:
+    if "://" in raw_target:
+        return raw_target
+    authority = raw_target.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" not in authority:
+        host_only = (
+            authority[: authority.index("]") + 1]
+            if authority.startswith("[") and "]" in authority
+            else authority.split(":", 1)[0]
+        )
+        if "$" in host_only or "`" in host_only:
+            return None
+    return f"http://{raw_target}"
+
+
+def _curl_stage_targets(args: list[str]) -> tuple[list[str], str | None, bool]:
+    """Collect normalized URL targets from a curl stage's arguments (`--url` and
+    positional operands), denying `--url @file`/`@-` and `--alt-svc` immediately."""
+    targets: list[str] = []
+    options_ended = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not options_ended:
+            if arg == "--":
+                options_ended = True
+                i += 1
+                continue
+            if arg == "-":
+                i += 1
+                continue
+            if arg.startswith("--"):
+                opt = arg.split("=", 1)[0]
+                if opt == "--alt-svc":
+                    return (
+                        [],
+                        "curl --alt-svc overrides the destination from an Alt-Svc cache "
+                        "file and is not allowed.",
+                        False,
+                    )
+                if opt == "--expand-url":
+                    return (
+                        [],
+                        "curl --expand-url constructs destination URLs from variables and "
+                        "is not allowed; pass explicit URLs instead.",
+                        False,
+                    )
+                if opt == "--url":
+                    if "=" in arg:
+                        raw_url = arg.split("=", 1)[1]
+                    elif i + 1 < len(args):
+                        raw_url = args[i + 1]
+                        i += 1
+                    else:
+                        return [], "curl --url requires a destination URL.", False
+                    if not raw_url:
+                        return [], "curl --url requires a destination URL.", False
+                    expanded_list = brace_expansions(raw_url, limit=BRACE_EXPANSION_CAP + 1)
+                    if len(expanded_list) > BRACE_EXPANSION_CAP:
+                        return [], None, True
+                    for expanded in expanded_list:
+                        if expanded.startswith("@"):
+                            return (
+                                [],
+                                "curl --url @file reads URLs from a file or stdin and is "
+                                "not allowed; pass explicit URLs instead.",
+                                False,
+                            )
+                        norm = _normalize_curl_target(expanded)
+                        if norm is not None:
+                            targets.append(norm)
+                            targets.extend(_embedded_urls(norm))
+                    i += 1
+                    continue
+                if "=" not in arg and (
+                    opt in CURL_VALUED_LONG or opt.startswith("--expand-")
+                ):
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if arg.startswith("-") and len(arg) > 1:
+                flags = arg[1:]
+                for idx, ch in enumerate(flags):
+                    if ch in CURL_VALUED_SHORT:
+                        if idx + 1 == len(flags):
+                            i += 1
+                        break
+                i += 1
+                continue
+        expanded_list = brace_expansions(arg, limit=BRACE_EXPANSION_CAP + 1)
+        if len(expanded_list) > BRACE_EXPANSION_CAP:
+            return [], None, True
+        for expanded in expanded_list:
+            norm = _normalize_curl_target(expanded)
+            if norm is not None:
+                targets.append(norm)
+                targets.extend(_embedded_urls(norm))
+        i += 1
+    return targets, None, False
+
+
+def _candidate_urls_from_token(token: str) -> tuple[list[str], bool]:
+    candidates: list[str] = []
+    values = [token]
+    if ASSIGNMENT_WORD.match(token):
+        values.append(token.split("=", 1)[1])
+    for val in values:
+        expanded_list = brace_expansions(val, limit=BRACE_EXPANSION_CAP + 1)
+        overflow = len(expanded_list) > BRACE_EXPANSION_CAP
+        for expanded in expanded_list[:BRACE_EXPANSION_CAP]:
+            if HTTP_SCHEME_PREFIX.match(expanded) and not any(
+                ch.isspace() for ch in expanded
+            ):
+                if overflow:
+                    return [], True
+                trimmed = expanded.rstrip(".,;!?")
+                candidates.append(trimmed)
+                candidates.extend(_embedded_urls(trimmed))
+            else:
+                found = list(urls_in({"v": expanded}))
+                if overflow and found:
+                    return [], True
+                candidates.extend(found)
+    return candidates, False
+
+
+def command_url_denial(
+    command: str,
+    stages: list[Stage],
+    denied_hosts: dict[str, str] | None,
+    allowed_loopback_endpoints: tuple[str, ...] | list[str] = (),
+) -> str | None:
+    """Why a shell command's URLs (or redirect/proxy flags alongside an allowed
+    loopback URL) must be denied, or None."""
+    allowed_set = _canonical_allowed_endpoints(allowed_loopback_endpoints)
+    all_stages = list(stages)
+    for st in stages:
+        for split_cmd in _env_split_strings(st.raw):
+            cwd = st.cwds[0] if st.cwds else Path(".")
+            inner = command_stages(split_cmd, cwd, cwd)
+            if inner is None:
+                return "cannot parse env -S command."
+            all_stages.extend(inner)
+
+    seen_urls: dict[str, None] = {}
+    for url in urls_in({"command": command}):
+        expanded_list = brace_expansions(url, limit=BRACE_EXPANSION_CAP + 1)
+        if len(expanded_list) > BRACE_EXPANSION_CAP:
+            return "URL brace expansion exceeds 64 alternatives; pass explicit URLs instead."
+        for expanded in expanded_list:
+            seen_urls.setdefault(expanded, None)
+            for nested in _embedded_urls(expanded):
+                seen_urls.setdefault(nested, None)
+    stage_curl_urls: dict[int, list[str]] = {}
+    for idx, st in enumerate(all_stages):
+        for token in (*st.raw, *st.words):
+            cands, overflow = _candidate_urls_from_token(token)
+            if overflow:
+                return "URL brace expansion exceeds 64 alternatives; pass explicit URLs instead."
+            for cand in cands:
+                seen_urls.setdefault(cand, None)
+        if st.words and os.path.basename(st.words[0]) == "curl":
+            curl_urls, curl_err, curl_overflow = _curl_stage_targets(st.words[1:])
+            if curl_overflow:
+                return "URL brace expansion exceeds 64 alternatives; pass explicit URLs instead."
+            if curl_err:
+                return curl_err
+            stage_curl_urls[idx] = curl_urls
+            for cand in curl_urls:
+                seen_urls.setdefault(cand, None)
+
+    uses_allowed_loopback = False
+    for url in seen_urls:
+        why = url_denial(url, denied_hosts, allowed_set)
+        if why:
+            return why
+        if _allowed_loopback_match(url, allowed_set) is not None:
+            uses_allowed_loopback = True
+
+    if not uses_allowed_loopback:
+        return None
+
+    for idx, st in enumerate(all_stages):
+        proxy_why = _stage_proxy_denial(st)
+        if proxy_why:
+            return proxy_why
+        if not st.words:
+            continue
+        stage_urls: list[str] = list(stage_curl_urls.get(idx, ()))
+        for token in (*st.raw, *st.words):
+            cands, _ = _candidate_urls_from_token(token)
+            stage_urls.extend(cands)
+        stage_reaches_allowed = (
+            not stage_urls
+            or any(_allowed_loopback_match(u, allowed_set) is not None for u in stage_urls)
+            or any("$" in w or "`" in w for w in st.words)
+        )
+        if not stage_reaches_allowed:
+            continue
+        program = os.path.basename(st.words[0])
+        if program == "curl":
+            flag_why = _curl_loopback_flag_denial(st.words[1:], denied_hosts, allowed_set)
+            if flag_why:
+                return flag_why
+        elif program == "wget":
+            flag_why = _wget_loopback_flag_denial(st.words[1:])
+            if flag_why:
+                return flag_why
+    return None
 
 
 SYSTEM_TEMP_ROOTS = tuple({Path(p).resolve() for p in ("/tmp", "/var/tmp", tempfile.gettempdir())})

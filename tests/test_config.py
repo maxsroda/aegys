@@ -39,12 +39,14 @@ class ShippedDefaultsTest(TestHome):
         self.assertEqual(policy.denied_hosts["bit.ly"], "URL shortener hides the destination")
         self.assertEqual(policy.denied_hosts["iplogger.com"], "IP logger")
         self.assertEqual(policy.denied_hosts["1337x.to"], "on-the-fence site")
+        self.assertEqual(policy.allowed_loopback_endpoints, ())
 
     def test_no_user_config_gives_the_defaults(self) -> None:
         policy = load_policy(self.home)
         self.assertIn("git status*", policy.shell_allow)
         self.assertIn("gh repo delete*", policy.shell_deny)
         self.assertIn("webhook.site", policy.denied_hosts)
+        self.assertEqual(policy.allowed_loopback_endpoints, ())
         self.assertIn("*/.netrc", policy.secret_paths)
 
     def test_shipped_entries_are_stripped_and_empty_ones_dropped(self) -> None:
@@ -63,6 +65,7 @@ class MergeTest(TestHome):
             "shellCommandRules": {"allow": ["mytool --check*"], "deny": ["mytool --publish*"]},
             "allowWhileGuardOff": ["mytool"],
             "deniedHosts": {"internal test": ["evil.example"]},
+            "allowedLoopbackEndpoints": ["127.0.0.1:11438", "LOCALHOST:11438", "  [::1]:11438  ", ""],
             "secretPaths": ["*/.mysecret/*"],
         })
         policy = load_policy(self.home)
@@ -74,8 +77,20 @@ class MergeTest(TestHome):
         self.assertIn("git status", policy.allow_while_guard_off)
         self.assertEqual(policy.denied_hosts["evil.example"], "internal test")
         self.assertEqual(policy.denied_hosts["webhook.site"], "data exfiltration / out-of-band endpoint")
+        self.assertEqual(
+            policy.allowed_loopback_endpoints,
+            ("127.0.0.1:11438", "localhost:11438", "[::1]:11438"),
+        )
         self.assertIn("*/.mysecret/*", policy.secret_paths)
         self.assertIn("*/.netrc", policy.secret_paths)
+
+    def test_allowed_loopback_endpoints_deduplicate_and_honor_remove_defaults_in_any_case(self) -> None:
+        self.write_user_config({
+            "allowedLoopbackEndpoints": ["127.0.0.1:11438", "localhost:11438", "LOCALHOST:11438"],
+            "removeDefaults": {"allowedLoopbackEndpoints": ["LOCALHOST:11438"]},
+        })
+        policy = load_policy(self.home)
+        self.assertEqual(policy.allowed_loopback_endpoints, ("127.0.0.1:11438",))
 
     def test_remove_defaults_removes_a_default_from_each_list(self) -> None:
         self.write_user_config({
@@ -208,14 +223,70 @@ class ConfigProblemTest(TestHome):
             },
             "removeDefaults": {
                 "shellCommandRules": {"allow": [], "ask": [], "deny": []},
-                "allowWhileGuardOff": [], "deniedHosts": [], "secretPaths": [],
+                "allowWhileGuardOff": [], "deniedHosts": [],
+                "allowedLoopbackEndpoints": [], "secretPaths": [],
             },
             "shellCommandRules": {"allow": ["a*"], "ask": ["b*"], "deny": ["c*"]},
             "allowWhileGuardOff": ["d"],
             "deniedHosts": {"my reason": ["e.example"]},
+            "allowedLoopbackEndpoints": ["127.0.0.1:11438", "localhost:11438", "[::1]:11438"],
             "secretPaths": ["*/f"],
         })
         self.assertIsNone(config_problem(self.home))
+
+    def test_allowed_loopback_endpoints_must_be_a_list_of_exact_loopback_host_ports(self) -> None:
+        self.write_user_config({"allowedLoopbackEndpoints": "127.0.0.1:11438"})
+        self.assertEqual(
+            config_problem(self.home), "allowedLoopbackEndpoints is not a list of strings"
+        )
+        self.write_user_config({"removeDefaults": {"allowedLoopbackEndpoints": "127.0.0.1:11438"}})
+        self.assertEqual(
+            config_problem(self.home),
+            "removeDefaults.allowedLoopbackEndpoints is not a list of strings",
+        )
+        for bad in (
+            "127.0.0.1",
+            "localhost",
+            "[::1]",
+            "127.0.0.1:",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "127.0.0.1:011438",
+            "127.0.0.1:+11438",
+            "127.0.0.1:11438-11439",
+            "127.0.0.1:*",
+            "*:11438",
+            "127.0.0.*:11438",
+            "http://127.0.0.1:11438",
+            "127.0.0.1:11438/",
+            "user@127.0.0.1:11438",
+            "127.0.0.1:11438@evil:80",
+            "0.0.0.0:11438",
+            "[::]:11438",
+            "10.0.0.1:11438",
+            "172.16.0.1:11438",
+            "192.168.1.1:11438",
+            "169.254.169.254:80",
+            "[fe80::1]:80",
+            "[::ffff:127.0.0.1]:11438",
+            "::1:11438",
+            "[0:0:0:0:0:0:0:1]:11438",
+            "[::1%lo]:11438",
+            "[127.0.0.1]:11438",
+            "2130706433:11438",
+            "0x7f000001:11438",
+            "0177.0.0.1:11438",
+            "127.1:11438",
+            "sub.localhost:11438",
+            "localhost.:11438",
+            "host.local:11438",
+            "example.com:11438",
+        ):
+            self.write_user_config({"allowedLoopbackEndpoints": [bad]})
+            problem = config_problem(self.home)
+            self.assertIsNotNone(problem, bad)
+            self.assertIn("allowedLoopbackEndpoints", problem, bad)
+            self.assertIsNone(load_policy(self.home), bad)
 
     def test_an_unparsable_config_is_reported(self) -> None:
         self.write_user_config("{not json")
