@@ -2953,16 +2953,49 @@ ADDRESS_REASON = "private, loopback, link-local or metadata address"
 
 # "]" stays inside a URL so bracketed IPv6 hosts like http://[::1]/ survive.
 URL_PATTERN = re.compile(r"https?://[^\s'\"<>`)}]+", re.IGNORECASE)
-URL_CONT_PATTERN = re.compile(r"(?:[\t\r]*[^\s'\"<>`)}]+)+")
+URL_CONT_PATTERN = re.compile(r"(?:[\t\r\n]*[^\s'\"<>`)}]+)+")
 HTTP_SCHEME_PREFIX = re.compile(r"^https?://", re.IGNORECASE)
 INET_ATON_PART = re.compile(r"^(?:[0-9]+|0[xX][0-9A-Fa-f]+)$")
 PROXY_ENV_VAR = re.compile(r"^(?:https?_proxy|all_proxy)=(.+)$", re.IGNORECASE)
 BRACE_EXPANSION_CAP = 64
 CURL_VALUED_SHORT = frozenset("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+CURL_VALUED_LONG = frozenset({
+    "--abstract-unix-socket", "--alt-svc", "--aws-sigv4", "--cacert", "--capath",
+    "--cert", "--cert-type", "--ciphers", "--config", "--connect-timeout",
+    "--connect-to", "--continue-at", "--cookie", "--cookie-jar", "--create-file-mode",
+    "--crlfile", "--curves", "--data", "--data-ascii", "--data-binary", "--data-raw",
+    "--data-urlencode", "--delegation", "--dns-interface", "--dns-ipv4-addr",
+    "--dns-ipv6-addr", "--dns-servers", "--doh-url", "--dump-header", "--ech",
+    "--egd-file", "--engine", "--etag-compare", "--etag-save", "--expect100-timeout",
+    "--form", "--form-string", "--ftp-account", "--ftp-alternative-to-user",
+    "--ftp-method", "--ftp-port", "--ftp-ssl-ccc-mode", "--happy-eyeballs-timeout-ms",
+    "--haproxy-clientip", "--header", "--hostpubmd5", "--hostpubsha256", "--hsts",
+    "--interface", "--ip-tos", "--ipfs-gateway", "--json", "--keepalive-cnt",
+    "--keepalive-time", "--key", "--key-type", "--knownhosts", "--krb", "--libcurl",
+    "--limit-rate", "--local-port", "--login-options", "--mail-auth", "--mail-from",
+    "--mail-rcpt", "--max-filesize", "--max-redirs", "--max-time", "--netrc-file",
+    "--noproxy", "--oauth2-bearer", "--output", "--output-dir", "--parallel-max",
+    "--parallel-max-host", "--pass", "--pinnedpubkey", "--preproxy", "--proto",
+    "--proto-default", "--proto-redir", "--proxy", "--proxy-cacert", "--proxy-capath",
+    "--proxy-cert", "--proxy-cert-type", "--proxy-ciphers", "--proxy-crlfile",
+    "--proxy-header", "--proxy-key", "--proxy-key-type", "--proxy-pass",
+    "--proxy-pinnedpubkey", "--proxy-service-name", "--proxy-tls13-ciphers",
+    "--proxy-tlsauthtype", "--proxy-tlspassword", "--proxy-tlsuser", "--proxy-user",
+    "--proxy1.0", "--pubkey", "--quote", "--random-file", "--range", "--rate",
+    "--referer", "--request", "--request-target", "--resolve", "--retry",
+    "--retry-delay", "--retry-max-time", "--sasl-authzid", "--service-name",
+    "--sigalgs", "--socks4", "--socks4a", "--socks5", "--socks5-gssapi-service",
+    "--socks5-hostname", "--speed-limit", "--speed-time", "--ssl-sessions",
+    "--stderr", "--telnet-option", "--tftp-blksize", "--time-cond", "--tls-max",
+    "--tls13-ciphers", "--tlsauthtype", "--tlspassword", "--tlsuser", "--trace",
+    "--trace-ascii", "--trace-config", "--unix-socket", "--upload-file",
+    "--upload-flags", "--url", "--url-query", "--user", "--user-agent", "--variable",
+    "--vlan-priority", "--write-out",
+})
 CURL_BLOCKED_LONG = frozenset({
     "--proxy", "--proxy1.0", "--preproxy",
     "--socks4", "--socks4a", "--socks5", "--socks5-hostname",
-    "--connect-to", "--resolve",
+    "--connect-to", "--resolve", "--alt-svc",
     "--unix-socket", "--abstract-unix-socket",
     "--dns-servers", "--dns-ipv4-addr", "--dns-ipv6-addr", "--dns-interface",
     "--doh-url", "--ipfs-gateway",
@@ -3098,7 +3131,9 @@ def _embedded_urls(url: str) -> list[str]:
     current = remainder
     for _ in range(3):
         for nested in URL_PATTERN.findall(current):
-            seen.setdefault(nested, None)
+            trimmed = nested.rstrip(".,;!?")
+            if trimmed:
+                seen.setdefault(trimmed, None)
         decoded = unquote(current)
         if decoded == current:
             break
@@ -3121,15 +3156,7 @@ def urls_in(tool_input: dict[str, Any]):
                 and text[start - 2 : start] == "\\" + text[end]
             ):
                 url = url[:-1]
-            quoted_literal = (
-                (start > 0 and text[start - 1] in ('"', "'"))
-                or (
-                    start >= 2
-                    and text[start - 2] == "\\"
-                    and text[start - 1] in ('"', "'")
-                )
-            )
-            if not quoted_literal and (
+            if (
                 end == len(text)
                 or text[end].isspace()
                 or text[end] in ('"', "'", ")", "}", ">", "`")
@@ -3138,16 +3165,35 @@ def urls_in(tool_input: dict[str, Any]):
             yield url
             for nested in _embedded_urls(url):
                 yield nested
-            if end < len(text) and text[end] in "\t\r\n":
+            if end < len(text) and text[end] in "\t\r\n" and "://" in url:
+                after_scheme = url.split("://", 1)[1]
+                authority_only = (
+                    "/" not in after_scheme
+                    and "?" not in after_scheme
+                    and "#" not in after_scheme
+                )
                 ws_end = end
                 while ws_end < len(text) and text[ws_end] in "\t\r\n":
                     ws_end += 1
-                if ws_end < len(text) and (
-                    text[ws_end] in "@:" or text[ws_end].isdigit()
+                if authority_only and ws_end < len(text) and (
+                    text[ws_end] in "@:"
+                    or (
+                        text[ws_end].isdigit()
+                        and (
+                            "\n" not in text[end:ws_end]
+                            or _is_loopback_host(after_scheme.split(":", 1)[0])
+                        )
+                    )
                 ):
                     tail = URL_CONT_PATTERN.match(text, ws_end)
                     if tail:
-                        joined = url + tail.group(0).replace("\t", "").replace("\r", "")
+                        joined = (
+                            url
+                            + tail.group(0)
+                            .replace("\t", "")
+                            .replace("\r", "")
+                            .replace("\n", "")
+                        )
                         yield joined
                         for nested in _embedded_urls(joined):
                             yield nested
@@ -3232,6 +3278,12 @@ def url_denial(
                         f"URL {url!r} embeds denied or internal host {cand_host!r} in userinfo "
                         f"({spoof_why}). Remove userinfo from the URL."
                     )
+        canonical = parse_loopback_endpoint(host_part)
+        if canonical is not None and canonical in allowed_set:
+            return (
+                f"URL {url!r} includes userinfo on allowed loopback endpoint {canonical}, "
+                "which is not allowed. Retry without userinfo."
+            )
     raw_host = (
         host_part[: host_part.index("]") + 1]
         if host_part.startswith("[") and "]" in host_part
@@ -3280,10 +3332,18 @@ def _curl_loopback_flag_denial(
                     i += 1
                 else:
                     return "curl --url requires a destination URL."
-                normalized = raw_url if "://" in raw_url else f"http://{raw_url}"
-                url_why = url_denial(normalized, denied_hosts, allowed_set)
-                if url_why:
-                    return url_why
+                if not raw_url:
+                    return "curl --url requires a destination URL."
+                if raw_url.startswith("@"):
+                    return (
+                        "curl --url @file reads URLs from a file or stdin and is not "
+                        "allowed; pass explicit URLs instead."
+                    )
+                normalized = _normalize_curl_target(raw_url)
+                if normalized is not None:
+                    url_why = url_denial(normalized, denied_hosts, allowed_set)
+                    if url_why:
+                        return url_why
         elif arg.startswith("-") and len(arg) > 1:
             flags = arg[1:]
             for idx, ch in enumerate(flags):
@@ -3400,6 +3460,108 @@ def _env_split_strings(raw: list[str]) -> list[str]:
     return out
 
 
+def _normalize_curl_target(raw_target: str) -> str | None:
+    if "://" in raw_target:
+        return raw_target
+    authority = raw_target.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" not in authority:
+        host_only = (
+            authority[: authority.index("]") + 1]
+            if authority.startswith("[") and "]" in authority
+            else authority.split(":", 1)[0]
+        )
+        if "$" in host_only or "`" in host_only:
+            return None
+    return f"http://{raw_target}"
+
+
+def _curl_stage_targets(args: list[str]) -> tuple[list[str], str | None, bool]:
+    """Collect normalized URL targets from a curl stage's arguments (`--url` and
+    positional operands), denying `--url @file`/`@-` and `--alt-svc` immediately."""
+    targets: list[str] = []
+    options_ended = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not options_ended:
+            if arg == "--":
+                options_ended = True
+                i += 1
+                continue
+            if arg == "-":
+                i += 1
+                continue
+            if arg.startswith("--"):
+                opt = arg.split("=", 1)[0]
+                if opt == "--alt-svc":
+                    return (
+                        [],
+                        "curl --alt-svc overrides the destination from an Alt-Svc cache "
+                        "file and is not allowed.",
+                        False,
+                    )
+                if opt == "--expand-url":
+                    return (
+                        [],
+                        "curl --expand-url constructs destination URLs from variables and "
+                        "is not allowed; pass explicit URLs instead.",
+                        False,
+                    )
+                if opt == "--url":
+                    if "=" in arg:
+                        raw_url = arg.split("=", 1)[1]
+                    elif i + 1 < len(args):
+                        raw_url = args[i + 1]
+                        i += 1
+                    else:
+                        return [], "curl --url requires a destination URL.", False
+                    if not raw_url:
+                        return [], "curl --url requires a destination URL.", False
+                    expanded_list = brace_expansions(raw_url, limit=BRACE_EXPANSION_CAP + 1)
+                    if len(expanded_list) > BRACE_EXPANSION_CAP:
+                        return [], None, True
+                    for expanded in expanded_list:
+                        if expanded.startswith("@"):
+                            return (
+                                [],
+                                "curl --url @file reads URLs from a file or stdin and is "
+                                "not allowed; pass explicit URLs instead.",
+                                False,
+                            )
+                        norm = _normalize_curl_target(expanded)
+                        if norm is not None:
+                            targets.append(norm)
+                            targets.extend(_embedded_urls(norm))
+                    i += 1
+                    continue
+                if "=" not in arg and (
+                    opt in CURL_VALUED_LONG or opt.startswith("--expand-")
+                ):
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if arg.startswith("-") and len(arg) > 1:
+                flags = arg[1:]
+                for idx, ch in enumerate(flags):
+                    if ch in CURL_VALUED_SHORT:
+                        if idx + 1 == len(flags):
+                            i += 1
+                        break
+                i += 1
+                continue
+        expanded_list = brace_expansions(arg, limit=BRACE_EXPANSION_CAP + 1)
+        if len(expanded_list) > BRACE_EXPANSION_CAP:
+            return [], None, True
+        for expanded in expanded_list:
+            norm = _normalize_curl_target(expanded)
+            if norm is not None:
+                targets.append(norm)
+                targets.extend(_embedded_urls(norm))
+        i += 1
+    return targets, None, False
+
+
 def _candidate_urls_from_token(token: str) -> tuple[list[str], bool]:
     candidates: list[str] = []
     values = [token]
@@ -3409,11 +3571,14 @@ def _candidate_urls_from_token(token: str) -> tuple[list[str], bool]:
         expanded_list = brace_expansions(val, limit=BRACE_EXPANSION_CAP + 1)
         overflow = len(expanded_list) > BRACE_EXPANSION_CAP
         for expanded in expanded_list[:BRACE_EXPANSION_CAP]:
-            if HTTP_SCHEME_PREFIX.match(expanded):
+            if HTTP_SCHEME_PREFIX.match(expanded) and not any(
+                ch.isspace() for ch in expanded
+            ):
                 if overflow:
                     return [], True
-                candidates.append(expanded)
-                candidates.extend(_embedded_urls(expanded))
+                trimmed = expanded.rstrip(".,;!?")
+                candidates.append(trimmed)
+                candidates.extend(_embedded_urls(trimmed))
             else:
                 found = list(urls_in({"v": expanded}))
                 if overflow and found:
@@ -3449,12 +3614,22 @@ def command_url_denial(
             seen_urls.setdefault(expanded, None)
             for nested in _embedded_urls(expanded):
                 seen_urls.setdefault(nested, None)
-    for st in all_stages:
+    stage_curl_urls: dict[int, list[str]] = {}
+    for idx, st in enumerate(all_stages):
         for token in (*st.raw, *st.words):
             cands, overflow = _candidate_urls_from_token(token)
             if overflow:
                 return "URL brace expansion exceeds 64 alternatives; pass explicit URLs instead."
             for cand in cands:
+                seen_urls.setdefault(cand, None)
+        if st.words and os.path.basename(st.words[0]) == "curl":
+            curl_urls, curl_err, curl_overflow = _curl_stage_targets(st.words[1:])
+            if curl_overflow:
+                return "URL brace expansion exceeds 64 alternatives; pass explicit URLs instead."
+            if curl_err:
+                return curl_err
+            stage_curl_urls[idx] = curl_urls
+            for cand in curl_urls:
                 seen_urls.setdefault(cand, None)
 
     uses_allowed_loopback = False
@@ -3468,13 +3643,13 @@ def command_url_denial(
     if not uses_allowed_loopback:
         return None
 
-    for st in all_stages:
+    for idx, st in enumerate(all_stages):
         proxy_why = _stage_proxy_denial(st)
         if proxy_why:
             return proxy_why
         if not st.words:
             continue
-        stage_urls: list[str] = []
+        stage_urls: list[str] = list(stage_curl_urls.get(idx, ()))
         for token in (*st.raw, *st.words):
             cands, _ = _candidate_urls_from_token(token)
             stage_urls.extend(cands)
