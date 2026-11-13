@@ -27,7 +27,7 @@
 - Runs commands on a shipped allow list (`git status`, `cat`, `ls`, …) without asking.
 - Blocks recursive deletes of critical paths, reads of credential files, environment dumps (`env`, `printenv`, `/proc/*/environ`), and writes to *agy*'s and git's control files and to *aegys* itself. A `ps` that may print environments is blocked or goes to the classifier; it never runs at once.
 - Blocks a search that walks a folder (`grep -r`, `rg`, `diff -r`) unless it excludes `.env`, `.env.*` and `.git` by name. `git diff --no-index` of two folders cannot exclude them, so it is always blocked.
-- Blocks URLs on a deny list and private or cloud-metadata addresses.
+- Blocks URLs on a deny list and private, loopback or cloud-metadata addresses, except exact `host:port` loopback endpoints listed in `allowedLoopbackEndpoints`.
 - Asks you before `sudo`, `doas`, and commands on your own ask list.
 - Sends the rest to a classifier model of your choice, which allows or denies. When the agent retries a denied risky operation by another route without your authorization, *aegys* denies again and tells it to change course.
 - Allows file reads and writes inside your workspace, except config files such as `.git` or `.bashrc`, and writes into a folder laid out like `.git`; checks the rest the same way as commands.

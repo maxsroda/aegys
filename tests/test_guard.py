@@ -3171,6 +3171,124 @@ class AegysTest(unittest.TestCase):
         res_legacy_repeat = self.evaluate(legacy_cmd, last_user_input="Turn 2")
         self.assertIn("attempt 3 at a goal aegys already denied", res_legacy_repeat.get("reason", ""))
 
+    def test_loopback_urls_are_denied_by_default(self) -> None:
+        for cmd in (
+            "curl http://127.0.0.1:11438/v1/models",
+            "curl http://localhost:11438/health",
+            "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:11438/v1\")'",
+        ):
+            res = self.evaluate(cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (cmd, res))
+
+    def test_configured_loopback_endpoints_reach_classifier_while_other_endpoints_stay_denied(self) -> None:
+        self.configure(allowedLoopbackEndpoints=["127.0.0.1:11438", "localhost:11438"])
+        for allowed_cmd in (
+            "curl -fsS http://127.0.0.1:11438/v1/models",
+            "curl -fsS -X POST -d '{\"q\":\"hi\"}' http://localhost:11438/v1/chat/completions",
+            "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:11438/health\")'",
+        ):
+            res = self.evaluate(allowed_cmd, classifier_caller=allow_caller)
+            self.assertEqual(res, {"decision": "allow"}, (allowed_cmd, res))
+
+        for denied_cmd in (
+            "curl http://127.0.0.1:11439/",
+            "curl http://127.0.0.1/",
+            "curl http://[::1]:11438/",
+            "curl http://0.0.0.0:11438/",
+            "curl http://10.0.0.1:11438/",
+            "curl http://169.254.169.254/",
+            "curl http://2130706433:11438/",
+            "curl http://0x7f000001:11438/",
+            "curl http://127.1:11438/",
+            "curl http://127.0.0.1:11438@evil.example/",
+            "curl http://user@127.0.0.1:11438/",
+            "curl -L http://127.0.0.1:11438/",
+            "wget http://127.0.0.1:11438/",
+            "curl 'http://127.0.0.1:11438/r?url=https://webhook.site/x'",
+            "HTTP_PROXY=127.0.0.1:9999 curl http://127.0.0.1:11438/",
+        ):
+            res = self.evaluate(denied_cmd, classifier_caller=unexpected_caller)
+            self.assertEqual(res.get("decision"), "deny", (denied_cmd, res))
+
+        # Guard off: allowed loopback asks the user, while unlisted loopback still hard-denies.
+        self.slash("/aegys off")
+        res_off_allowed = self.evaluate(
+            "curl http://127.0.0.1:11438/health", classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res_off_allowed.get("decision"), "force_ask", res_off_allowed)
+        res_off_denied = self.evaluate(
+            "curl http://127.0.0.1:9999/health", classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res_off_denied.get("decision"), "deny", res_off_denied)
+        self.slash("/aegys on")
+
+        # Invalid allowedLoopbackEndpoints fails closed: loopback is denied and statusline turns red.
+        self.configure(allowedLoopbackEndpoints=["10.0.0.1:11438"])
+        res_broken_loopback = self.evaluate(
+            "curl http://127.0.0.1:11438/health", classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res_broken_loopback.get("decision"), "deny", res_broken_loopback)
+        res_broken_ls = self.evaluate("ls", classifier_caller=unexpected_caller)
+        self.assertEqual(res_broken_ls.get("decision"), "force_ask", res_broken_ls)
+        self.assertIn("allowedLoopbackEndpoints", res_broken_ls.get("reason", ""))
+
+    def test_allowed_loopback_endpoint_is_not_treated_as_evasion_of_denied_loopback_port_or_redirect_flag(
+        self,
+    ) -> None:
+        self.assertIn("Key internal services: none configured.", build_classifier_system_prompt())
+        self.configure(allowedLoopbackEndpoints=["127.0.0.1:11438", "localhost:11438"])
+
+        res_wrong_port = self.evaluate(
+            "curl http://127.0.0.1:9999/health", classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res_wrong_port.get("decision"), "deny", res_wrong_port)
+        self.assertIn("127.0.0.1:9999", res_wrong_port.get("reason", ""))
+        self.assertIn("same endpoint", res_wrong_port.get("reason", ""))
+        self.assertNotIn("same host", res_wrong_port.get("reason", ""))
+
+        res_default_port = self.evaluate(
+            "curl http://127.0.0.1/health", classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res_default_port.get("decision"), "deny", res_default_port)
+        self.assertIn("127.0.0.1:80", res_default_port.get("reason", ""))
+        self.assertIn("same endpoint", res_default_port.get("reason", ""))
+        self.assertNotIn("same host", res_default_port.get("reason", ""))
+
+        res_redirect = self.evaluate(
+            "curl -L http://127.0.0.1:11438/health", classifier_caller=unexpected_caller
+        )
+        self.assertEqual(res_redirect.get("decision"), "deny", res_redirect)
+        self.assertIn("-L", res_redirect.get("reason", ""))
+
+        captured_prompts: list[str] = []
+        captured_contexts: list[str] = []
+
+        def inspecting_caller(
+            sys_prompt: str,
+            msgs: list[dict[str, Any]],
+            max_tokens: int,
+            tools: list[dict[str, Any]] | None,
+        ) -> dict[str, Any]:
+            captured_prompts.append(sys_prompt)
+            captured_contexts.extend(
+                part.get("text", "") for m in msgs for part in m["content"]
+            )
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "0"}]}
+
+        res_allowed = self.evaluate(
+            "curl http://127.0.0.1:11438/health", classifier_caller=inspecting_caller
+        )
+        self.assertEqual(res_allowed, {"decision": "allow"}, res_allowed)
+        self.assertEqual(len(captured_prompts), 1)
+        prompt = captured_prompts[0]
+        self.assertIn("127.0.0.1:11438", prompt)
+        self.assertIn("localhost:11438", prompt)
+        self.assertNotIn("Key internal services: none configured.", prompt)
+        self.assertIn("allowed loopback endpoint", prompt)
+        denials_ctx = "\n".join(captured_contexts)
+        self.assertIn("127.0.0.1:9999 is denied", denials_ctx)
+        self.assertNotIn("same host", denials_ctx)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -368,6 +368,7 @@
       "z-lib.org"
     ]
   },
+  "allowedLoopbackEndpoints": [],
   "secretPaths": [
     "*/.ssh",
     "*/.ssh/*",
